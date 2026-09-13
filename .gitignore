@@ -73,3 +73,8 @@ hub-console.log
 claude/
 
 models-index.json
+# Docker deploy state on this host: the compose override is machine-specific
+# (Docker Desktop port mode + pinned subnet) and data/ is the U1HUB_DIR bind
+# mount holding config, spools, dispatch, auth and the thumbnail cache.
+docker-compose.override.yml
+data/
