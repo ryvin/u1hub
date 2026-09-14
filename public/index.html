@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- U1 Print Hub — index v2.27.1 -->
+<!-- U1 Print Hub — index v2.28.0 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -108,6 +108,12 @@
   .chip.act{cursor:pointer;}
   .chip.act:hover{color:var(--ink); border-color:var(--signal);}
   .chip.srconly{color:var(--ink-faint); border-style:dashed;}
+  /* v2.26: colors a library file needs, and the printable-on filter chips */
+  .palrow{margin-top:5px; display:flex; align-items:center; gap:4px;}
+  .pdot{width:11px; height:11px; border-radius:50%; border:1px solid var(--line); flex:none;}
+  .paln{font-family:var(--mono); font-size:9.5px; letter-spacing:.03em; color:var(--ink-faint); margin-left:3px;}
+  .palbar .pallead{font-family:var(--mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint); padding:2px 2px 2px 0;}
+  .palbar label.pal.on{color:var(--signal); border-color:var(--signal);}
   .job.onboard{border-left:2px dashed var(--line-soft);}
   .jact{display:none; flex:none; gap:4px; align-items:center;}
   .job:hover .jact{display:flex;}
@@ -433,9 +439,6 @@
   .discrow{display:flex; align-items:center; gap:9px; padding:8px 10px; border:1px solid var(--line-soft); border-radius:8px; margin-bottom:6px; font-size:13px;}
   .discrow .di{font-family:var(--mono); font-size:11.5px; color:var(--ink-dim); flex:1;}
   .discrow .di b{color:var(--ink); font-family:var(--sans); font-size:13px;}
-  .tipfoot{margin-top:34px; padding-top:18px; border-top:1px solid var(--line); text-align:center;}
-  .tipfoot a{display:inline-block; font-size:13.5px; font-weight:700; color:#1a1400; background:var(--signal); padding:10px 20px; border-radius:8px; text-decoration:none;}
-  .tipfoot a:hover{filter:brightness(1.06);}
 
   details.diag{margin-top:22px; border-top:1px solid var(--line); padding-top:14px;}
   details.diag summary{font-family:var(--mono); font-size:11.5px; color:var(--ink-faint); letter-spacing:.08em; cursor:pointer; text-transform:uppercase;}
@@ -538,7 +541,6 @@
     #jthumb{max-width:150px; max-height:150px;}
     .heads{gap:6px;}
     .sechead{margin-top:18px;}
-    .tipfoot{margin-top:24px;}
   }
   @media (max-width:400px){
     .main{padding-left:10px; padding-right:10px;}
@@ -568,6 +570,7 @@
         <option value="size_asc">Smallest first</option>
       </select>
       <div class="srcbar" id="srcbar" title="Show files stored on…"></div>
+      <div class="srcbar palbar" id="palbar" title="Only files whose colors are all loaded on this printer right now"></div>
     </div>
     <div class="qwrap" id="qwrap" style="display:none">
       <button class="qhead" id="qhead"><span id="qarrow">▾</span> Up next <span class="qcount" id="qcount"></span></button>
@@ -711,7 +714,6 @@
 
     <details class="diag"><summary>Job diagnostics</summary><pre id="diagpre">Select a file.</pre></details>
 
-    <div class="tipfoot"><a href="https://venmo.com/u/dgambill" target="_blank" rel="noopener">Buy me a beer 🍺</a></div>
     </div>
     <div class="matchview" id="matchview" style="display:none">
       <div class="sechead"><h2>Match</h2><span class="count" id="matchcount"></span></div>
@@ -745,7 +747,7 @@
   </div>
 </div>
 
-<script>const VERSION = "2.27.1";</script>
+<script>const VERSION = "2.28.0";</script>
 <script src="app.js"></script>
 <!-- @client-modules -->
 </body>

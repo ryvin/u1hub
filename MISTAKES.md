@@ -95,6 +95,31 @@ after an async warm, or it is a bug. Still open after this fix:
 fileInfoForModules` (256 KB head) - small, but the rule says they go too.
 
 ---
+## 2026-09-14 - Bulk-pulling the library through Moonraker killed it mid-print
+
+**What happened:** To seed the Hub library, 444 gcode files were pulled from
+two U1s through Moonraker's HTTP file API, back to back. After about 250
+files snapdragon's kernel OOM-killed Moonraker (961 MB of RAM; dmesg:
+`Out of memory: Killed process ... python3`), twelve minutes into a print the
+owner had started from the Hub. Klipper kept printing; the API, the Hub card
+and every poller went dark, and nothing on the U1 restarts Moonraker (busybox
+init, no supervisor). It was restarted by hand with
+`/etc/init.d/S61moonraker start` without being able to read the print state
+first, because the only thing that reports it was the thing that was dead.
+
+**Root cause:** Moonraker's memory grows while serving large files in a
+burst and the U1 has no headroom. The pull ran with no pause between files,
+no memory check, and did not re-check the print state per file.
+
+**Consequence:** A restart of a service the safety rules say not to touch
+during a print, done blind. The print finished. Eighty files had to be
+pulled again later, over SSH.
+
+**Rule:** Bulk copies from a printer bypass Moonraker (stream `cat` over
+SSH), one file at a time with a pause, and only while the printer is idle.
+`modules/printer-sync.js` encodes the same three rules for the steady-state
+case. Before restarting Moonraker, confirm the printer is idle by another
+route (Klipper's own log, or the touchscreen) rather than assuming.
 
 ## 2026-09-11 - Four releases of module settings that one Save in Settings would erase
 

@@ -42,6 +42,9 @@ const MODULE_TABLE = {
   // function. No route, no UI - it only reacts to events dispatch already
   // publishes, so ordering relative to the others here doesn't matter.
   timelapse: require("../modules/timelapse.js"),
+  // v2.28: keeps the library in step with what lands on the printers. Reads
+  // the fleet snapshot and the library snapshot; provides nothing.
+  "printer-sync": require("../modules/printer-sync.js"),
   // Last on purpose: it owns no data anyone else reads, and its only side
   // effect is one outbound HTTPS GET that must never delay a registration
   // above it.

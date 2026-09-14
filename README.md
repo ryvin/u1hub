@@ -35,7 +35,10 @@ exactly as they do when you visit the printer on its own.
 **Send prints without walking over.** Pick a file, see the colors it needs,
 choose which head prints which color, and push it to any idle machine. Files
 live in one merged list: the Hub's library plus whatever is stored on each
-printer, with thumbnails.
+printer, with thumbnails. A file that lands on a printer some other way is
+copied into the library on its own, and every row shows the colors it needs,
+so "printable on snapdragon" is one tap: the list keeps only the files whose
+colors are all loaded in that machine right now.
 
 **Browse the models you have not sliced yet.** The Models tab reads a folder
 of 3MF project files (Designer\Model\file.3mf, the way designers ship them)

@@ -164,8 +164,12 @@ writes). `scripts/check-core.js` syntax-checks the root plus every core file.
 
 ## Harness
 
-`npm test` → **730 checks**, expect **730 passed, 0 failed**. A red harness
-blocks everything.
+`npm test` → **750 checks**, expect **750 passed, 0 failed**. A red harness
+blocks everything. (750 = the 730 upstream measured for 2.27.1 plus the 20
+checks 2.28 added; a clone without the private slice fixtures runs
+`U1HUB_HARNESS_SKIP_SLICE=1 npm test` and measured **716 passed, 0 failed**
+on 2026-09-21 - the skip is printed, and the 34-check slicing section is not
+evidence for anything on that machine.)
 
 Takes ~2.5 min over SMB. Run it with `scripts/run-harness.cmd` and poll
 `scripts/harness.log` — see **Working over the bridge** below for why.

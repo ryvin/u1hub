@@ -1889,8 +1889,15 @@ async function stopHub() {
     // cube-u1.3mf + ag-u1o.3mf into test/fixtures/ (gitignored — ~4 MB).
     const FIXDIR = path.join(__dirname, "fixtures");
     const FIXC = path.join(FIXDIR, "cube-u1.3mf"), FIXA = path.join(FIXDIR, "ag-u1o.3mf");
-    if (!fs.existsSync(FIXC) || !fs.existsSync(FIXA))
+    // v2.28: a clone without the private fixtures may run the REST of the
+    // harness by setting U1HUB_HARNESS_SKIP_SLICE=1. The skip is loud, the
+    // count drops, and the default stays a hard error - a green run with this
+    // flag set is not a ship gate for slicing.
+    const SKIP_SLICE = process.env.U1HUB_HARNESS_SKIP_SLICE === "1" && !(fs.existsSync(FIXC) && fs.existsSync(FIXA));
+    if (SKIP_SLICE) console.log("  ! SKIPPED: slice fixtures missing and U1HUB_HARNESS_SKIP_SLICE=1 - slicing checks did not run");
+    if (!SKIP_SLICE && (!fs.existsSync(FIXC) || !fs.existsSync(FIXA)))
       throw new Error("SLICE fixtures missing — copy cube-u1.3mf and ag-u1o.3mf into test/fixtures/ (kept out of git)");
+    if (!SKIP_SLICE) {
     const SL = require(path.join(hubDir, "modules", "slicing.js"));
     const crypto = require("crypto");
     const sha = b => crypto.createHash("sha256").update(b).digest("hex");
@@ -2067,6 +2074,7 @@ async function stopHub() {
     const cfg3 = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     delete cfg3.features;
     fs.writeFileSync(cfgPath, JSON.stringify(cfg3, null, 2));
+    }
   }
 
   console.log("\n== PERSIST: dispatch edits actually reach the disk (v2.16) ==");
@@ -3764,6 +3772,73 @@ async function stopHub() {
     ok(hits("elephant -test").length === 2, "-word excludes", hits("elephant -test"));
     ok(hits("x20 -penguin").length === 1, "wildcards, words and exclusions combine", hits("x20 -penguin"));
     ok(hits("*(x20)*").length === 0 && hits("*a+b*").length === 0 && hits("*x20.*").length === 2, "regex metacharacters in a glob are literal, not a crash", hits("*x20.*"));
+  }
+
+  console.log("\n== SYNC: new printer files copy themselves into the library (v2.28) ==");
+  {
+    // The module is driven through POST /api/printer-sync/run so every
+    // assertion follows a pass the harness started, never a timer (rule 7).
+    // The printing/idle checks wait on what /api/fleet actually reports,
+    // because that snapshot is what the module consults.
+    const cfg = (await jget("/api/config")).body;
+    const dir = cfg.folderResolved;
+    const pidx = (cfg.printers || []).findIndex(p => String(p.url).endsWith(":" + portU1));
+    ok(pidx >= 0, "the U1 mock is still a configured printer", cfg.printers);
+    ok(cfg.features && cfg.features["printer-sync"] === true, "printer-sync is a feature, on by default", cfg.features);
+    const fleetState = async () => { const f = (await jget("/api/fleet")).body || []; const p = f.find(x => x.id === pidx); return p ? p.state : "absent"; };
+    const waitState = async want => { let st = null; for (let i = 0; i < 60; i++) { st = await fleetState(); if (st === want) break; await sleep(250); } return st; };
+    const data = Buffer.from("; synced by printer-sync\nG28\nG1 X10\n");
+    const arrived = path.join(dir, "arrived_on_printer.gcode");
+    mockU1.state.printState = "printing";
+    mockU1.state.files.push({ name: "arrived_on_printer.gcode", size: data.length, data });
+    ok(await waitState("printing") === "printing", "fleet reports the U1 printing");
+    let r = await jpost("/api/printer-sync/run", {});
+    ok(r.status === 200 && r.body.busy.includes("U1-mock") && !fs.existsSync(arrived),
+      "a printing printer is left alone: listed as busy, nothing copied", r.body);
+    mockU1.state.printState = "standby";
+    ok(await waitState("standby") === "standby", "fleet reports the U1 idle again");
+    r = await jpost("/api/printer-sync/run", {});
+    ok(r.status === 200 && r.body.copied.includes("arrived_on_printer.gcode"), "idle: the new printer file is copied", r.body);
+    ok(fs.existsSync(arrived) && fs.readFileSync(arrived).equals(data), "the library copy is byte-identical to the printer's");
+    ok(!fs.existsSync(arrived + ".part"), "no .part file is left behind");
+    r = await jget("/api/files");
+    ok(r.body && r.body.files.some(f => f.name === "arrived_on_printer.gcode"), "the copied file is a real library row");
+    r = await jpost("/api/printer-sync/run", {});
+    ok(r.status === 200 && r.body.copied.length === 0, "a second pass copies nothing: the library already has it", r.body);
+    // never overwrite
+    const clash = path.join(dir, "clash.gcode");
+    fs.writeFileSync(clash, "; local version\n");
+    mockU1.state.files.push({ name: "clash.gcode", size: 5, data: Buffer.from("12345") });
+    r = await jpost("/api/printer-sync/run", {});
+    ok(fs.readFileSync(clash, "utf8") === "; local version\n" && r.body.skipped.includes("clash.gcode"),
+      "same name, different bytes: the library copy is untouched and the file is reported skipped", r.body);
+    r = await jpost("/api/printer-sync/run", {});
+    ok(r.body.skipped.length === 0, "the skip is reported once, not on every pass", r.body);
+    // a copy whose length disagrees with the listing is discarded
+    const short = path.join(dir, "short.gcode");
+    mockU1.state.files.push({ name: "short.gcode", size: 999, data: Buffer.from("tiny") });
+    r = await jpost("/api/printer-sync/run", {});
+    const stat = (await jget("/api/printer-sync")).body;
+    ok(!fs.existsSync(short) && !fs.existsSync(short + ".part") && stat.errors.some(e => e.name === "short.gcode"),
+      "a copy whose byte count disagrees with the listing is discarded and logged", stat.errors);
+    ok(stat.synced.some(x => x.name === "arrived_on_printer.gcode" && x.printer === "U1-mock"), "/api/printer-sync lists what it copied and from where");
+    ok(stat.skipped["clash.gcode"] && /different file/.test(stat.skipped["clash.gcode"].reason), "/api/printer-sync explains the skip");
+    // subfolders stay on the printer
+    mockU1.state.files.push({ name: "sub/inner.gcode", size: 4, data: Buffer.from("G28\n") });
+    r = await jpost("/api/printer-sync/run", {});
+    ok(!fs.existsSync(path.join(dir, "inner.gcode")) && !fs.existsSync(path.join(dir, "sub")), "files in printer subfolders are ignored");
+    mockU1.state.files = mockU1.state.files.filter(f => !/^(arrived_on_printer|clash|short)\.gcode$|^sub\//.test(f.name));
+  }
+
+  console.log("\n== PAGE: tip footer gone, library rows know their colors (v2.28) ==");
+  {
+    const idxHtml = fs.readFileSync(path.join(REPO, "public", "index.html"), "utf8");
+    const appSrc = fs.readFileSync(path.join(REPO, "public", "app.js"), "utf8");
+    ok(!idxHtml.includes("tipfoot") && !idxHtml.includes("Buy me a beer"), "the tip footer and its styles are gone from the page");
+    ok(idxHtml.includes('id="palbar"') && appSrc.includes("function renderPalBar(") && appSrc.includes("function printableOn("),
+      "the list has a printable-on filter bar backed by the same match rule as the Match tab");
+    ok(appSrc.includes('class="palrow"') && appSrc.includes("/api/library-palettes"), "library rows render their palette from the palette index");
+    ok(appSrc.includes('"printer-sync":"Copy new printer files into the library"'), "Settings labels the sync switch in plain words");
   }
 
   await stopHub();

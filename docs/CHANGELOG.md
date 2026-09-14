@@ -77,6 +77,18 @@ printers, and nothing leaves your network unless you turn remote access on.
 
 ---
 
+## New in 2.28 - the library keeps itself, and the list knows its colors
+
+- **New files on a printer copy themselves into the library.** Send a file
+  from Orca straight to a machine, or drop one on a USB stick, and within a
+  minute it is a real library row you can select and push anywhere - not a
+  "printer only" row you can only manage. One file at a time, never while
+  that printer is printing, never overwriting a library file of the same
+  name. Settings has the switch (Copy new printer files into the library).
+- **Every library row shows the colors it needs**, and the printer chips above
+  the list gain a "printable now" filter: pick a printer and the list keeps
+  only the files whose colors are all loaded in its heads right now.
+- The tip footer is gone.
 ### 2.27.1 - the Models tab on a slow share
 
 - **Previews by byte ranges.** The first cut read each whole project file

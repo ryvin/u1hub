@@ -27,6 +27,9 @@ function lazyImg(cls, url){
 function armLazy(root){ if(THUMB_IO && root) root.querySelectorAll("img[data-src]").forEach(i => THUMB_IO.observe(i)); }
 let FILES = [], SELECTED = null, MAP = null, FLEET = [], MAPSEL = {};
 let ONBOARD = [], ACT = null; // onboard = /api/printer-files cache; ACT = open per-printer action strip {name,pid}
+// v2.26: library palette index (name -> [hex]) for the per-row color dots and
+// the "printable on" filter; PRINTABLE is the printer id the filter is set to.
+let PALIDX = new Map(), PRINTABLE = null;
 let SRCSEL = { hub:true, p:{} }; // source-filter checkboxes; p[pid]=false hides that printer (default: everything on)
 let QUEUE = [], QOPEN = true;   // shared "up next" list (state lives in JS, not DOM)
 
@@ -151,8 +154,40 @@ $("sort").addEventListener("change", e=>{ SORT=e.target.value; renderList(); });
 async function loadFiles(){
   try{ const d = await (await fetch("/api/files?"+tparam())).json();
     if(d.error){ $("folderline").textContent=d.error; FILES=[]; renderList(); return; }
-    $("folderline").textContent=d.folder; FILES=d.files; renderList();
+    $("folderline").textContent=d.folder; FILES=d.files; renderList(); refreshPalIdx();
   }catch(e){ $("folderline").textContent="Server unreachable"; }
+}
+// v2.26: one fetch of every library file's colors (cached server-side by
+// size+mtime) feeds the row dots and the printable-on filter. If the match
+// module is off the endpoint is absent and the list simply shows no dots.
+async function refreshPalIdx(){
+  try{ const r=await fetch("/api/library-palettes?"+tparam(),{priority:"low"}); if(!r.ok) return;
+    const d=await r.json(); PALIDX=new Map((d.files||[]).map(f=>[f.name, f.colors||[]])); renderList();
+  }catch(e){}
+}
+// A library file is "printable on" a printer when every color it needs sits
+// within MATCH_THRESHOLD of a distinct loaded head - the same greedy rule the
+// Match tab and the fleet cards use, so all three agree.
+function printableOn(name, pid){
+  const colors=PALIDX.get(name); if(!colors||!colors.length) return false;
+  const p=(FLEET||[]).find(x=>x.id===pid); if(!p||!p.online) return false;
+  const m=matchFile(colors, loadedHeadList(p));
+  return m.total>0 && m.matched===m.total;
+}
+function renderPalBar(){
+  const bar=$("palbar"); if(!bar) return;
+  bar.innerHTML="";
+  const online=(FLEET||[]).filter(p=>p.online && (p.heads||[]).some(h=>h&&h.loaded));
+  if(!online.length){ if(PRINTABLE!==null){ PRINTABLE=null; renderList(); } return; }
+  if(PRINTABLE!==null && !online.some(p=>p.id===PRINTABLE)){ PRINTABLE=null; renderList(); }
+  const lead=document.createElement("span"); lead.className="pallead"; lead.textContent="printable on"; bar.appendChild(lead);
+  online.forEach(p=>{
+    const l=document.createElement("label"); l.className="pal"+(PRINTABLE===p.id?" on":" off");
+    const c=document.createElement("input"); c.type="checkbox"; c.checked=PRINTABLE===p.id;
+    c.addEventListener("change",()=>{ PRINTABLE=c.checked?p.id:null; renderPalBar(); renderList(); });
+    l.appendChild(c); l.appendChild(document.createTextNode(p.name));
+    bar.appendChild(l);
+  });
 }
 // Onboard (printer-storage) listings for the unified library view. Offline
 // printers are simply absent from badges until they answer again.
@@ -180,6 +215,7 @@ function renderSrcBar(){
     if(SRCSEL.p[pr.id]===undefined) SRCSEL.p[pr.id]=true;
     bar.appendChild(mk(pr.id, pr.name, SRCSEL.p[pr.id]));
   });
+  renderPalBar();
 }
 function srcVisible(f){
   if(f.src==="lib" && SRCSEL.hub) return true;
@@ -249,7 +285,14 @@ function renderList(){
   }); });
   if(!rows.length){ list.innerHTML='<div class="empty-list">No <code>.gcode</code> files here yet.<br><br>Point <code>gcodeFolder</code> in <code>config.json</code> at your Orca output folder, then Refresh.</div>'; return; }
   const match=nameMatcher(q);
-  const shown=rows.filter(srcVisible).filter(f=>match(f.name));
+  let shown=rows.filter(srcVisible).filter(f=>match(f.name));
+  if(PRINTABLE!==null){
+    shown=shown.filter(f=>f.src==="lib" && printableOn(f.name, PRINTABLE));
+    if(!shown.length){
+      const pn=((FLEET||[]).find(x=>x.id===PRINTABLE)||{}).name||"that printer";
+      list.innerHTML='<div class="empty-list">Nothing in the library is printable on '+esc(pn)+' with the colors it has loaded right now.</div>'; return;
+    }
+  }
   if(!shown.length){ list.innerHTML='<div class="empty-list">Nothing matches the filter / source selection.</div>'; return; }
   sortFiles(shown);
   list.innerHTML="";
@@ -264,8 +307,10 @@ function renderList(){
     const chips = f.locs.length
       ? `<div class="chiprow">${f.src==="onboard"?'<span class="chip srconly">printer only</span>':""}${f.locs.map(l=>`<span class="chip act" role="button" data-pid="${l.pid}" title="stored on ${esc(l.pname)} — click to manage that copy">${esc(l.pname)}</span>`).join("")}</div>`
       : "";
+    const pal=f.src==="lib" ? (PALIDX.get(f.name)||[]) : [];
+    const palrow=pal.length ? `<div class="palrow" title="${esc(pal.join(" "))}">${pal.map(c=>`<span class="pdot" style="background:${esc(c)}"></span>`).join("")}<span class="paln">${pal.length} color${pal.length===1?"":"s"}</span></div>` : "";
     b.innerHTML=thumb+
-      `<span class="jtxt"><div class="jn">${esc(f.name)}</div><div class="jm">${fmtTime(f.mtime)} · ${fmtSize(f.size)}${f.src==="onboard"?" · printer storage":""}</div>`+
+      `<span class="jtxt"><div class="jn">${esc(f.name)}</div><div class="jm">${fmtTime(f.mtime)} · ${fmtSize(f.size)}${f.src==="onboard"?" · printer storage":""}</div>`+palrow+
       (f.lastPrinted?`<div class="jm jprinted">Printed ${fmtTime(f.lastPrinted)}</div>`:"")+chips+`</span>`+
       (f.src==="lib"?`<span class="jact"><span class="ab" role="button" data-act="ren" title="Rename in Hub library">✎</span><span class="ab" role="button" data-act="del" title="Delete from Hub library">🗑</span></span>`:"");
     if(f.src==="lib"){
@@ -2513,7 +2558,7 @@ async function loadConfigUI(){
     const c=await (await fetch("/api/config")).json();
     $("setFolder").value=c.gcodeFolder||"";
     (function(){
-      const LBL={power:"Smart plugs",camera:"Chamber cameras",spools:"Spools & RFID",match:"Spool Match",mixer:"FS Mixer","types-beta":"Printer types (beta)",dispatch:"Dispatch scheduler",slicing:"In-app slicing",resources:"Resource Monitor",updates:"Update notices",klipper:"Printer pages via Hub"};
+      const LBL={power:"Smart plugs",camera:"Chamber cameras",spools:"Spools & RFID",match:"Spool Match",mixer:"FS Mixer","types-beta":"Printer types (beta)",dispatch:"Dispatch scheduler",slicing:"In-app slicing",resources:"Resource Monitor",updates:"Update notices",klipper:"Printer pages via Hub","printer-sync":"Copy new printer files into the library"};
       const cfgF=c.featuresConfig||c.features||{}, liveF=c.features||{};
       const box=$("setFeatures");
       box.innerHTML=Object.keys(cfgF).map(k=>
