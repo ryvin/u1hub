@@ -79,6 +79,18 @@ function createMock(profile) {
     if (u.pathname === "/server/files/list")
       return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: Date.now() / 1000, permissions: "rw" })) });
 
+    // Fork (ryvin/u1hub): serve a stored file's bytes, the way Moonraker does
+    // for the printer-sync pull. Files pushed by upload carry no body (only a
+    // byte count), so a test that wants a downloadable file sets `data` itself.
+    if (u.pathname.startsWith("/server/files/gcodes/") && req.method === "GET") {
+      const name = decodeURIComponent(u.pathname.slice("/server/files/gcodes/".length));
+      const f = state.files.find(x => x.name === name);
+      if (!f) return send(404, { error: "mock: no such file " + name });
+      const body = Buffer.isBuffer(f.data) ? f.data : Buffer.alloc(f.size || 0, 0x20);
+      res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": body.length });
+      return res.end(body);
+    }
+
     if (u.pathname === "/server/files/upload" && req.method === "POST") {
       let bytes = 0;
       let head = Buffer.alloc(0);

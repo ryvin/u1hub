@@ -52,6 +52,10 @@ const MODULE_TABLE = {
   // folder set in Settings; an optional storefront upload stays off unless
   // configured by hand. Off by default (MODULE_DEFAULTS).
   timelapse: require("../modules/timelapse.js"),
+  // Fork (ryvin/u1hub): copies files that land on a printer some other way
+  // into the library, one at a time, never while that printer is busy.
+  // Provides nothing and uses only ctx, so its place here is arbitrary.
+  "printer-sync": require("../modules/printer-sync.js"),
   // Last on purpose: it owns no data anyone else reads, and its only side
   // effect is one outbound HTTPS GET that must never delay a registration
   // above it.

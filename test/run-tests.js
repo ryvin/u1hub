@@ -1974,8 +1974,15 @@ async function stopHub() {
     // cube-u1.3mf + ag-u1o.3mf into test/fixtures/ (gitignored — ~4 MB).
     const FIXDIR = path.join(__dirname, "fixtures");
     const FIXC = path.join(FIXDIR, "cube-u1.3mf"), FIXA = path.join(FIXDIR, "ag-u1o.3mf");
-    if (!fs.existsSync(FIXC) || !fs.existsSync(FIXA))
+    // Fork (ryvin/u1hub): a clone without the private fixtures may run the
+    // REST of the harness by setting U1HUB_HARNESS_SKIP_SLICE=1. The skip is
+    // loud, the count drops, and the default stays a hard error - a green run
+    // with this flag set is not a ship gate for slicing.
+    const SKIP_SLICE = process.env.U1HUB_HARNESS_SKIP_SLICE === "1" && !(fs.existsSync(FIXC) && fs.existsSync(FIXA));
+    if (SKIP_SLICE) console.log("  ! SKIPPED: slice fixtures missing and U1HUB_HARNESS_SKIP_SLICE=1 - slicing checks did not run");
+    if (!SKIP_SLICE && (!fs.existsSync(FIXC) || !fs.existsSync(FIXA)))
       throw new Error("SLICE fixtures missing — copy cube-u1.3mf and ag-u1o.3mf into test/fixtures/ (kept out of git)");
+    if (!SKIP_SLICE) {
     const SL = require(path.join(hubDir, "modules", "slicing.js"));
     const crypto = require("crypto");
     const sha = b => crypto.createHash("sha256").update(b).digest("hex");
@@ -2152,6 +2159,7 @@ async function stopHub() {
     const cfg3 = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     delete cfg3.features;
     fs.writeFileSync(cfgPath, JSON.stringify(cfg3, null, 2));
+    }
   }
 
   console.log("\n== PERSIST: dispatch edits actually reach the disk (v2.16) ==");
