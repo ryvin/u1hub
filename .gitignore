@@ -81,3 +81,9 @@ margin.json
 models-attrs.json
 models-links.json
 logbook.json
+
+# Fork (ryvin/u1hub): Docker deploy state on this host. The compose override is
+# machine-specific (port mode, pinned subnet) and data/ is the U1HUB_DIR bind
+# mount holding config, spools, dispatch, auth and the thumbnail cache.
+docker-compose.override.yml
+data/
