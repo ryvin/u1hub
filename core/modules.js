@@ -47,6 +47,7 @@ const MODULE_TABLE = {
   // (pauses/errors with a reason, maintenance mode), uses notify.send at call
   // time, provides logbook.cards for the fleet snapshot's `upkeep` field.
   logbook: require("../modules/logbook.js"),
+  costing: require("../modules/costing.js"),   // fork (ryvin/u1hub): print ledger + client/project costing; AFTER margin and resources (uses margin.quote, listens on print.* and filament.deducted)
   // v2.27: SF3D timelapse upload. Listens on hub.events ("print.done"),
   // pulls the printer's own rendered clip and hands it to the SF3D edge
   // function. No route, no UI - it only reacts to events dispatch already

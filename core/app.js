@@ -86,6 +86,7 @@ const CLIENT_TABLE = {
   models: "/modules/models-ui.js",       // v2.26 Models tab (3MF library; read-only on touch, v2.27; ✦ Settings, v2.28)
   margin: "/modules/margin-ui.js",       // v2.28 worth-printing line on the job card + Settings rates (no tab)
   logbook: "/modules/logbook-ui.js",     // v2.37 Logbook tab: issues, fixes, maintenance schedule
+  costing: "/modules/costing-ui.js",     // fork (ryvin/u1hub): Projects tab, job-card project dropdown, Settings rates
   "library-colors": "/modules/library-colors-ui.js"  // fork (ryvin/u1hub): palette dots + "printable on" filter on the library list
   // (named -ui deliberately: the server module is modules/dispatch.js, and two
   //  same-named files in different folders is a foot-gun during deploys)

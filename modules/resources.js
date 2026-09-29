@@ -925,6 +925,7 @@ function register(ctx) {
     store.state.deductions.push(rec);
     if (store.state.deductions.length > DEDUCT_LOG_MAX) store.state.deductions.splice(0, store.state.deductions.length - DEDUCT_LOG_MAX);
     store.save();
+    if (ctx.events) ctx.events.emit("filament.deducted", rec);   // fork (ryvin/u1hub): modules/costing.js prices its ledger from this record, so nothing deducts twice
     if (entries.length)
       hublog("info", "resources: " + p.name + " finished " + name + " — " + entries.map(e => "-" + e.grams + " g " + (e.color_name || e.spool_id) + (e.empty ? " (EMPTY)" : "")).join(", "));
     else if (misses.length) hublog("info", "resources: " + p.name + " finished " + name + " — nothing deducted: " + misses.join("; "));
