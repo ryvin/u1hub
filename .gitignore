@@ -97,3 +97,8 @@ models-requests.json
 # mount holding config, spools, dispatch, auth and the thumbnail cache.
 docker-compose.override.yml
 data/
+
+# Fork (ryvin/u1hub) costing module state: the print ledger and the
+# clients/projects/line items. Real client data - never commit.
+projects.json
+prints.json

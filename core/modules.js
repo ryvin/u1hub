@@ -47,6 +47,7 @@ const MODULE_TABLE = {
   // (pauses/errors with a reason, maintenance mode), uses notify.send at call
   // time, provides logbook.cards for the fleet snapshot's `upkeep` field.
   logbook: require("../modules/logbook.js"),
+  costing: require("../modules/costing.js"),   // fork (ryvin/u1hub): print ledger + client/project costing; AFTER margin and resources (uses margin.quote, listens on print.* and filament.deducted)
   // v2.34/v2.40: timelapses from the chamber camera. Listens on hub.events
   // (print.started / done / cancelled / error), saves finished videos to the
   // folder set in Settings; an optional storefront upload stays off unless

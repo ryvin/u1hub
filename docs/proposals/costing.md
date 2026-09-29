@@ -1,5 +1,9 @@
 # Project costing for prints — research + brainstorm
 
+> **Status: built as the MVP (C7's first row), see [../costing.md](../costing.md)**
+> for the five C8 decisions, the formulas as shipped, the API, the state files
+> and the roadmap. This file stays as the research and the reasoning behind it.
+
 Scope: U1 Print Hub, `origin/main` at **v2.38.0** (local `main` is at 2.28.0 and was
 not used). Read-only; nothing edited, committed or restarted. Sections A and B are
 evidence (web sources cited by URL; code facts quoted from `git show origin/main:<path>`).

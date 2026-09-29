@@ -1,7 +1,7 @@
 # ryvin/u1hub — what this fork adds, and how it stays rebased
 
 This is a fork of [dlgambill/u1hub](https://github.com/dlgambill/u1hub). Everything
-upstream ships is here unchanged. The fork adds three switches, all of them
+upstream ships is here unchanged. The fork adds four switches, all of them
 feature modules, so that the diff against upstream stays small and every
 upstream release rebases in a few minutes.
 
@@ -11,6 +11,7 @@ upstream release rebases in a few minutes.
 |---|---|---|---|
 | `printer-sync` | **off** | off | Copies gcode that lands on a printer some other way (Orca straight to the machine, USB) into the Hub library, one file at a time, never while that printer is printing. See [printer-sync.md](printer-sync.md). |
 | `library-colors` | on | off | Color dots under each library row, and a "printable on" chip bar that filters the library to files whose colors are all loaded on a chosen printer right now. Client only. It reads the match module's `/api/library-palettes`. |
+| `costing` | on | off | A print ledger (every finished, cancelled or failed print with its actual duration and its filament priced from the rolls that were loaded), clients and projects with line items, a cost summary where every line names its source, a pricing helper, CSV export and a printable quote page. Projects tab, a project dropdown on the job card, rates in Settings. See [costing.md](costing.md). |
 
 Switch any of them from Settings → Features, or in `config.json`:
 
@@ -25,17 +26,18 @@ does the same with `slicing`.
 
 | File | Change |
 |---|---|
-| `modules/printer-sync.js` | new, server module |
-| `public/modules/library-colors-ui.js` | new, client module |
-| `test/printer-sync-standalone.js` | new, fork suite (part of `npm run test:standalone`) |
-| `docs/FORK.md`, `docs/printer-sync.md` | new |
-| `core/modules.js` | +1 `MODULE_TABLE` entry |
-| `core/app.js` | +1 `CLIENT_TABLE` entry |
-| `core/config.js` | 3 keys in `MODULE_DEFAULTS`, 2 in `LITE_OFF` |
+| `modules/printer-sync.js`, `modules/costing.js` | new, server modules |
+| `public/modules/library-colors-ui.js`, `public/modules/costing-ui.js` | new, client modules |
+| `test/printer-sync-standalone.js`, `test/costing-standalone.js` | new, fork suites (part of `npm run test:standalone`) |
+| `docs/FORK.md`, `docs/printer-sync.md`, `docs/costing.md`, `docs/proposals/costing.md` | new |
+| `core/modules.js` | +2 `MODULE_TABLE` entries |
+| `core/app.js` | +2 `CLIENT_TABLE` entries |
+| `core/config.js` | 4 keys in `MODULE_DEFAULTS`, 3 in `LITE_OFF` |
+| `modules/resources.js` | +1 line in `deductFor()`: `ctx.events.emit("filament.deducted", rec)` after the deduction is saved, so the costing ledger prices a print from the record resources already made instead of deducting again. Reasoning in [costing.md](costing.md#rebase-footprint). |
 | `test/mock-moonraker.js` | +1 route: `GET /server/files/gcodes/<name>` serves a stored file's bytes |
 | `test/run-tests.js` | `U1HUB_HARNESS_SKIP_SLICE=1` lets a clone without upstream's private slice fixtures run the rest of the harness. The skip is printed. |
-| `package.json` | the fork suite is appended to `test:standalone` |
-| `.gitignore` | `docker-compose.override.yml`, `data/` (Docker deploy state) |
+| `package.json` | the fork suites are appended to `test:standalone` |
+| `.gitignore` | `docker-compose.override.yml`, `data/` (Docker deploy state); `projects.json`, `prints.json` (costing state) |
 
 `git diff origin/main..ryvin --stat` is the source of truth. If this table and
 that command disagree, the command is right.
@@ -66,7 +68,8 @@ git fetch origin
 git switch ryvin && git rebase origin/main
 # expected conflicts, all one-liners: core/config.js MODULE_DEFAULTS / LITE_OFF,
 # the tails of MODULE_TABLE (core/modules.js) and CLIENT_TABLE (core/app.js),
-# rarely package.json "test:standalone" or .gitignore
+# the one emit line in modules/resources.js deductFor() (keep it right after
+# store.save()), rarely package.json "test:standalone" or .gitignore
 npm ci
 U1HUB_HARNESS_SKIP_SLICE=1 npm test     # read the printed total, then "N passed, 0 failed"
 npm run test:standalone
@@ -97,3 +100,4 @@ curl -s localhost:4545/api/fleet          # every printing machine still printin
 |---|---|
 | printer-sync against a real U1 (one small file pulled from an idle printer, Moonraker RSS before and after, busy printer skipped) | **not yet run**. Flip the `MODULE_DEFAULTS` entry to `true` in the commit that records it. |
 | library-colors in a real browser against the live fleet | see the commit that introduced it |
+| costing | no hardware gate needed: it listens to events the Hub already raises and writes its own two files. The mock lifecycle (standby → printing → complete, printing → cancelled) is in `test/costing-standalone.js`; the first real print on the deployed Hub should show a ledger row with `seconds_source: "actual"` and `material.source: "deduction"` on the Projects tab. |
