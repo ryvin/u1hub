@@ -28,6 +28,7 @@ const REPO = path.join(__dirname, "..");
 const PORT = 45985;
 const HUB = "http://127.0.0.1:" + PORT;
 const FALSIFY = process.env.U1HUB_COSTING_FALSIFY === "1";
+const PAUSE_MS = 300;        // backfill pacing under test (production default 1000)
 
 let pass = 0, fail = 0;
 function ok(cond, name, detail) {
@@ -48,7 +49,10 @@ async function startHub(dir, extraEnv) {
   CHILD = spawn(process.execPath, ["server.js"], {
     cwd: REPO, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, U1HUB_DIR: dir, U1HUB_PORT: String(PORT), U1HUB_POLL_MS: "400", U1HUB_EVENTS_POLL_MS: "3600000",
-           U1HUB_SYNC_MS: "3600000", U1HUB_PROFILE: "", ...(extraEnv || {}) }
+           U1HUB_SYNC_MS: "3600000", U1HUB_PROFILE: "",
+           // The boot backfill is OFF unless a section turns it on: every
+           // Moonraker GET in this suite follows a call the test made (rule 7).
+           U1HUB_COSTING_BACKFILL_BOOT_MS: "0", U1HUB_COSTING_BACKFILL_PAUSE_MS: String(PAUSE_MS), ...(extraEnv || {}) }
   });
   CHILD.stdout.on("data", d => LOG += d);
   CHILD.stderr.on("data", d => LOG += d);
@@ -82,7 +86,7 @@ function pureChecks() {
   let c = C.costOf(A, R);
   ok(c.material.cost === 0.64 && c.material.source === "deduction" && c.material.partial === true, "deduction row: the priced grams at the loaded rolls' prices, flagged partial (one head had no roll)", c.material);
   ok(c.hours === 1 && c.time_source === "actual", "actual seconds win over the slicer estimate", { hours: c.hours, src: c.time_source });
-  ok(c.machine && c.machine.per_hour === 0.32 && c.machine.cost === 0.32 && c.machine.source === "depreciation+maintenance", "machine: 1099/5000 + 0.10 = $0.32/h over 1 h", c.machine);
+  ok(c.machine && c.machine.per_hour === 0.32 && c.machine.cost === 0.32 && c.machine.basis === "depreciation+maintenance" && c.machine.source === "typed", "machine: 1099/5000 + 0.10 = $0.32/h over 1 h, typed rates", c.machine);
   ok(c.energy && c.energy.kwh === 0.25 && c.energy.cost === 0.04 && c.energy.source === "watts", "energy: 250 W x 1 h = 0.25 kWh at $0.16", c.energy);
   ok(c.direct === 1.00 && c.blanks.length === 0, "direct = 0.64 + 0.32 + 0.04 = $1.00, nothing blank", { direct: c.direct, blanks: c.blanks });
   const B = { id: "B", printer_id: 0, outcome: "done", seconds: null, est_minutes: 120, material: { grams: 100, source: "slicer" } };
@@ -95,13 +99,50 @@ function pureChecks() {
   ok(c.blanks.some(b => /roll has no price/.test(b)) && c.direct === r2(c.machine.cost + c.energy.cost), "…and the blank is named; direct sums only what is known", c);
   c = C.costOf({ ...B, printer_id: 1 }, R);
   ok(c.energy === null && c.blanks.some(b => /energy \(no watts\)/.test(b)), "KNOWN-BAD no watts for the printer: energy is null, not zero", c);
-  ok(c.machine && c.machine.source === "depreciation" && c.machine.per_hour === 0.22, "…depreciation alone when no maintenance reserve is set", c.machine);
+  ok(c.machine && c.machine.basis === "depreciation" && c.machine.per_hour === 0.22, "…depreciation alone when no maintenance reserve is set", c.machine);
   c = C.costOf(B, {});
-  ok(c.material.cost === null && c.machine === null && c.energy === null && c.direct === null && c.blanks.length === 3, "no rates at all: every line blank, direct null, three blanks named", c);
+  ok(c.material.cost === null && c.machine === null && c.energy === null && c.direct === null && c.blanks.length === 3, "no rates at all (and no suggestions): every line blank, direct null, three blanks named", c);
   c = C.costOf({ material: { grams: 10, source: "slicer", slicer_cost: 0.5 } }, {});
   ok(c.material.cost === 0.5 && c.material.source === "slicer", "the slicer's own filament cost is the last fallback", c.material);
   c = C.costOf({ printer_id: 0, seconds: 3600, energy: { kwh: 0.8, source: "metered" } }, R);
   ok(c.energy.kwh === 0.8 && c.energy.cost === 0.13 && c.energy.source === "metered", "a metered kWh on the row beats the typed watts (the v2 hook)", c.energy);
+
+  console.log("\n== PURE: filament length -> grams (Moonraker filament_used / filament_total are millimetres) ==");
+  let gg = C.mmToGrams(40361.57, "PLA;PLA;PLA;PLA");
+  ok(gg && gg.grams === 120.38 && gg.density === 1.24 && gg.material === "PLA" && gg.assumed === false, "40361.57 mm of 1.75 mm PLA = 120.38 g, the figure Moonraker itself reports as filament_weight_total for that file", gg);
+  gg = C.mmToGrams(10000, "PETG");
+  ok(gg && gg.grams === 30.55 && gg.density === 1.27, "10 m of PETG: pi x 0.0875^2 x 1000 cm = 24.05 cm3 x 1.27 = 30.55 g", gg);
+  ok(C.mmToGrams(1000, "ABS").density === 1.04 && C.mmToGrams(1000, "ASA").density === 1.07 && C.mmToGrams(1000, "TPU").density === 1.21 && C.mmToGrams(1000, "PETG-CF").density === 1.27, "ABS 1.04, ASA 1.07, TPU 1.21; a variant (PETG-CF) takes its family's density", null);
+  gg = C.mmToGrams(1000, "WOOD");
+  ok(gg && gg.density === 1.24 && gg.assumed === true, "KNOWN-BAD unknown material: PLA's density, flagged assumed rather than silently", gg);
+  ok(C.mmToGrams(0, "PLA") === null && C.mmToGrams("abc", "PLA") === null, "KNOWN-BAD zero or non-numeric length: null, never 0 g", null);
+  ok(C.materialOf("PLA;PETG;PLA;PLA") === "PLA" && C.materialOf(";ABS") === "ABS" && C.materialOf("") === null, "materialOf takes the first listed tool's type", null);
+
+  console.log("\n== PURE: suggested rates fill only what is unset, and say so ==");
+  const SG = C.SUGGESTED;
+  ok(SG.kwh_rate === 0.183 && SG.printers.purchase === 849 && SG.printers.life_hours === 5000 && SG.printers.maint_per_hour === 0.10 && SG.printers.avg_watts === 150 && SG.applies_to === "u1", "the cited numbers (docs/costing.md): $0.183/kWh, $849, 5000 h, $0.10/h, 150 W, for a U1", SG);
+  ok(Object.keys(C.SUGGESTED_NOTES).length === 5 && /EIA/.test(C.SUGGESTED_NOTES.kwh_rate) && /ESTIMATE/.test(C.SUGGESTED_NOTES.avg_watts) && /ESTIMATE/.test(C.SUGGESTED_NOTES.maint_per_hour), "every suggestion carries a note; the two derived ones are labelled ESTIMATE", C.SUGGESTED_NOTES);
+  const RSug = { cost_per_g: 0.02, suggested: SG };
+  c = C.costOf({ printer_id: 0, type: "u1", seconds: 3600, material: { grams: 100, source: "slicer" } }, RSug);
+  ok(c.machine && c.machine.per_hour === 0.27 && c.machine.cost === 0.27 && c.machine.source === "suggested" && c.machine.basis === "depreciation+maintenance", "no typed printer rates: machine 849/5000 + 0.10 = $0.27/h, labelled suggested", c.machine);
+  ok(c.energy && c.energy.kwh === 0.15 && c.energy.cost === 0.03 && c.energy.source === "suggested" && c.energy.watts === 150, "no typed watts or $/kWh: 150 W x 1 h = 0.15 kWh at $0.183 = $0.03, labelled suggested", c.energy);
+  ok(c.direct === 2.3 && c.blanks.length === 0, "direct 2.00 + 0.27 + 0.03 = $2.30, no blanks", c);
+  c = C.costOf({ printer_id: 0, type: "u1", seconds: 3600, material: { grams: 100, source: "slicer" } }, { ...RSug, kwh_rate: 0.16, printers: { "0": { avg_watts: 250, purchase: 1099, life_hours: 5000, maint_per_hour: 0.1 } } });
+  ok(c.energy.source === "watts" && c.energy.cost === 0.04 && c.energy.watts === 250 && c.machine.source === "typed" && c.machine.per_hour === 0.32, "typed rates win over the suggestions on every line", c);
+  c = C.costOf({ printer_id: 0, type: "u1", seconds: 3600, material: { grams: 100, source: "slicer" } }, { ...RSug, printers: { "0": { avg_watts: 250 } } });
+  ok(c.energy.source === "suggested" && c.energy.watts_source === "typed" && c.energy.rate_source === "suggested" && c.energy.cost === 0.05, "typed watts with a suggested $/kWh: the line is still labelled suggested (250 W x 1 h x 0.183 = $0.05)", c.energy);
+  c = C.costOf({ printer_id: 0, type: "u1", seconds: 3600, material: { grams: 100, source: "slicer" } }, { ...RSug, printers: { "0": { purchase: 1099 } } });
+  ok(c.machine.source === "typed+suggested" && c.machine.per_hour === 0.32, "a typed purchase with suggested life hours and maintenance: 1099/5000 + 0.10, labelled typed+suggested", c.machine);
+  c = C.costOf({ printer_id: 0, type: "generic", seconds: 3600, material: { grams: 100, source: "slicer" } }, RSug);
+  ok(c.machine === null && c.energy === null && c.blanks.length === 2 && /no printer rates/.test(c.blanks[0]), "KNOWN-BAD a generic Klipper printer gets no U1 suggestion: machine and energy blank and named", c);
+  c = C.costOf({ printer_id: 0, type: "u1", material: { grams: 100, source: "slicer" } }, RSug);
+  ok(c.machine === null && c.energy === null && c.blanks.some(b => /no time/.test(b)), "KNOWN-BAD no time at all: suggestions cannot invent hours", c.blanks);
+  c = C.costOf({ printer_id: 0, type: "u1", seconds: 3600, material: { grams: 120.38, source: "printer-meta", grams_source: "printer-meta", material: "PLA" } }, RSug);
+  ok(c.material.grams_source === "printer-meta" && c.material.source === "flat" && c.material.cost === 2.41, "grams from the printer's metadata are priced at the flat $/g and say where the grams came from", c.material);
+  c = C.costOf({ printer_id: 0, type: "u1", seconds: 4800, seconds_source: "history", material: { grams: 30.55, source: "history", grams_source: "history", density_assumed: true } }, RSug);
+  ok(c.time_source === "history" && c.material.grams_source === "history" && c.material.density_assumed === true, "history-sourced time and grams keep their labels; an assumed density is flagged through", c);
+  const ss = C.projectSummary({ items: [] }, [{ id: "S1", printer_id: 0, type: "u1", outcome: "done", seconds: 3600, material: { grams: 100, source: "slicer" } }], RSug);
+  ok(ss.sources.machine.suggested === 1 && ss.sources.energy.suggested === 1 && ss.sources.grams.slicer === 1 && ss.blanks.length === 0, "the summary tallies suggested lines apart from typed ones", ss.sources);
 
   console.log("\n== PURE: projectSummary on three prints (done, cancelled, uncounted) ==");
   const E = { id: "E", printer_id: 0, outcome: "cancelled", seconds: 600, material: { grams: 5, source: "slicer", partial: true } };
@@ -350,6 +391,120 @@ function pureChecks() {
     r = await jpost("/api/costing/projects/remove", { id: P1 });
     ok(r.status === 200 && r.body.prints_unassigned === 2, "removing a project frees its prints to the unassigned strip", r.body);
     ok(((await jget("/api/costing/projects")).body.unassigned_total) === 2, "…where they now sit", null);
+
+    console.log("\n== LIVE: a file sent straight to the printer (not in the library) gets grams and time from the printer's own metadata ==");
+    const PFILE = "Printer only x4.gcode";
+    mock.state.metadata = { [PFILE]: { estimated_time: 11236, filament_weight_total: 120.38, filament_total: 40361.57, filament_type: "PLA;PLA;PLA;PLA", filament_name: "Generic PLA", slicer: "SnapmakerOrca" } };
+    mock.state.printState = "standby"; mock.state.printDuration = 0; mock.state.filename = "";
+    ok(await waitState("standby") === "standby", "mock idle");
+    await check();
+    mock.state.printState = "printing"; mock.state.filename = PFILE;
+    ok(await waitState("printing") === "printing", "fleet reports it printing a file the library does not have");
+    await check();
+    const mrBefore = mock.state.metaRequests.filter(q => q.filename === PFILE).length;   // core/fleet.js asks once itself, for progress, while printing
+    mock.state.printState = "complete"; mock.state.printDuration = 7200;
+    ok(await waitState("complete") === "complete", "fleet reports it complete");
+    ev = await check();
+    ok(ev.some(e => e.type === "print.done" && e.durationSec === 7200), "print.done with 7200 s", ev);
+    const pm = await waitRow(x => x.file === PFILE && x.outcome === "done");
+    const wantG = FALSIFY ? 120.39 : 120.38;
+    ok(pm && pm.material.grams === wantG && pm.material.grams_source === "printer-meta" && pm.material.source === "printer-meta", "the row's grams are the printer's filament_weight_total (" + wantG + " g, printer-meta)" + (FALSIFY ? " [FALSIFIED]" : ""), pm && pm.material);
+    ok(pm && pm.seconds === 7200 && pm.seconds_source === "actual" && pm.est_minutes === 187 && pm.est_source === "printer-meta", "actual 7200 s kept; the printer's estimated_time 11236 s = 187 min recorded beside it (printer-meta)", pm && { s: pm.seconds, ss: pm.seconds_source, e: pm.est_minutes, es: pm.est_source });
+    ok(pm && pm.material.material === "PLA" && pm.pieces === 4, "material PLA from filament_type; pieces 4 from the name", pm && { m: pm.material.material, p: pm.pieces });
+    ok(pm && pm.cost.material.cost === 2.41 && pm.cost.material.source === "flat" && pm.cost.material.grams_source === "printer-meta", "priced at the flat $/g: 120.38 x 0.02 = $2.41, labelled flat with grams from printer metadata", pm && pm.cost.material);
+    ok(mock.state.metaRequests.filter(q => q.filename === PFILE).length === mrBefore + 1, "exactly one metadata GET to the printer at print.done for that file", mock.state.metaRequests);
+    ok((await jget("/api/resources/deductions")).body.deductions.length === 1, "resources deducted nothing for a file it cannot read (unchanged upstream rule)");
+
+    console.log("\n== LIVE: the same print reported done twice is one ledger row ==");
+    const before = (await jget("/api/costing/prints")).body.total;
+    mock.state.printState = "printing";                       // the state flaps back, print_duration still counting
+    ok(await waitState("printing") === "printing", "fleet reports printing again");
+    ev = await check();
+    ok(ev.some(e => e.type === "print.started"), "complete -> printing raises print.started (what the Hub saw 2026-10-02)", ev);
+    mock.state.printState = "complete"; mock.state.printDuration = 7700;
+    ok(await waitState("complete") === "complete", "…and complete again");
+    ev = await check();
+    ok(ev.some(e => e.type === "print.done" && e.durationSec === 7700), "a second print.done, 500 s later by the printer's own clock", ev);
+    const again = await waitRow(x => x.id === pm.id && x.seconds === 7700);
+    ok(!!again && again.done_twice === 1, "the existing row took the longer duration (7700 s) and counts the repeat", again && { s: again.seconds, twice: again.done_twice });
+    const after = (await jget("/api/costing/prints")).body;
+    ok(after.total === before && after.prints.filter(x => x.file === PFILE && x.outcome === "done").length === 1, "no second row: the ledger total is unchanged (" + before + ")", { before, after: after.total });
+    const hl = (((await jget("/api/diagnostics?logs=0")).body || {}).log || []).map(x => x.msg).filter(m => /reported again/.test(m));
+    ok(hl.length === 1 && /7200 s -> 7700 s/.test(hl[0]), "the Hub log says so", hl);
+
+    console.log("\n== LIVE: backfill of blank rows, one paced GET at a time, idempotent ==");
+    r = await jget("/api/costing/projects");
+    ok(r.body.blank_rows === 0 && r.body.sources && r.body.sources.grams["printer-meta"] === 1 && r.body.sources.grams.slicer === 2, "the tab's tally: 2 rows with slicer grams, 1 with printer metadata, none blank", r.body.sources);
+    await stopHub();
+    // Three rows an older Hub left blank: A has metadata on the printer, B only
+    // a history job (PETG, 10 m of filament), C nothing anywhere.
+    const blank = (id, file) => ({ id, at: Date.now() - 3600000, printer_id: 0, printer: "U1-mock", file, type: "u1", outcome: "done", project_id: null, job_id: null, bundle_id: null,
+      seconds: null, seconds_source: null, est_minutes: null, material: { grams: null, cost: null, source: null, partial: false, heads: [] }, energy: null, pieces: 1, counted: true, note: "" });
+    const lj2 = JSON.parse(fs.readFileSync(path.join(tmp, "prints.json"), "utf8"));
+    lj2.prints.push(blank("pt_A", "Backfill A.gcode"), blank("pt_B", "Backfill B.gcode"), blank("pt_C", "Backfill C.gcode"));
+    fs.writeFileSync(path.join(tmp, "prints.json"), JSON.stringify(lj2));
+    mock.state.metadata["Backfill A.gcode"] = { estimated_time: 3600, filament_weight_total: 50.5, filament_type: "PLA" };
+    const endB = Math.floor((Date.now() - 3600000) / 1000) - 10;
+    mock.state.history = [{ job_id: "000002", exists: true, filename: "Backfill B.gcode", status: "completed", start_time: endB - 4990, end_time: endB, print_duration: 4800, total_duration: 4990, filament_used: 10000, metadata: { filament_type: "PETG" } },
+                          { job_id: "000001", exists: true, filename: "Backfill B.gcode", status: "cancelled", start_time: endB - 90000, end_time: endB - 86400, print_duration: 100, total_duration: 120, filament_used: 500, metadata: {} }];
+    mock.state.totalPrintTime = 123 * 3600;
+    mock.state.metaRequests.length = 0;
+    await startHub(tmp);
+    r = await jget("/api/costing/projects");
+    ok(r.body.blank_rows === 3 && r.body.ledger_total === 6, "after the restart: 6 rows, 3 blank, nothing asked of the printer yet", { blank: r.body.blank_rows, total: r.body.ledger_total, reqs: mock.state.metaRequests.length });
+    ok(mock.state.metaRequests.length === 0, "boot backfill off (U1HUB_COSTING_BACKFILL_BOOT_MS=0): no metadata GET happened by itself", mock.state.metaRequests);
+    const t0 = Date.now();
+    r = await jpost("/api/costing/backfill", {});
+    const ms = Date.now() - t0;
+    ok(r.status === 200 && r.body.checked === 3 && r.body.filled === 2 && r.body.meta === 1 && r.body.history === 1 && r.body.none === 1, "POST /api/costing/backfill: 3 checked, 2 filled (1 metadata, 1 history), 1 still blank", r.body);
+    ok(r.body.requests === 4 && mock.state.metaRequests.length === 3, "4 GETs: metadata for A, B, C and one history list (cached for C)", { body: r.body, meta: mock.state.metaRequests.map(q => q.filename) });
+    // Pacing is asserted on the Hub's own record of when it sent each GET (the
+    // mock's receive times carry socket jitter). 2 ms tolerance: a Node timer
+    // can land a millisecond early on the event loop's cached clock.
+    ok(r.body.pause_ms === PAUSE_MS && r.body.min_gap_ms >= PAUSE_MS - 2 && ms >= 3 * PAUSE_MS - 2, "paced: the smallest gap between two of the 4 GETs was " + r.body.min_gap_ms + " ms (pause " + PAUSE_MS + "); the whole run took " + ms + " ms, at least 3 pauses", { min_gap: r.body.min_gap_ms, ms });
+    let rows = (await jget("/api/costing/prints")).body.prints;
+    const A = rows.find(x => x.id === "pt_A"), B = rows.find(x => x.id === "pt_B"), Cc = rows.find(x => x.id === "pt_C");
+    ok(A && A.material.grams === 50.5 && A.material.grams_source === "printer-meta" && A.est_minutes === 60 && A.est_source === "printer-meta" && A.cost.hours === 1 && A.cost.time_source === "printer-meta", "A: 50.5 g and 60 min from the printer's metadata; costed as 1 h (printer-meta)", A && { m: A.material, e: A.est_minutes, c: A.cost });
+    ok(B && B.material.grams === 30.55 && B.material.grams_source === "history" && B.material.material === "PETG" && B.material.density === 1.27 && B.material.filament_mm === 10000, "B: 10000 mm of PETG from the history job = 30.55 g (history), density 1.27", B && B.material);
+    ok(B && B.seconds === 4800 && B.seconds_source === "history" && B.cost.time_source === "history" && B.history_job === "000002", "B: 4800 s print_duration from the matching (completed, right time) job, not the older cancelled one", B && { s: B.seconds, ss: B.seconds_source, j: B.history_job });
+    ok(Cc && Cc.material.grams == null && Cc.seconds == null && Cc.autofill && Cc.autofill.result === "none" && Cc.autofill.still_blank === true, "C: nothing anywhere stays blank and is marked as asked", Cc && Cc.autofill);
+    const reqs1 = mock.state.metaRequests.length;
+    r = await jpost("/api/costing/backfill", {});
+    ok(r.status === 200 && r.body.checked === 1 && r.body.filled === 0 && r.body.requests === 2 && mock.state.metaRequests.length === reqs1 + 1, "a second forced run re-asks only for C (metadata + history, 2 GETs); A and B are settled", { body: r.body, reqs: mock.state.metaRequests.length - reqs1 });
+    r = await jget("/api/costing");
+    ok(r.status === 200 && r.body.suggested && r.body.suggested.kwh_rate === 0.183 && r.body.suggested.printers.purchase === 849 && r.body.suggested.notes && /EIA/.test(r.body.suggested.notes.kwh_rate), "GET /api/costing carries the suggested values with their notes", r.body.suggested);
+    ok(r.body.printer_names[0].hours === 123 && r.body.printer_names[0].type === "u1", "…and each printer's print hours from its history totals (123 h), for the life-hours progress", r.body.printer_names);
+    const hdiag = (((await jget("/api/diagnostics?logs=0")).body || {}).log || []).map(x => x.msg).filter(m => /costing: backfill/.test(m));
+    ok(hdiag.length === 2 && /3 blank rows checked, 2 filled \(1 from printer metadata, 1 from job history\), 1 still blank, 4 GETs/.test(hdiag[0]), "both runs are logged with their counts", hdiag);
+
+    console.log("\n== LIVE: the boot backfill runs once, skips rows already asked about, and the ledger cost uses suggestions only where rates are unset ==");
+    await stopHub();
+    const lj3 = JSON.parse(fs.readFileSync(path.join(tmp, "prints.json"), "utf8"));
+    ok(lj3.prints.find(x => x.id === "pt_B").material.grams === 30.55 && lj3.prints.find(x => x.id === "pt_C").autofill.result === "none", "the fills and the 'asked' marks are on disk", null);
+    lj3.prints.push(blank("pt_D", "Backfill D.gcode"));
+    fs.writeFileSync(path.join(tmp, "prints.json"), JSON.stringify(lj3));
+    mock.state.metadata["Backfill D.gcode"] = { estimated_time: 600, filament_total: 1000, filament_type: "ASA" };
+    const reqsC = mock.state.metaRequests.filter(q => q.filename === "Backfill C.gcode").length;
+    await startHub(tmp, { U1HUB_COSTING_BACKFILL_BOOT_MS: "500" });
+    const D = await waitRow(x => x.id === "pt_D" && x.material.grams != null);
+    ok(D && D.material.grams === 2.57 && D.material.grams_source === "printer-meta" && D.material.density === 1.07 && D.est_minutes === 10, "boot backfill filled D: 1000 mm of ASA via filament_total = 2.57 g (density 1.07), 10 min", D && D.material);
+    ok(mock.state.metaRequests.filter(q => q.filename === "Backfill C.gcode").length === reqsC, "…and did not ask about C again (already marked 'none'; only a POST retries it)", null);
+    rows = (await jget("/api/costing/prints")).body.prints;
+    const Dn = rows.find(x => x.id === "pt_D");
+    ok(Dn && Dn.cost.machine && Dn.cost.machine.source === "typed" && Dn.cost.energy.source === "watts", "with the earlier typed printer rates and $/kWh, nothing on D is suggested", Dn && Dn.cost);
+    r = await jpost("/api/costing/settings", { kwh_rate: "", printers: { "0": { purchase: "", life_hours: "", maint_per_hour: "", avg_watts: "" } } });
+    ok(r.status === 200 && r.body.kwh_rate === null && !r.body.printers["0"], "rates unset again", r.body);
+    rows = (await jget("/api/costing/prints")).body.prints;
+    const Ds = rows.find(x => x.id === "pt_D");
+    ok(Ds && Ds.cost.machine && Ds.cost.machine.source === "suggested" && Ds.cost.machine.per_hour === 0.27 && Ds.cost.energy.source === "suggested" && Ds.cost.energy.watts === 150 && Ds.cost.blanks.length === 0, "now every machine/energy line on D is the suggestion and says so: $0.27/h, 150 W", Ds && Ds.cost);
+    r = await jpost("/api/costing/settings", { printers: { "0": { avg_watts: 90 } } });
+    rows = (await jget("/api/costing/prints")).body.prints;
+    const Dt = rows.find(x => x.id === "pt_D");
+    ok(r.status === 200 && Dt && Dt.cost.energy.watts === 90 && Dt.cost.energy.watts_source === "typed" && Dt.cost.energy.source === "suggested" && Dt.cost.energy.rate_source === "suggested", "a typed 90 W wins over the suggested 150 W; the $/kWh is still the suggestion, so the line stays labelled suggested", Dt && Dt.cost.energy);
+    r = await jpost("/api/costing/settings", { kwh_rate: 0.183, printers: { "0": { purchase: 849, life_hours: 5000, maint_per_hour: 0.1, avg_watts: 150 } } });
+    rows = (await jget("/api/costing/prints")).body.prints;
+    const Du = rows.find(x => x.id === "pt_D");
+    ok(r.status === 200 && Du && Du.cost.machine.source === "typed" && Du.cost.energy.source === "watts" && Du.cost.machine.cost === Ds.cost.machine.cost && Du.cost.energy.cost === Ds.cost.energy.cost, "'use suggested values' = the same numbers saved as real rates: identical costs, now labelled typed", Du && Du.cost);
     await stopHub();
 
     console.log("\n== OFF and LITE ==");

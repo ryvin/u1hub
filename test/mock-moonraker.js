@@ -31,7 +31,9 @@ function createMock(profile) {
     history: [],                   // v2.33: Moonraker job history, newest first:
                                    // { filename, status, start_time, print_duration }
     camGrabs: 0,                   // v2.35: monitor.jpg fetches seen (issue #4: one per grab, not per viewer)
-    camDelayMs: 600                // how long the "camera" takes to answer
+    camDelayMs: 600,               // how long the "camera" takes to answer
+    metadata: null,                // fork (ryvin/u1hub): { [filename]: metadata } for /server/files/metadata; null = upstream's blank answer
+    metaRequests: []               // fork (ryvin/u1hub): every metadata GET, { filename, at }
   };
 
   const objectsList = profile === "u1"
@@ -149,6 +151,20 @@ function createMock(profile) {
 
     if (u.pathname === "/machine/system_info")
       return send(200, { result: { system_info: { product_info: { device_name: profile === "u1" ? "U1-mock" : "SV06-mock", machine_type: profile, serial_number: "MOCK" + profile }, network: {} } } });
+
+    // Fork (ryvin/u1hub): per-file metadata the way Moonraker answers it when
+    // a test has stored some (state.metadata[filename] = { estimated_time,
+    // filament_weight_total, filament_total, filament_type, slicer }); 404 for a
+    // file it has none for, as Moonraker does. Every request is logged with its
+    // time so the costing backfill's pacing can be measured. Upstream's blanket
+    // answer below stays for every test that never sets state.metadata.
+    if (u.pathname === "/server/files/metadata" && state.metadata) {
+      const fn = u.searchParams.get("filename") || "";
+      state.metaRequests.push({ filename: fn, at: Date.now() });
+      const m = state.metadata[fn];
+      if (!m) return send(404, { error: { code: 404, message: "mock: no metadata for " + fn } });
+      return send(200, { result: { filename: fn, ...m } });
+    }
 
     if (u.pathname === "/server/files/metadata")
       return send(200, { result: {} });

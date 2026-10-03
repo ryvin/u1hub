@@ -25,10 +25,11 @@
   const hrs = h => h == null ? "—" : (h < 1 ? Math.round(h * 60) + " min" : (Math.round(h * 10) / 10) + " h");
   const when = t => { const d = new Date(t); return d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); };
   const typeSlug = () => (typeof window.activeType === "function" && window.activeType().slug) || "u1";
-  const SRC = { deduction: "actual", flat: "flat $/g", slicer: "slicer est.", actual: "actual", watts: "typed W", metered: "metered", typed: "typed", blank: "blank", "hub-clock": "hub clock" };
+  const SRC = { deduction: "actual", flat: "flat $/g", slicer: "slicer est.", actual: "actual", watts: "typed W", metered: "metered", typed: "typed", blank: "blank", "hub-clock": "hub clock",
+                "printer-meta": "printer metadata", history: "printer history", suggested: "suggested", "typed+suggested": "typed + suggested" };
   const srcText = t => Object.entries(t || {}).map(([k, n]) => n + " " + (SRC[k] || k)).join(", ") || "—";
 
-  let EL = null, DATA = null, OPEN = null, PROJ = null, FORM = null, MSG = "";
+  let EL = null, DATA = null, OPEN = null, PROJ = null, FORM = null, MSG = "", OKMSG = "";
 
   function style() {
     if (document.getElementById("cstcss")) return;
@@ -51,7 +52,9 @@
       ".cst-table{width:100%; border-collapse:collapse; font-size:12.5px;} .cst-table th{text-align:right; font-family:var(--mono); font-size:10.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-faint); padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap;}",
       ".cst-table th:first-child, .cst-table td:first-child{text-align:left;} .cst-table td{padding:6px 8px; border-bottom:1px solid var(--line-soft); text-align:right; font-family:var(--mono); font-size:11.5px; color:var(--ink-dim); white-space:nowrap; font-variant-numeric:tabular-nums;}",
       ".cst-table td:first-child{font-family:var(--sans); font-size:13px; color:var(--ink); white-space:normal;} .cst-table td.hi{color:var(--ink); font-weight:600;} .cst-table td .note{font-family:var(--mono); font-size:10.5px; color:var(--ink-faint); white-space:normal;}",
-      ".cst-wrap{overflow:auto;} .cst-empty{color:var(--ink-faint); padding:10px 2px;} .cst-msg{font-size:12px; color:var(--bad,#e5484d);}",
+      ".cst-wrap{overflow:auto;} .cst-empty{color:var(--ink-faint); padding:10px 2px;} .cst-msg{font-size:12px; color:var(--bad,#e5484d); margin:6px 0;}",
+      ".cst-ok{font-size:12px; color:var(--ok,#3dd68c); margin:6px 0; font-family:var(--mono);}",
+      ".cst-note{font-size:12px; color:var(--ink-dim); padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel-2,var(--panel)); margin:4px 0 12px; line-height:1.6;} .cst-note b{color:var(--ink);} .cst-note .mono{font-family:var(--mono); font-size:11px; color:var(--ink-faint);} .cst-note .btn{margin-top:6px;}",
       ".cst-inline{display:flex; gap:6px; align-items:center; flex-wrap:wrap;} .cst-inline select.field, .cst-inline input.field{width:auto; flex:0 1 auto; font-size:12px; padding:3px 7px;}",
       // the job card line
       ".cstline{display:none; margin-top:4px; font-family:var(--mono); font-size:11.5px; line-height:1.7; color:var(--ink-dim); align-items:center; gap:8px; flex-wrap:wrap;} .cstline.show{display:flex;}",
@@ -88,6 +91,7 @@
     const body = EL.querySelector("#cst-body");
     body.innerHTML = OPEN && PROJ ? renderProject() : renderList();
     if (MSG) { const m = document.createElement("div"); m.className = "cst-msg"; m.textContent = MSG; body.prepend(m); MSG = ""; }
+    if (OKMSG) { const m = document.createElement("div"); m.className = "cst-ok"; m.id = "cst-okmsg"; m.textContent = OKMSG; body.prepend(m); OKMSG = ""; }
     const f = body.querySelector("[data-focus]"); if (f) setTimeout(() => f.focus(), 0);
   }
   const projOpts = (sel, blank) => (blank ? '<option value="">' + esc(blank) + "</option>" : "") + DATA.projects.map(p => '<option value="' + esc(p.id) + '"' + (p.id === sel ? " selected" : "") + ">" + esc(p.name) + (p.client_id ? " · " + esc(clientName(p.client_id)) : "") + "</option>").join("");
@@ -98,14 +102,30 @@
     return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '"><div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
       ' <span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span>" + (p.counted === false ? ' <span class="cst-pill">not counted</span>' : "") + "</div>" +
       '<div class="s">' + when(p.at) + " · " + esc(p.printer) + " · " + (p.pieces || 1) + " pc · " + hrs(c.hours) + (c.time_source ? " (" + (SRC[c.time_source] || c.time_source) + ")" : "") +
-      " · " + (mat.grams != null ? mat.grams + " g" : "no grams") + " · material <b>" + usd(mat.cost) + "</b>" + (mat.source ? " (" + (SRC[mat.source] || mat.source) + (mat.partial ? ", partial" : "") + ")" : "") +
-      (c.machine ? " · machine <b>" + usd(c.machine.cost) + "</b>" : "") + (c.energy ? " · energy <b>" + usd(c.energy.cost) + "</b>" : "") + " · direct <b>" + usd(c.direct) + "</b></div></div>" +
+      " · " + (mat.grams != null ? mat.grams + " g" + (mat.grams_source ? " (" + (SRC[mat.grams_source] || mat.grams_source) + ")" : "") : "no grams") + " · material <b>" + usd(mat.cost) + "</b>" + (mat.source ? " (" + (SRC[mat.source] || mat.source) + (mat.partial ? ", partial" : "") + ")" : "") +
+      (c.machine ? " · machine <b>" + usd(c.machine.cost) + "</b>" + (c.machine.source !== "typed" ? " (" + (SRC[c.machine.source] || c.machine.source) + ")" : "") : "") +
+      (c.energy ? " · energy <b>" + usd(c.energy.cost) + "</b>" + (c.energy.source === "suggested" ? " (suggested)" : "") : "") + " · direct <b>" + usd(c.direct) + "</b></div></div>" +
       '<div class="acts cst-inline"><select class="field" data-assign="' + esc(p.id) + '">' + projOpts(p.project_id || "", inProject ? "move to…" : "assign to…") + "</select>" +
       (inProject ? '<button class="btn ghost" data-count="' + esc(p.id) + '" data-to="' + (p.counted === false ? "1" : "0") + '">' + (p.counted === false ? "Count it" : "Don't count") + "</button>" : "") + "</div></div>";
   };
 
+  // What the Hub filled in by itself and what only the person can set, with
+  // the ledger's own tallies, so "no grams" reads as a gap with a reason.
+  function renderFilledNote() {
+    const s = DATA.sources || {};
+    const tl = t => srcText(t);
+    const bf = DATA.backfill || {};
+    const last = bf.last ? "Last fill: " + bf.last.checked + " checked, " + bf.last.filled + " filled (" + bf.last.meta + " printer metadata, " + bf.last.history + " job history), " + bf.last.none + " still blank, " + bf.last.requests + " requests." : "";
+    return '<div class="cst-note" id="cst-filled"><b>Filled by the Hub</b> - time from the printer when the print ended; grams from the rolls that were loaded, else the file in the library, else the printer\'s own metadata for the file, else its job history (filament length x density); machine and energy from your rates, or the cited suggestions in Settings until you type your own. ' +
+      '<b>Set by you</b> - client, project, pieces, "don\'t count", line items, what you charged, and every rate in Settings &rarr; Project costing.' +
+      '<div class="mono">' + DATA.ledger_total + " rows · grams: " + esc(tl(s.grams)) + " · time: " + esc(tl(s.time)) + " · machine: " + esc(tl(s.machine)) + " · energy: " + esc(tl(s.energy)) + "</div>" +
+      (DATA.blank_rows ? '<button class="btn ghost" data-backfill' + (bf.running ? " disabled" : "") + ">" + (bf.running ? "Filling from the printers…" : "Fill the " + DATA.blank_rows + " blank row" + (DATA.blank_rows === 1 ? "" : "s") + " from the printers") + "</button>" : "") +
+      (last ? '<div class="mono" id="cst-bflast">' + esc(last) + "</div>" : "") + "</div>";
+  }
+
   function renderList() {
     let h = "";
+    if (DATA.ledger_total) h += renderFilledNote();
     if (DATA.unassigned.length) {
       h += '<div class="cst-sec">Unassigned prints <span class="cst-pill">' + DATA.unassigned_total + "</span></div>" + DATA.unassigned.map(p => printRow(p, false)).join("") +
         (DATA.unassigned_total > DATA.unassigned.length ? '<div class="cst-empty">Showing the newest ' + DATA.unassigned.length + " of " + DATA.unassigned_total + ".</div>" : "");
@@ -171,34 +191,42 @@
 
   const val = id => { const x = EL.querySelector(id); return x ? x.value : ""; };
   async function onClick(e) {
-    const a = e.target.closest("[data-form],[data-openp],[data-back],[data-addclient],[data-addproject],[data-additem],[data-rmitem],[data-rmclient],[data-rmproject],[data-count]");
+    const a = e.target.closest("[data-form],[data-openp],[data-back],[data-addclient],[data-addproject],[data-additem],[data-rmitem],[data-rmclient],[data-rmproject],[data-count],[data-backfill]");
     if (!a) return;
     e.preventDefault();
     const d = a.dataset;
     if (d.form != null) { FORM = FORM === d.form || d.form === "" ? null : d.form; render(); return; }
     if (d.openp != null) { OPEN = d.openp; FORM = null; await load(); return; }
     if (d.back != null) { OPEN = null; PROJ = null; FORM = null; await load(); return; }
-    let r = null;
-    if (d.addclient != null) r = await jpost("/api/costing/clients", { name: val("#cst-cn"), email: val("#cst-ce") });
-    else if (d.addproject != null) r = await jpost("/api/costing/projects", { name: val("#cst-pn"), client_id: val("#cst-pc") || null });
-    else if (d.additem != null) { const k = val("#cst-ik"); r = await jpost("/api/costing/items", { project_id: OPEN, kind: k, label: val("#cst-il"), [k === "labor" ? "minutes" : "cost"]: val("#cst-iv") }); }
-    else if (d.rmitem != null) r = await jpost("/api/costing/items/remove", { project_id: OPEN, id: d.rmitem });
-    else if (d.rmclient != null) r = await jpost("/api/costing/clients/remove", { id: d.rmclient });
-    else if (d.rmproject != null) { r = await jpost("/api/costing/projects/remove", { id: OPEN }); if (r.ok) { OPEN = null; PROJ = null; } }
-    else if (d.count != null) r = await jpost("/api/costing/prints/update", { print_id: d.count, counted: d.to === "1" });
-    if (r && !r.ok) { MSG = r.d.error || "That did not work"; render(); return; }
-    FORM = null;
+    if (d.backfill != null) {
+      a.disabled = true; a.textContent = "Filling from the printers…";
+      const r = await jpost("/api/costing/backfill", {});
+      if (!r.ok) MSG = r.d.error || "The backfill did not run";
+      else OKMSG = "Asked the printers: " + r.d.checked + " blank row" + (r.d.checked === 1 ? "" : "s") + " checked, " + r.d.filled + " filled (" + r.d.meta + " from printer metadata, " + r.d.history + " from job history), " + r.d.none + " still blank.";
+      await load(); return;
+    }
+    let r = null, said = "";
+    if (d.addclient != null) { r = await jpost("/api/costing/clients", { name: val("#cst-cn"), email: val("#cst-ce") }); if (r.ok) said = "Saved client “" + r.d.client.name + "” (projects.json)."; }
+    else if (d.addproject != null) { r = await jpost("/api/costing/projects", { name: val("#cst-pn"), client_id: val("#cst-pc") || null }); if (r.ok) said = "Saved project “" + r.d.project.name + "”" + (r.d.project.client_id ? " for " + clientName(r.d.project.client_id) : "") + " (projects.json)."; }
+    else if (d.additem != null) { const k = val("#cst-ik"); r = await jpost("/api/costing/items", { project_id: OPEN, kind: k, label: val("#cst-il"), [k === "labor" ? "minutes" : "cost"]: val("#cst-iv") }); if (r.ok) said = "Saved " + k + " item “" + r.d.item.label + "”."; }
+    else if (d.rmitem != null) { r = await jpost("/api/costing/items/remove", { project_id: OPEN, id: d.rmitem }); if (r.ok) said = "Item removed."; }
+    else if (d.rmclient != null) { r = await jpost("/api/costing/clients/remove", { id: d.rmclient }); if (r.ok) said = "Client removed."; }
+    else if (d.rmproject != null) { r = await jpost("/api/costing/projects/remove", { id: OPEN }); if (r.ok) { OPEN = null; PROJ = null; said = "Project removed; its " + r.d.prints_unassigned + " print" + (r.d.prints_unassigned === 1 ? "" : "s") + " went back to unassigned."; } }
+    else if (d.count != null) { r = await jpost("/api/costing/prints/update", { print_id: d.count, counted: d.to === "1" }); if (r.ok) said = d.to === "1" ? "Counted again." : "Not counted on this project."; }
+    if (r && !r.ok) { MSG = (r.d.error || "That did not work") + (r.status ? " (HTTP " + r.status + ")" : " (no answer from the Hub)"); render(); return; }
+    FORM = null; OKMSG = said;
     await load();
   }
   async function onChange(e) {
     const t = e.target;
-    let r = null;
-    if (t.dataset.assign != null) r = await jpost("/api/costing/prints/assign", { print_id: t.dataset.assign, project_id: t.value || null });
-    else if (t.dataset.state != null) r = await jpost("/api/costing/projects/update", { id: OPEN, state: t.value });
-    else if (t.dataset.client != null) r = await jpost("/api/costing/projects/update", { id: OPEN, client_id: t.value || null });
-    else if (t.dataset.charged != null) r = await jpost("/api/costing/projects/update", { id: OPEN, charged: t.value });
+    let r = null, said = "";
+    if (t.dataset.assign != null) { r = await jpost("/api/costing/prints/assign", { print_id: t.dataset.assign, project_id: t.value || null }); if (r.ok) said = t.value ? "Print assigned to “" + (t.options[t.selectedIndex] || {}).text + "”." : "Print unassigned."; }
+    else if (t.dataset.state != null) { r = await jpost("/api/costing/projects/update", { id: OPEN, state: t.value }); if (r.ok) said = "State saved: " + t.value + "."; }
+    else if (t.dataset.client != null) { r = await jpost("/api/costing/projects/update", { id: OPEN, client_id: t.value || null }); if (r.ok) said = "Client saved."; }
+    else if (t.dataset.charged != null) { r = await jpost("/api/costing/projects/update", { id: OPEN, charged: t.value }); if (r.ok) said = t.value ? "Charged " + usd(Number(t.value)) + " saved." : "Charged amount cleared."; }
     else return;
-    if (!r.ok) { MSG = r.d.error || "That did not work"; }
+    if (!r.ok) MSG = (r.d.error || "That did not work") + (r.status ? " (HTTP " + r.status + ")" : " (no answer from the Hub)");
+    else OKMSG = said;
     await load();
   }
 
@@ -251,29 +279,65 @@
     SET = document.createElement("div");
     SET.id = "setCosting";
     SET.innerHTML = '<label class="fl" style="margin-top:18px">Project costing <span class="hint" id="cstHint">fork</span></label>' +
-      '<div class="hint" style="margin-top:4px; max-width:640px">Every print the Hub watches finish is logged with its real duration and its filament priced from the rolls that were loaded. Machine time is purchase price over life hours plus a maintenance reserve, per printer; energy is average watts x hours x your tariff. Any rate you leave blank leaves that line blank - the Hub never guesses. The U1 has no published average draw (1150 W is its peak): measure one print on a smart plug and type what you saw.</div>' +
-      '<div class="cst-rates" id="cstRates">' + RATE_LABELS.map(([k, l, h]) => '<label>' + esc(l) + '<input class="field" type="number" step="0.01" min="0" data-rate="' + k + '"><span class="hint">' + esc(h) + "</span></label>").join("") + "</div>" +
+      '<div class="hint" style="margin-top:4px; max-width:640px">Every print the Hub watches finish is logged with its real duration and its filament priced from the rolls that were loaded. Machine time is purchase price over life hours plus a maintenance reserve, per printer; energy is average watts x hours x your tariff. A rate you leave blank is costed from the <b>suggested</b> value shown greyed in its box - a cited number (source on hover, and in docs/costing.md), labelled "suggested" on every line it touches - or stays blank where there is no citation to lean on. Your own number always wins: the U1 has no published average draw (400 W is its 120 V ceiling), so a smart-plug reading of one print beats the suggestion.</div>' +
+      '<div class="cst-rates" id="cstRates">' + RATE_LABELS.map(([k, l, h]) => '<label>' + esc(l) + '<input class="field" type="number" step="0.01" min="0" data-rate="' + k + '"><span class="hint" data-hint="' + k + '">' + esc(h) + "</span></label>").join("") + "</div>" +
       '<div id="cstPrinters"></div>' +
-      '<div class="row" style="margin-top:8px; align-items:center; gap:8px"><button class="btn ghost" id="cstSave">Save</button><span class="pstatus" id="cstMsg"></span></div>';
+      '<div class="row" style="margin-top:8px; align-items:center; gap:8px"><button class="btn ghost" id="cstSave">Save</button><button class="btn ghost" id="cstUseSug" title="Write every suggested value into the rates you have left blank. Typed rates are not touched.">Use suggested values</button><span class="pstatus" id="cstMsg"></span></div>';
     host.appendChild(SET);
-    SET.querySelector("#cstSave").addEventListener("click", async () => {
+    const save = async body => {
+      const r = await jpost("/api/costing/settings", body);
+      const m = SET.querySelector("#cstMsg");
+      if (!r.ok) { m.className = "pstatus err"; m.textContent = (r.d.error || "Could not save") + (r.status ? " (HTTP " + r.status + ")" : ""); return null; }
+      paint(r.d); if (OPEN) load(); return r.d;
+    };
+    const collect = () => {
       const body = { printers: {} };
       SET.querySelectorAll("[data-rate]").forEach(i => body[i.dataset.rate] = i.value);
       SET.querySelectorAll("[data-pidx]").forEach(i => { (body.printers[i.dataset.pidx] = body.printers[i.dataset.pidx] || {})[i.dataset.pkey] = i.value; });
-      const r = await jpost("/api/costing/settings", body);
-      const m = SET.querySelector("#cstMsg");
-      if (!r.ok) { m.className = "pstatus err"; m.textContent = r.d.error || "Could not save"; return; }
-      paint(r.d); m.className = "pstatus ok"; m.textContent = "Saved."; if (OPEN) load();
+      return body;
+    };
+    SET.querySelector("#cstSave").addEventListener("click", async () => {
+      const d = await save(collect());
+      if (d) { const m = SET.querySelector("#cstMsg"); m.className = "pstatus ok"; m.textContent = "Saved to config.json."; }
+    });
+    // The suggestions become real, typed rates - only where the box is blank,
+    // and only for printers the suggestion is for (a U1).
+    SET.querySelector("#cstUseSug").addEventListener("click", async () => {
+      const sug = (RATES && RATES.suggested) || {};
+      const body = collect();
+      let n = 0;
+      for (const k of Object.keys(sug)) if (k !== "printers" && k !== "notes" && k !== "applies_to" && (body[k] === "" || body[k] == null) && sug[k] != null) { body[k] = sug[k]; n++; }
+      for (const p of (RATES && RATES.printer_names) || []) {
+        if (sug.applies_to && p.type !== sug.applies_to) continue;
+        const pb = body.printers[String(p.idx)] = body.printers[String(p.idx)] || {};
+        for (const [k, v] of Object.entries(sug.printers || {})) if ((pb[k] === "" || pb[k] == null) && v != null) { pb[k] = v; n++; }
+      }
+      const d = await save(body);
+      if (d) { const m = SET.querySelector("#cstMsg"); m.className = "pstatus ok"; m.textContent = n ? "Saved " + n + " suggested value" + (n === 1 ? "" : "s") + " as your rates (config.json). Change any of them whenever you know better." : "Nothing to fill - every suggested rate is already set."; }
     });
   }
   function paint(s) {
     if (!SET || !s) return;
     RATES = s;
-    SET.querySelectorAll("[data-rate]").forEach(i => { i.value = s[i.dataset.rate] != null ? s[i.dataset.rate] : ""; });
+    const sug = s.suggested || {}, notes = sug.notes || {};
+    SET.querySelectorAll("[data-rate]").forEach(i => {
+      const k = i.dataset.rate;
+      i.value = s[k] != null ? s[k] : "";
+      i.placeholder = sug[k] != null ? "suggested " + sug[k] : "";
+      if (notes[k]) i.title = notes[k];
+      const h = SET.querySelector('[data-hint="' + k + '"]');
+      if (h && sug[k] != null) h.textContent = (s[k] != null ? "" : "suggested " + sug[k] + " - ") + (notes[k] || "");
+    });
     const set = Object.keys(s.keys ? s : {}).filter(k => s.keys.includes(k) && s[k] != null).length;
-    SET.querySelector("#cstHint").textContent = set ? set + " of " + s.keys.length + " rates set" : "no rates set yet - every cost line is blank";
+    SET.querySelector("#cstHint").textContent = set ? set + " of " + s.keys.length + " rates set" : "no rates set yet - lines with a suggested value are costed from it and say so";
+    const hrs = p => p.hours != null ? '<div class="hint" title="print hours on this printer, from its own Moonraker history totals">' + Math.round(p.hours).toLocaleString() + " h printed" + (sug.printers && sug.printers.life_hours && ((s.printers || {})[String(p.idx)] || {}).life_hours == null ? " of " + sug.printers.life_hours.toLocaleString() + " suggested (" + Math.round(p.hours / sug.printers.life_hours * 100) + "%)" : "") + "</div>" : "";
     SET.querySelector("#cstPrinters").innerHTML = '<table class="cst-ptable"><thead><tr><th>Printer</th>' + PKEYS.map(([, l]) => "<th>" + esc(l) + "</th>").join("") + "</tr></thead><tbody>" +
-      (s.printer_names || []).map(p => "<tr><td>" + esc(p.name) + "</td>" + PKEYS.map(([k]) => '<td><input class="field" type="number" min="0" step="0.01" data-pidx="' + p.idx + '" data-pkey="' + k + '" value="' + ((s.printers || {})[String(p.idx)] && s.printers[String(p.idx)][k] != null ? esc(s.printers[String(p.idx)][k]) : "") + '"></td>').join("") + "</tr>").join("") + "</tbody></table>";
+      (s.printer_names || []).map(p => "<tr><td>" + esc(p.name) + hrs(p) + "</td>" + PKEYS.map(([k]) => {
+        const v = (s.printers || {})[String(p.idx)] && s.printers[String(p.idx)][k] != null ? esc(s.printers[String(p.idx)][k]) : "";
+        const sv = sug.printers && (!sug.applies_to || p.type === sug.applies_to) ? sug.printers[k] : null;
+        return '<td><input class="field" type="number" min="0" step="0.01" data-pidx="' + p.idx + '" data-pkey="' + k + '" value="' + v + '"' + (sv != null ? ' placeholder="suggested ' + esc(sv) + '" title="' + esc(notes[k] || "") + '"' : "") + "></td>";
+      }).join("") + "</tr>").join("") + "</tbody></table>" +
+      (sug.printers ? '<div class="hint" style="margin-top:6px; max-width:640px">Greyed values are suggestions for a Snapmaker U1 - sources: ' + esc([notes.purchase, notes.life_hours, notes.maint_per_hour, notes.avg_watts].filter(Boolean).join(" · ")) + ".</div>" : "");
   }
   // Core's Settings feature list prints the raw key for anything it has no
   // label for; name this flag there.

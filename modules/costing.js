@@ -41,6 +41,29 @@
 // (parser.js, the same read resources.js and margin.js make); the piece count
 // comes from the file name through margin.js's qtyFromName. Internal string
 // handling of files the Hub owns, not an external provider.
+//
+// A file sent straight from the slicer to the printer is NOT in the library,
+// so that read finds nothing. The fallback chain per row, each step labelled
+// in `material.source` / `est_source` / `seconds_source` so a summary never
+// has to guess (docs/costing.md "Where each number comes from"):
+//   grams: deduction (the rolls)  ->  library gcode  ->  the printer's own
+//          Moonraker file metadata (GET /server/files/metadata, a few hundred
+//          bytes of JSON, fetched at print.done while the file is still on
+//          the printer)  ->  Moonraker's job history filament_used, millimetres
+//          turned into grams by material density.
+//   time:  print.done durationSec  ->  history print_duration  ->  the slicer's
+//          estimate from the library file or the printer's metadata.
+// Rows left blank by an older Hub are backfilled the same way, one GET at a
+// time with a pause between (2026-09-14: bulk gcode downloads through
+// Moonraker OOM-killed it mid-print; metadata is JSON, but the pacing stays).
+//
+// Rates the person has not typed can be SUGGESTED: cited numbers for a U1
+// (purchase, life hours, maintenance reserve, average watts) and the U.S.
+// residential electricity price, each with its source in docs/costing.md.
+// costOf uses a suggestion only where the typed rate is unset and labels the
+// line "suggested"; Settings shows them as placeholders and a button writes
+// them as real rates. Still never a guessed zero: a blank stays a blank until
+// a cited number or a typed one fills it.
 
 "use strict";
 
@@ -66,23 +89,94 @@ const RATE_KEYS = {
 const PRINTER_KEYS = { purchase: [0, 100000], life_hours: [1, 1000000], maint_per_hour: [0, 100], avg_watts: [1, 5000] };
 const BREAKS = [1, 10, 50];
 
+// Filament length -> grams. 1.75 mm filament; densities in g/cm^3 are the
+// slicer-default table (sources and dates in docs/costing.md). A material the
+// table does not know is priced as PLA and says so (`density_assumed`).
+const FILAMENT_DIAMETER_MM = 1.75;
+const DENSITY = Object.freeze({ PLA: 1.24, PETG: 1.27, ABS: 1.04, ASA: 1.07, TPU: 1.21 });
+
+// Suggested rates: every number cited in docs/costing.md ("Suggested values"),
+// with the date it was read. They apply to a U1 (row.type "u1"); a generic
+// Klipper printer gets no printer suggestion. SUGGESTED_NOTES is what Settings
+// prints beside each placeholder.
+const SUGGESTED = Object.freeze({
+  kwh_rate: 0.183,
+  printers: Object.freeze({ purchase: 849, life_hours: 5000, maint_per_hour: 0.10, avg_watts: 150 }),
+  applies_to: "u1"
+});
+const SUGGESTED_NOTES = Object.freeze({
+  kwh_rate: "U.S. residential average, EIA Electric Power Monthly table 5.6.A, July 2026 (18.31 c/kWh)",
+  purchase: "Snapmaker U1 on us.snapmaker.com, 2026-10-03 ($849 sale, $999 list)",
+  life_hours: "Snapmaker's own cost guide: a common estimate for a well-maintained printer is around 5,000 h",
+  maint_per_hour: "ESTIMATE: one $49 hot end per ~1,000 h, a $33.99 plate per ~1,000 h, belts/fans allowance (docs/costing.md)",
+  avg_watts: "ESTIMATE for PLA at 120 V: no measured U1 figure published; a comparable CoreXY meters 103-135 W plus the U1's 10-30 W parked heads (docs/costing.md)"
+});
+
+const MOON_TIMEOUT_MS = 3500;
+const META_MAX = 500;                   // printer-metadata cache entries
+const HIST_TTL_MS = 60 * 1000;          // a printer's job history is re-read at most this often during a backfill
+const HISTORY_MATCH_S = 30 * 60;        // a history job whose end is within this of the row's `at` is that print
+const DUP_SLACK_MS = 10 * 60 * 1000;    // two print.done for one job: their computed starts agree within this
+const HOURS_TTL_MS = 10 * 60 * 1000;    // Moonraker totals (life-hours progress) are re-read at most this often
+const BACKFILL_PAUSE_MS = Math.max(0, Number(process.env.U1HUB_COSTING_BACKFILL_PAUSE_MS ?? 1000));
+const BACKFILL_BOOT_MS = Math.max(0, Number(process.env.U1HUB_COSTING_BACKFILL_BOOT_MS ?? 15000));
+
 const r2 = v => Math.round(v * 100) / 100;
 const r3 = v => Math.round(v * 1000) / 1000;
 const num = v => { if (v === "" || v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
 const clean = (s, n) => String(s == null ? "" : s).replace(/[\u0000-\u001f]+/g, " ").trim().slice(0, n || 200);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// ---- pure: filament length -> grams ----------------------------------------------
+// "PLA;PLA;PETG;PLA" (Moonraker's filament_type, one entry per tool) -> "PLA":
+// the first non-empty entry, the tool the slicer lists first. Null when blank.
+function materialOf(types) {
+  const parts = String(types == null ? "" : types).split(/[;,]/).map(s => s.trim().toUpperCase()).filter(Boolean);
+  return parts.length ? parts[0].slice(0, 20) : null;
+}
+// -> { density, material, assumed }. "PLA+", "PETG-CF" match their family.
+function densityOf(material) {
+  const m = String(material || "").toUpperCase();
+  for (const k of Object.keys(DENSITY)) if (m.startsWith(k)) return { density: DENSITY[k], material: k, assumed: false };
+  return { density: DENSITY.PLA, material: "PLA", assumed: true };
+}
+// mm of 1.75 mm filament -> grams: pi r^2 (cm^2) x length (cm) x density.
+function mmToGrams(mm, material) {
+  const len = num(mm);
+  if (len == null || len <= 0) return null;
+  const d = densityOf(material);
+  const cm3 = Math.PI * Math.pow(FILAMENT_DIAMETER_MM / 20, 2) * (len / 10);
+  return { grams: r2(cm3 * d.density), density: d.density, material: d.material, assumed: d.assumed };
+}
+
 // ---- pure: one print --------------------------------------------------------------
-// print: a ledger row. rates: conf() below (or any object of the same shape).
-// -> { material:{grams,cost,source,partial}, hours, time_source, machine, energy, direct, blanks[] }
+// print: a ledger row. rates: conf() below (or any object of the same shape;
+// rates.suggested, when present, fills a printer rate or the $/kWh the person
+// has not typed, for rows of the printer type it applies to).
+// -> { material:{grams,grams_source,cost,source,partial}, hours, time_source,
+//      machine:{per_hour,cost,source,basis}, energy:{kwh,cost,source}, direct, blanks[] }
+// material.source is where the PRICE came from (deduction | flat | slicer),
+// material.grams_source where the GRAMS came from (deduction | slicer |
+// printer-meta | history). machine.basis says which halves exist
+// (depreciation, maintenance, both); machine.source and energy.source say
+// "suggested" when any input was a suggestion rather than a typed rate.
 // Every cost is null when its inputs are missing; `direct` sums what is there
 // and `blanks` names what is not, so a caller never mistakes "unknown" for 0.
 function costOf(print, rates) {
   const p = print || {}, R = rates || {};
-  const pr = ((R.printers || {})[String(p.printer_id)]) || {};
+  const typed = ((R.printers || {})[String(p.printer_id)]) || {};
+  const S = (R.suggested && typeof R.suggested === "object") ? R.suggested : null;
+  const sugOk = !!S && (p.type == null || !S.applies_to || p.type === S.applies_to);
+  // A typed rate wins; a suggestion fills only an unset one, and says so.
+  const pick = (key, perPrinter) => {
+    const t = num(perPrinter ? typed[key] : R[key]);
+    if (t != null) return { v: t, src: "typed" };
+    const s = sugOk ? num(perPrinter ? (S.printers || {})[key] : S[key]) : null;
+    return s != null ? { v: s, src: "suggested" } : { v: null, src: null };
+  };
   const m = p.material || {};
   const grams = num(m.grams);
-  const material = { grams, cost: null, source: null, partial: !!m.partial };
+  const material = { grams, grams_source: grams != null ? (m.grams_source || m.source || null) : null, cost: null, source: null, partial: !!m.partial };
   if (m.source === "deduction") {
     material.source = "deduction";
     material.cost = num(m.cost) != null ? r2(m.cost) : null;
@@ -91,21 +185,30 @@ function costOf(print, rates) {
     if (num(R.cost_per_g) != null) { material.cost = r2(grams * R.cost_per_g); material.source = "flat"; }
     else if (num(m.slicer_cost) != null) { material.cost = r2(m.slicer_cost); material.source = "slicer"; }
   }
+  if (m.density_assumed) material.density_assumed = true;
   let hours = null, time_source = null;
-  if (num(p.seconds) > 0) { hours = p.seconds / 3600; time_source = "actual"; }
-  else if (num(p.est_minutes) > 0) { hours = p.est_minutes / 60; time_source = "slicer"; }
+  if (num(p.seconds) > 0) { hours = p.seconds / 3600; time_source = p.seconds_source || "actual"; }
+  else if (num(p.est_minutes) > 0) { hours = p.est_minutes / 60; time_source = p.est_source || "slicer"; }
   let machine = null;
-  const dep = num(pr.purchase) != null && num(pr.life_hours) > 0 ? pr.purchase / pr.life_hours : null;
-  const maint = num(pr.maint_per_hour);
-  if (hours != null && (dep != null || maint != null)) {
-    const per_hour = (dep || 0) + (maint || 0);
-    machine = { per_hour: r3(per_hour), cost: r2(hours * per_hour), source: dep != null && maint != null ? "depreciation+maintenance" : (dep != null ? "depreciation" : "maintenance") };
+  const purchase = pick("purchase", true), life = pick("life_hours", true), maint = pick("maint_per_hour", true);
+  const dep = purchase.v != null && life.v > 0 ? purchase.v / life.v : null;
+  if (hours != null && (dep != null || maint.v != null)) {
+    const per_hour = (dep || 0) + (maint.v || 0);
+    const used = [dep != null && purchase.src, dep != null && life.src, maint.v != null && maint.src].filter(Boolean);
+    const basis = dep != null && maint.v != null ? "depreciation+maintenance" : (dep != null ? "depreciation" : "maintenance");
+    const source = used.includes("suggested") ? (used.includes("typed") ? "typed+suggested" : "suggested") : "typed";
+    machine = { per_hour: r3(per_hour), cost: r2(hours * per_hour), source, basis };
   }
   let energy = null;
   const e = p.energy || {};
-  const rate = num(R.kwh_rate);
-  if (num(e.kwh) != null) energy = { kwh: r3(e.kwh), cost: rate != null ? r2(e.kwh * rate) : null, source: e.source || "metered" };
-  else if (hours != null && num(pr.avg_watts) > 0) { const kwh = hours * pr.avg_watts / 1000; energy = { kwh: r3(kwh), cost: rate != null ? r2(kwh * rate) : null, source: "watts" }; }
+  const rate = pick("kwh_rate", false), watts = pick("avg_watts", true);
+  const rateCost = kwh => rate.v != null ? r2(kwh * rate.v) : null;
+  if (num(e.kwh) != null) energy = { kwh: r3(e.kwh), cost: rateCost(e.kwh), source: rate.src === "suggested" && rate.v != null ? "suggested" : (e.source || "metered"), kwh_source: e.source || "metered", rate_source: rate.src };
+  else if (hours != null && watts.v > 0) {
+    const kwh = hours * watts.v / 1000;
+    const sug = watts.src === "suggested" || (rate.v != null && rate.src === "suggested");
+    energy = { kwh: r3(kwh), cost: rateCost(kwh), source: sug ? "suggested" : "watts", watts: watts.v, watts_source: watts.src, rate_source: rate.src };
+  }
   const blanks = [];
   if (material.cost == null) blanks.push(material.source === "deduction" ? "material (a loaded roll has no price)" : (grams == null ? "material (no grams)" : "material (no rate)"));
   if (!machine) blanks.push(hours == null ? "machine (no time)" : "machine (no printer rates)");
@@ -134,8 +237,9 @@ function projectSummary(project, prints, rates) {
   const sources = {
     material: tally(r => r.cost.material.cost == null ? "blank" : r.cost.material.source),
     material_partial: counted.filter(r => r.cost.material.partial).length,
+    grams: tally(r => r.cost.material.grams == null ? "blank" : r.cost.material.grams_source),
     time: tally(r => r.cost.time_source),
-    machine: tally(r => r.cost.machine ? "typed" : "blank"),
+    machine: tally(r => r.cost.machine ? r.cost.machine.source : "blank"),
     energy: tally(r => r.cost.energy && r.cost.energy.cost != null ? r.cost.energy.source : "blank")
   };
   const items = Array.isArray(project && project.items) ? project.items : [];
@@ -248,7 +352,8 @@ function quoteHtml(o) {
   const { project, client, summary: s, pricing: pz, prints, rates } = o;
   const usd = v => v == null ? "—" : "$" + Number(v).toFixed(2);
   const hrs = h => h == null ? "—" : (h < 1 ? Math.round(h * 60) + " min" : (Math.round(h * 10) / 10) + " h");
-  const SRC = { deduction: "actual (loaded rolls)", flat: "flat $/g", slicer: "slicer estimate", actual: "actual", watts: "typed watts", metered: "metered", typed: "typed rates" };
+  const SRC = { deduction: "actual (loaded rolls)", flat: "flat $/g", slicer: "slicer estimate", actual: "actual", history: "printer history", "hub-clock": "Hub clock", "printer-meta": "printer metadata",
+                watts: "typed watts", metered: "metered", typed: "typed rates", suggested: "suggested rates", "typed+suggested": "typed + suggested rates" };
   const srcLine = t => Object.entries(t || {}).map(([k, n]) => n + " " + (SRC[k] || k)).join(", ");
   const rows = (prints || []).map(p => {
     const c = costOf(p, rates);
@@ -272,7 +377,7 @@ function quoteHtml(o) {
     (rows || "<tr><td colspan=10>No prints on this project yet.</td></tr>") + "</table>" +
     (items ? "<h2>Line items</h2><table><tr><th>Kind</th><th>Item</th><th class=n>Amount</th></tr>" + items + "</table>" : "") +
     "<h2>Cost</h2><table>" +
-    line("Material", usd(s.material), srcLine(s.sources.material) + (s.sources.material_partial ? " · " + s.sources.material_partial + " partial" : "")) +
+    line("Material", usd(s.material), srcLine(s.sources.material) + (s.sources.material_partial ? " · " + s.sources.material_partial + " partial" : "") + (s.sources.grams ? " · grams: " + srcLine(s.sources.grams) : "")) +
     line("Machine time", usd(s.machine), srcLine(s.sources.machine)) + line("Energy", usd(s.energy), srcLine(s.sources.energy)) +
     line("Labour", usd(s.labor.cost), s.labor.minutes + " min" + (s.labor.setup_minutes ? " incl. " + s.labor.setup_minutes + " min setup per print" : "")) + line("Extras", usd(s.extras), "hardware, packaging, shipping") +
     (s.failure ? line("Failure allowance", usd(s.failure), rates.failure_pct + "% of print cost (no failed prints recorded)") : "") +
@@ -323,9 +428,138 @@ function register(ctx) {
       out.printers[i] = {};
       for (const k of Object.keys(PRINTER_KEYS)) out.printers[i][k] = num(p && p[k]);
     }
-    return { ...out, ...flat() };
+    return { ...out, ...flat(), suggested: SUGGESTED };
   }
-  const ratesView = () => ({ ...conf(), printer_names: printers().map((p, i) => ({ idx: i, name: p.name || ("printer " + (i + 1)) })), keys: Object.keys(RATE_KEYS), printer_keys: Object.keys(PRINTER_KEYS) });
+  const ratesView = () => ({ ...conf(), suggested: { ...SUGGESTED, notes: SUGGESTED_NOTES },
+    printer_names: printers().map((p, i) => ({ idx: i, name: p.name || ("printer " + (i + 1)), type: p.type || "u1", hours: HOURS[String(i)] ? HOURS[String(i)].hours : null, hours_at: HOURS[String(i)] ? HOURS[String(i)].at : null })),
+    keys: Object.keys(RATE_KEYS), printer_keys: Object.keys(PRINTER_KEYS) });
+
+  // ---- Moonraker, read-only: tiny JSON GETs, bounded, never a gcode body ------------
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const baseOf = idx => { const p = printers()[idx]; const b = p && String(p.url || "").replace(/\/+$/, ""); return b || null; };
+  let GETS = 0;                                   // every Moonraker GET this module made (the harness reads it)
+  async function moonGet(base, pathq) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), MOON_TIMEOUT_MS);
+    try {
+      GETS++;
+      const r = await fetch(base + pathq, { signal: ac.signal });
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return ((await r.json()) || {}).result || null;
+    } finally { clearTimeout(t); }
+  }
+  // Backfill pacing: one request at a time, BACKFILL_PAUSE_MS apart.
+  let LAST_PACED = 0, MIN_GAP = null;      // MIN_GAP: smallest gap between two paced GETs in the current backfill
+  async function pacedGet(base, pathq) {
+    const wait = LAST_PACED + BACKFILL_PAUSE_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    const now = Date.now();
+    if (LAST_PACED) MIN_GAP = MIN_GAP == null ? now - LAST_PACED : Math.min(MIN_GAP, now - LAST_PACED);
+    LAST_PACED = now;
+    return moonGet(base, pathq);
+  }
+  // Life-hours progress per printer from /server/history/totals, the same read
+  // modules/logbook.js makes, cached ten minutes. Awaited by GET /api/costing.
+  const HOURS = {};
+  let HOURS_AT = 0, HOURS_BUSY = null;
+  function refreshHours(force) {
+    if (!force && HOURS_AT && Date.now() - HOURS_AT < HOURS_TTL_MS) return Promise.resolve();
+    if (HOURS_BUSY) return HOURS_BUSY;
+    HOURS_BUSY = Promise.all(printers().map(async (p, i) => {
+      const base = baseOf(i); if (!base) return;
+      try {
+        const tot = ((await moonGet(base, "/server/history/totals")) || {}).job_totals || {};
+        if (Number.isFinite(tot.total_print_time)) HOURS[String(i)] = { hours: Math.round(tot.total_print_time / 36) / 100, at: Date.now() };
+      } catch {}
+    })).then(() => { HOURS_AT = Date.now(); }).finally(() => { HOURS_BUSY = null; });
+    return HOURS_BUSY;
+  }
+  // The printer's own metadata for a file (grams, estimate, per-tool types),
+  // cached per printer+file. A 404 (file gone, or never scanned) is cached as
+  // "none" so a boot backfill does not ask again; POST /api/costing/backfill
+  // clears those. A network failure is not cached at all.
+  const META = new Map();
+  function shapeMeta(m) {
+    if (!m || typeof m !== "object") return null;
+    const material = materialOf(m.filament_type);
+    let grams = num(m.filament_weight_total) > 0 ? r2(m.filament_weight_total) : null, conv = null;
+    if (grams == null && num(m.filament_total) > 0) { conv = mmToGrams(m.filament_total, material); grams = conv ? conv.grams : null; }
+    const est_minutes = num(m.estimated_time) > 0 ? Math.round(m.estimated_time / 60) : null;
+    if (grams == null && est_minutes == null) return null;
+    return { found: true, at: Date.now(), grams, grams_via: conv ? "mm" : "weight", density: conv ? conv.density : null, density_assumed: conv ? conv.assumed : false, est_minutes, material, slicer: m.slicer ? String(m.slicer).slice(0, 60) : null };
+  }
+  async function metaFor(idx, name, paced) {
+    const base = baseOf(idx); if (!base) return null;
+    const key = idx + ":" + name, hit = META.get(key);
+    if (hit) return hit.found ? hit : null;
+    const m = await (paced ? pacedGet : moonGet)(base, "/server/files/metadata?filename=" + encodeURIComponent(name));
+    const rec = shapeMeta(m) || { found: false, at: Date.now() };
+    META.set(key, rec);
+    if (META.size > META_MAX) META.delete(META.keys().next().value);
+    return rec.found ? rec : null;
+  }
+  // The printer's job history (newest first), cached a minute per printer.
+  const HIST = new Map();
+  async function historyFor(idx, paced) {
+    const base = baseOf(idx); if (!base) return null;
+    const hit = HIST.get(idx);
+    if (hit && Date.now() - hit.at < HIST_TTL_MS) return hit.jobs;
+    const r = await (paced ? pacedGet : moonGet)(base, "/server/history/list?limit=200&order=desc");
+    const jobs = r && Array.isArray(r.jobs) ? r.jobs : [];
+    HIST.set(idx, { at: Date.now(), jobs });
+    return jobs;
+  }
+  // The history job that IS this row: same file, ended within HISTORY_MATCH_S
+  // of the row's timestamp; the closest wins.
+  function matchJob(jobs, row) {
+    const end = row.at / 1000;
+    let best = null, gap = Infinity;
+    for (const j of jobs || []) {
+      if (!j || path.basename(String(j.filename || "")) !== row.file) continue;
+      const je = num(j.end_time) != null ? j.end_time : (num(j.start_time) != null && num(j.total_duration) != null ? j.start_time + j.total_duration : null);
+      if (je == null) continue;
+      const g = Math.abs(je - end);
+      if (g < HISTORY_MATCH_S && g < gap) { best = j; gap = g; }
+    }
+    return best;
+  }
+  // Fill what the row lacks from printer metadata; true when anything changed.
+  function applyMeta(row, meta) {
+    if (!meta) return false;
+    let changed = false;
+    row.material = row.material || { grams: null, cost: null, source: null, partial: row.outcome !== "done", heads: [] };
+    if (row.material.grams == null && meta.grams != null) {
+      const prog = num(row.material.progress);
+      Object.assign(row.material, { grams: r2(meta.grams * (prog != null ? prog : 1)), source: row.material.source === "deduction" ? "deduction" : "printer-meta", grams_source: "printer-meta",
+        material: meta.material || null, density: meta.density, density_assumed: !!meta.density_assumed });
+      changed = true;
+    }
+    // The estimate is kept beside an actual duration, as it is for library files.
+    if (!(num(row.est_minutes) > 0) && meta.est_minutes != null) { row.est_minutes = meta.est_minutes; row.est_source = "printer-meta"; changed = true; }
+    if (!row.material.material && meta.material) row.material.material = meta.material;
+    return changed;
+  }
+  // Fill what the row still lacks from its history job; true when anything changed.
+  function applyJob(row, job) {
+    if (!job) return false;
+    let changed = false;
+    const meta = shapeMeta(job.metadata);
+    if (meta && applyMeta(row, meta)) changed = true;
+    row.material = row.material || { grams: null, cost: null, source: null, partial: row.outcome !== "done", heads: [] };
+    if (row.material.grams == null && num(job.filament_used) > 0) {
+      const mat = row.material.material || (meta && meta.material) || materialOf(job.metadata && job.metadata.filament_type) || null;
+      const conv = mmToGrams(job.filament_used, mat);
+      if (conv) {
+        Object.assign(row.material, { grams: conv.grams, source: row.material.source === "deduction" ? "deduction" : "history", grams_source: "history",
+          material: conv.material, density: conv.density, density_assumed: conv.assumed, filament_mm: r2(job.filament_used) });
+        changed = true;
+      }
+    }
+    if (!(num(row.seconds) > 0) && num(job.print_duration) > 0) { row.seconds = Math.round(job.print_duration); row.seconds_source = "history"; changed = true; }
+    if (job.job_id && !row.history_job) { row.history_job = String(job.job_id); changed = true; }
+    return changed;
+  }
 
   // ---- file facts (slicer grams, time, cost), head+tail read, cached ---------------
   const FACTS = new Map();
@@ -390,26 +624,90 @@ function register(ctx) {
       const s = START.get(idx);
       if (seconds == null && s && s.file === name) { seconds = Math.round((Date.now() - s.at) / 1000); seconds_source = "hub-clock"; }
     }
+    const now = Date.now();
+    START.delete(idx);
+    // The same print reported done twice (the printer's state flapped back to
+    // printing and to complete again, print_duration still counting): the two
+    // events compute the same START. One row, the longer duration, no second
+    // print on the bill.
+    if (outcome === "done" && seconds != null) {
+      const start = now - seconds * 1000;
+      const dup = [...L.prints].reverse().find(r => r.printer_id === idx && r.file === name && r.outcome === "done" && num(r.seconds) > 0 && r.seconds_source !== "history" && Math.abs((r.at - r.seconds * 1000) - start) < DUP_SLACK_MS);
+      if (dup) {
+        const before = dup.seconds;
+        dup.seconds = Math.max(dup.seconds, seconds); dup.at = now; dup.done_twice = (dup.done_twice || 0) + 1;
+        saveL();
+        ctx.hublog("info", "costing: " + dup.printer + " done " + name + " reported again (" + before + " s -> " + dup.seconds + " s); same print, row updated, nothing added");
+        return dup;
+      }
+    }
     const grams = facts && facts.grams != null ? r2(facts.grams * (progress != null ? progress : 1)) : null;
     const key = pendKey(slug, name);
     const job = jobOf(idx, name);
-    const row = { id: newId("pt"), at: Date.now(), printer_id: idx, printer: (p && p.name) || ev.printer || ("printer " + (idx + 1)), file: name, type: slug, outcome,
+    const row = { id: newId("pt"), at: now, printer_id: idx, printer: (p && p.name) || ev.printer || ("printer " + (idx + 1)), file: name, type: slug, outcome,
       project_id: P.pending[key] || null, job_id: job ? job.id : null, bundle_id: job && job.bundle_id ? job.bundle_id : null,
-      seconds, seconds_source, est_minutes: facts ? facts.est_minutes : null,
-      material: { grams, cost: null, source: grams != null ? "slicer" : null, partial: outcome !== "done", progress, slicer_cost: facts ? facts.slicer_cost : null, heads: [] },
+      seconds, seconds_source, est_minutes: facts ? facts.est_minutes : null, est_source: facts && facts.est_minutes != null ? "slicer" : null,
+      material: { grams, cost: null, source: grams != null ? "slicer" : null, grams_source: grams != null ? "slicer" : null, partial: outcome !== "done", progress, slicer_cost: facts ? facts.slicer_cost : null, heads: [] },
       energy: null, pieces: qtyFromName(name) || 1, counted: true, note: "" };
+    // Not in the library (sent straight from the slicer to the printer): ask
+    // the printer, which still has the file, for its metadata. One small GET.
+    if (row.material.grams == null || (row.seconds == null && row.est_minutes == null)) {
+      try { applyMeta(row, await metaFor(idx, name, false)); }
+      catch (e) { ctx.hublog("warn", "costing: " + row.printer + " metadata for " + name + " - " + e.message); }
+    }
     // A pending assignment is spent by the print that FINISHES; a cancelled
     // attempt lands in the project too but leaves the assignment for the retry.
     if (outcome === "done" && row.project_id) { delete P.pending[key]; saveP(); }
-    START.delete(idx);
     const stash = STASH.get(idx + ":" + name);
     if (stash && Date.now() - stash.at < STASH_MS) { applyDeduction(row, stash.rec); STASH.delete(idx + ":" + name); }
     L.prints.push(row);
     if (L.prints.length > LEDGER_MAX) L.prints.splice(0, L.prints.length - LEDGER_MAX);
     saveL();
-    ctx.hublog("info", "costing: " + row.printer + " " + outcome + " " + name + (seconds != null ? " after " + seconds + " s" : "") + (row.project_id ? " -> project " + row.project_id : ""));
+    ctx.hublog("info", "costing: " + row.printer + " " + outcome + " " + name + (seconds != null ? " after " + seconds + " s" : "") +
+      (row.material.grams != null ? " · " + row.material.grams + " g (" + row.material.grams_source + ")" : " · no grams") + (row.project_id ? " -> project " + row.project_id : ""));
     return row;
   }
+
+  // ---- backfill: rows an older Hub left blank -----------------------------------
+  // One Moonraker GET at a time, BACKFILL_PAUSE_MS apart; a row is marked
+  // `autofill` whatever the outcome so the boot pass never asks twice for the
+  // same blank. POST /api/costing/backfill forces a retry of every blank row.
+  const needsFill = r => (r.material || {}).grams == null || (!(num(r.seconds) > 0) && !(num(r.est_minutes) > 0));
+  let BACKFILL = null, LAST_BACKFILL = null;
+  function backfill(opts) {
+    if (BACKFILL) return BACKFILL;
+    const force = !!(opts && opts.force);
+    BACKFILL = (async () => {
+      if (force) { for (const [k, v] of META) if (!v.found) META.delete(k); HIST.clear(); }
+      const todo = L.prints.filter(r => needsFill(r) && (force || !r.autofill));
+      const out = { at: Date.now(), forced: force, blank: L.prints.filter(needsFill).length, checked: todo.length, filled: 0, meta: 0, history: 0, none: 0, requests: 0, errors: 0, ms: 0, pause_ms: BACKFILL_PAUSE_MS, min_gap_ms: null };
+      const gets0 = GETS;
+      LAST_PACED = 0; MIN_GAP = null;
+      for (const row of todo) {
+        const idx = Number(row.printer_id);
+        let how = [];
+        try {
+          if (baseOf(idx)) {
+            if (applyMeta(row, await metaFor(idx, row.file, true))) how.push("meta");
+            if (needsFill(row)) { const jobs = await historyFor(idx, true); if (applyJob(row, matchJob(jobs, row))) how.push("history"); }
+          }
+        } catch (e) { out.errors++; ctx.hublog("warn", "costing: backfill " + row.printer + " " + row.file + " - " + e.message); }
+        row.autofill = { at: Date.now(), result: how.length ? how.join("+") : "none", still_blank: needsFill(row) };
+        if (how.includes("meta")) out.meta++;
+        if (how.includes("history")) out.history++;
+        if (how.length) out.filled++; else out.none++;
+      }
+      out.requests = GETS - gets0;
+      out.min_gap_ms = MIN_GAP;
+      out.ms = Date.now() - out.at;
+      if (todo.length) saveL();
+      LAST_BACKFILL = out;
+      ctx.hublog("info", "costing: backfill " + (force ? "(forced) " : "") + out.checked + " blank row" + (out.checked === 1 ? "" : "s") + " checked, " + out.filled + " filled (" + out.meta + " from printer metadata, " + out.history + " from job history), " + out.none + " still blank, " + out.requests + " GETs in " + out.ms + " ms");
+      return out;
+    })().finally(() => { BACKFILL = null; });
+    return BACKFILL;
+  }
+  if (BACKFILL_BOOT_MS > 0) { const t0 = setTimeout(() => { backfill({ force: false }).catch(e => ctx.hublog("warn", "costing: boot backfill failed - " + e.message)); }, BACKFILL_BOOT_MS); if (t0.unref) t0.unref(); }
   if (ctx.events) {
     ctx.events.on("print.started", ev => { if (Number.isInteger(Number(ev.id)) && ev.filename) START.set(Number(ev.id), { file: path.basename(String(ev.filename)), at: Date.now() }); });
     ctx.events.on("print.done", ev => { record(ev, "done").catch(e => ctx.hublog("warn", "costing: ledger write failed - " + e.message)); });
@@ -437,6 +735,21 @@ function register(ctx) {
     return { project: pr, client: client(pr.client_id), summary: s, pricing: pricing(s, R, floorFor(s.grams)), prints: rows.map(r => ({ ...r, cost: costOf(r, R) })) };
   }
   const brief = pr => { const s = projectSummary(pr, printsOf(pr.id), conf()); return { ...pr, summary: { cost: s.cost, charged: s.charged, margin: s.margin, margin_pct: s.margin_pct, prints: s.prints, counted: s.counted, failed: s.failed, pieces: s.pieces, hours: s.hours, partial: s.partial } }; };
+  // What the whole ledger's numbers came from, for the tab's "filled by the
+  // Hub / set by you" note: a tally per line of every row's source.
+  const ledgerSources = R => {
+    const t = { grams: {}, time: {}, material: {}, machine: {}, energy: {} };
+    const add = (k, v) => { t[k][v] = (t[k][v] || 0) + 1; };
+    for (const r of L.prints) {
+      const c = costOf(r, R);
+      add("grams", c.material.grams == null ? "blank" : c.material.grams_source || "unknown");
+      add("time", c.time_source || "blank");
+      add("material", c.material.cost == null ? "blank" : c.material.source);
+      add("machine", c.machine ? c.machine.source : "blank");
+      add("energy", c.energy && c.energy.cost != null ? c.energy.source : "blank");
+    }
+    return t;
+  };
   const view = () => {
     const R = conf();
     return {
@@ -445,13 +758,25 @@ function register(ctx) {
       pending: P.pending,
       unassigned: L.prints.filter(r => !r.project_id).slice(-30).reverse().map(r => ({ ...r, cost: costOf(r, R) })),
       unassigned_total: L.prints.filter(r => !r.project_id).length,
-      ledger_total: L.prints.length, ledger_max: LEDGER_MAX
+      ledger_total: L.prints.length, ledger_max: LEDGER_MAX,
+      sources: ledgerSources(R), blank_rows: L.prints.filter(needsFill).length,
+      backfill: { running: !!BACKFILL, last: LAST_BACKFILL, pause_ms: BACKFILL_PAUSE_MS }
     };
   };
   const bad = (res, msg) => res.status(400).json({ error: msg });
 
   // ---- routes: rates ------------------------------------------------------------------------
-  ctx.app.get("/api/costing", (req, res) => res.json({ fork: "ryvin/u1hub", ...ratesView() }));
+  ctx.app.get("/api/costing", async (req, res) => {
+    try { await refreshHours(String((req.query || {}).refresh || "") === "1"); } catch {}
+    res.json({ fork: "ryvin/u1hub", ...ratesView() });
+  });
+  // Fill blank grams/time from the printers now (forced: retries every blank
+  // row, including ones a boot pass already asked about). Answers when done.
+  ctx.app.post("/api/costing/backfill", async (req, res) => {
+    if (BACKFILL) return res.status(409).json({ error: "A backfill is already running" });
+    try { res.json({ ok: true, ...(await backfill({ force: true })) }); }
+    catch (e) { res.status(500).json({ error: "backfill failed - " + e.message }); }
+  });
   ctx.app.post("/api/costing/settings", (req, res) => {
     const b = req.body || {};
     const cur = (ctx.cfg.costing && typeof ctx.cfg.costing === "object") ? ctx.cfg.costing : {};
@@ -630,4 +955,5 @@ function register(ctx) {
   ctx.hublog("info", "costing (ryvin/u1hub fork module) armed: " + L.prints.length + " ledger rows, " + Object.keys(P.projects).length + " projects");
 }
 
-module.exports = { register, costOf, projectSummary, pricing, grossUp, netOf, projectCsv, quoteHtml, LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES };
+module.exports = { register, costOf, projectSummary, pricing, grossUp, netOf, projectCsv, quoteHtml, mmToGrams, materialOf, densityOf,
+                   LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES, DENSITY, FILAMENT_DIAMETER_MM, SUGGESTED, SUGGESTED_NOTES };
