@@ -72,8 +72,13 @@ const fsp = fs.promises;
 const path = require("path");
 const { parseGcodeMap, estMinutes } = require("../parser.js");
 const { qtyFromName, csvCell } = require("./margin.js");
+const REPORT = require("./costing-report.js");    // report / reportCsv / reportHtml, pure
 
-const LEDGER_MAX = 5000;
+// The ledger cap. 10,000 rows: three printers at five prints a day each is
+// ~5,500 rows a year, so this holds about two years of a busy farm, and at
+// ~1 KB a row the file (written whole on every assignment) stays near 10 MB.
+// Oldest rows go first. Overridable for a bigger farm or a test.
+const LEDGER_MAX = Math.max(10, Number(process.env.U1HUB_COSTING_LEDGER_MAX) || 10000);
 const FACTS_MAX = 500;                 // parsed-file cache entries
 const STASH_MS = 10 * 60 * 1000;       // a deduction and its ledger row must be within this
 const HEAD_BYTES = 64 * 1024, TAIL_BYTES = 512 * 1024;
@@ -99,10 +104,26 @@ const DENSITY = Object.freeze({ PLA: 1.24, PETG: 1.27, ABS: 1.04, ASA: 1.07, TPU
 // with the date it was read. They apply to a U1 (row.type "u1"); a generic
 // Klipper printer gets no printer suggestion. SUGGESTED_NOTES is what Settings
 // prints beside each placeholder.
+// `printers` is the U1 block (applies_to "u1"); `by_type` keys a block per
+// printer type. A type with no block gets no printer suggestion at all. The
+// Kobra S1 block carries only what could be cited: its price and the generic
+// life-hours guide; no watts and no maintenance reserve (docs/costing.md).
 const SUGGESTED = Object.freeze({
   kwh_rate: 0.183,
   printers: Object.freeze({ purchase: 849, life_hours: 5000, maint_per_hour: 0.10, avg_watts: 150 }),
-  applies_to: "u1"
+  applies_to: "u1",
+  by_type: Object.freeze({
+    u1: Object.freeze({ purchase: 849, life_hours: 5000, maint_per_hour: 0.10, avg_watts: 150 }),
+    "kobra-s1": Object.freeze({ purchase: 401, life_hours: 5000 })
+  })
+});
+const SUGGESTED_TYPE_NOTES = Object.freeze({
+  "kobra-s1": Object.freeze({
+    purchase: "Anycubic Kobra S1 on store.anycubic.com, 2026-10-03 ($401 sale, $631 regular)",
+    life_hours: "Snapmaker's cost guide figure for any well-maintained printer (~5,000 h); no Kobra-specific figure published",
+    maint_per_hour: "no suggestion: no cited Kobra S1 parts prices or intervals",
+    avg_watts: "no suggestion: the one measured figure found (Igor's Lab review, 180 W printing PLA) could not be read at source; type it if you trust it"
+  })
 });
 const SUGGESTED_NOTES = Object.freeze({
   kwh_rate: "U.S. residential average, EIA Electric Power Monthly table 5.6.A, July 2026 (18.31 c/kWh)",
@@ -120,6 +141,22 @@ const DUP_SLACK_MS = 10 * 60 * 1000;    // two print.done for one job: their com
 const HOURS_TTL_MS = 10 * 60 * 1000;    // Moonraker totals (life-hours progress) are re-read at most this often
 const BACKFILL_PAUSE_MS = Math.max(0, Number(process.env.U1HUB_COSTING_BACKFILL_PAUSE_MS ?? 1000));
 const BACKFILL_BOOT_MS = Math.max(0, Number(process.env.U1HUB_COSTING_BACKFILL_BOOT_MS ?? 15000));
+// The job-history import (every printer's own Moonraker history -> ledger
+// rows). Paged IMPORT_PAGE jobs at a time through the same paced GET as the
+// backfill, at boot (after the backfill) and every IMPORT_MS; a job that
+// ended inside IMPORT_SETTLE_MS is left for the next run so the Hub's own
+// print.done, which is a few seconds behind the printer, writes that row.
+const IMPORT_PAGE = Math.min(1000, Math.max(1, Number(process.env.U1HUB_COSTING_IMPORT_PAGE) || 100));
+const IMPORT_MAX_PAGES = 100;                           // per printer per run: 10,000 jobs at the default page
+const IMPORT_SETTLE_MS = Math.max(0, Number(process.env.U1HUB_COSTING_IMPORT_SETTLE_MS ?? 2 * 60 * 1000));
+const IMPORT_MS = Math.max(0, Number(process.env.U1HUB_COSTING_IMPORT_MS ?? 3600000));
+const IMPORT_BOOT_MS = Math.max(0, Number(process.env.U1HUB_COSTING_IMPORT_BOOT_MS ?? 15000));
+const HUB_END_SLACK_MS = 10 * 60 * 1000;                // a Hub-watched row and a history job are the same print when their ends agree within this
+const HUB_START_SLACK_MS = 5 * 60 * 1000;               // ...or their starts (end - print_duration) do
+// Moonraker job status -> ledger outcome. in_progress is skipped (the Hub's
+// own events will write it when it ends); anything unknown is a failed print.
+const STATUS_OUTCOME = Object.freeze({ completed: "done", cancelled: "cancelled", error: "error", klippy_shutdown: "error", klippy_disconnect: "error", interrupted: "error", server_exit: "error" });
+const MATCH_MAX_IDS = 10000;
 
 const r2 = v => Math.round(v * 100) / 100;
 const r3 = v => Math.round(v * 1000) / 1000;
@@ -166,12 +203,14 @@ function costOf(print, rates) {
   const p = print || {}, R = rates || {};
   const typed = ((R.printers || {})[String(p.printer_id)]) || {};
   const S = (R.suggested && typeof R.suggested === "object") ? R.suggested : null;
-  const sugOk = !!S && (p.type == null || !S.applies_to || p.type === S.applies_to);
+  // The printer block for this row's type: by_type first, else the default
+  // block when the type is the one it applies to (or the row has no type).
+  const SP = !S ? null : ((S.by_type && p.type != null && S.by_type[p.type]) || ((p.type == null || !S.applies_to || p.type === S.applies_to) ? (S.printers || null) : null));
   // A typed rate wins; a suggestion fills only an unset one, and says so.
   const pick = (key, perPrinter) => {
     const t = num(perPrinter ? typed[key] : R[key]);
     if (t != null) return { v: t, src: "typed" };
-    const s = sugOk ? num(perPrinter ? (S.printers || {})[key] : S[key]) : null;
+    const s = perPrinter ? (SP ? num(SP[key]) : null) : (S ? num(S[key]) : null);
     return s != null ? { v: s, src: "suggested" } : { v: null, src: null };
   };
   const m = p.material || {};
@@ -430,7 +469,7 @@ function register(ctx) {
     }
     return { ...out, ...flat(), suggested: SUGGESTED };
   }
-  const ratesView = () => ({ ...conf(), suggested: { ...SUGGESTED, notes: SUGGESTED_NOTES },
+  const ratesView = () => ({ ...conf(), suggested: { ...SUGGESTED, notes: SUGGESTED_NOTES, type_notes: SUGGESTED_TYPE_NOTES },
     printer_names: printers().map((p, i) => ({ idx: i, name: p.name || ("printer " + (i + 1)), type: p.type || "u1", hours: HOURS[String(i)] ? HOURS[String(i)].hours : null, hours_at: HOURS[String(i)] ? HOURS[String(i)].at : null })),
     keys: Object.keys(RATE_KEYS), printer_keys: Object.keys(PRINTER_KEYS) });
 
@@ -707,7 +746,126 @@ function register(ctx) {
     })().finally(() => { BACKFILL = null; });
     return BACKFILL;
   }
-  if (BACKFILL_BOOT_MS > 0) { const t0 = setTimeout(() => { backfill({ force: false }).catch(e => ctx.hublog("warn", "costing: boot backfill failed - " + e.message)); }, BACKFILL_BOOT_MS); if (t0.unref) t0.unref(); }
+
+  // ---- import: every printer's own job history -> ledger rows ----------------------
+  // Prints the Hub never watched (started from the printer's screen, or
+  // finished while the Hub was down) are in each printer's Moonraker history.
+  // Each job is keyed by printer + job_id so a run imports it once; a job the
+  // Hub DID watch is recognised by printer + file + end (or start) time and
+  // that row wins, gaining the job_id and any blank it can fill. One paced
+  // GET per page, IMPORT_PAGE jobs a page, newest first; a run stops at the
+  // first page with nothing new unless `full` asks it to read everything.
+  // Offline printers are skipped and tried again next run.
+  const jobEndMs = j => {
+    const e = num(j.end_time); if (e > 0) return Math.round(e * 1000);
+    const s = num(j.start_time), t = num(j.total_duration);
+    return s > 0 ? Math.round((s + (t > 0 ? t : 0)) * 1000) : null;
+  };
+  // Two Hub rows for the same file can sit minutes apart (a cancelled attempt
+  // and its retry); the one whose outcome agrees and whose end is closest
+  // is the job's row.
+  function hubRowFor(idx, name, job, outcome) {
+    const end = jobEndMs(job), start = num(job.start_time) > 0 ? Math.round(job.start_time * 1000) : null;
+    let best = null, score = Infinity;
+    for (const r of L.prints) {
+      if (r.printer_id !== idx || r.file !== name || r.history_job || r.source === "history") continue;
+      const endGap = end != null ? Math.abs(r.at - end) : Infinity;
+      const startGap = start != null && num(r.seconds) > 0 ? Math.abs((r.at - r.seconds * 1000) - start) : Infinity;
+      if (endGap >= HUB_END_SLACK_MS && startGap >= HUB_START_SLACK_MS) continue;
+      const s = Math.min(endGap, startGap) + (r.outcome === outcome ? 0 : HUB_END_SLACK_MS * 10);
+      if (s < score) { best = r; score = s; }
+    }
+    return best;
+  }
+  function rowFromJob(idx, p, job, outcome, name, end) {
+    const meta = shapeMeta(job.metadata);
+    const seconds = num(job.print_duration) > 0 ? Math.round(job.print_duration) : null;
+    const est_minutes = meta && meta.est_minutes != null ? meta.est_minutes : null;
+    // A cancelled or failed job used a fraction of the file's filament: the
+    // share of the slicer's estimated time it ran, when both are known.
+    let progress = null;
+    if (outcome !== "done" && seconds != null && est_minutes > 0) progress = r3(Math.min(1, seconds / (est_minutes * 60)));
+    const material = { grams: null, cost: null, source: null, grams_source: null, partial: outcome !== "done", progress, slicer_cost: null, heads: [],
+                       material: (meta && meta.material) || materialOf(job.metadata && job.metadata.filament_type) || null };
+    if (meta && meta.grams != null && (outcome === "done" || progress != null))
+      Object.assign(material, { grams: r2(meta.grams * (progress != null ? progress : 1)), source: "printer-meta", grams_source: "printer-meta", density: meta.density, density_assumed: !!meta.density_assumed });
+    else if (num(job.filament_used) > 0) {
+      const conv = mmToGrams(job.filament_used, material.material);
+      if (conv) Object.assign(material, { grams: conv.grams, source: "history", grams_source: "history", material: conv.material, density: conv.density, density_assumed: conv.assumed, filament_mm: r2(job.filament_used) });
+    }
+    return { id: newId("pt"), at: end, printer_id: idx, printer: (p && p.name) || ("printer " + (idx + 1)), file: name, type: (p && p.type) || "u1", outcome,
+      project_id: null, job_id: null, bundle_id: null, seconds, seconds_source: seconds != null ? "history" : null, est_minutes, est_source: est_minutes != null ? "printer-meta" : null,
+      material, energy: null, pieces: qtyFromName(name) || 1, counted: true, note: "", source: "history", history_job: String(job.job_id), history_status: String(job.status || ""), imported_at: Date.now() };
+  }
+  let IMPORT = null, LAST_IMPORT = null;
+  function importHistory(opts) {
+    if (IMPORT) return IMPORT;
+    const full = !!(opts && opts.full);
+    IMPORT = (async () => {
+      const out = { at: Date.now(), full, printers: [], imported: 0, matched: 0, known: 0, skipped: 0, pages: 0, requests: 0, errors: 0, offline: [], dropped: 0, ms: 0, pause_ms: BACKFILL_PAUSE_MS, min_gap_ms: null };
+      const gets0 = GETS;
+      LAST_PACED = 0; MIN_GAP = null;
+      let fleet = []; try { fleet = (await ctx.fleet()) || []; } catch {}
+      const known = new Set(L.prints.filter(r => r.history_job).map(r => r.printer_id + ":" + r.history_job));
+      const settle = out.at - IMPORT_SETTLE_MS;
+      let changed = false;
+      for (let idx = 0; idx < printers().length; idx++) {
+        const p = printers()[idx], base = baseOf(idx);
+        if (!base) continue;
+        const pr = { idx, name: p.name || ("printer " + (idx + 1)), type: p.type || "u1", status: "ok", pages: 0, seen: 0, imported: 0, matched: 0, known: 0, skipped: 0 };
+        out.printers.push(pr);
+        const me = fleet.find(f => f && f.id === idx);
+        if (me && me.online === false) { pr.status = "offline"; out.offline.push(pr.name); continue; }
+        try {
+          for (let start = 0; pr.pages < IMPORT_MAX_PAGES; start += IMPORT_PAGE) {
+            const r = await pacedGet(base, "/server/history/list?limit=" + IMPORT_PAGE + "&start=" + start + "&order=desc");
+            pr.pages++;
+            const jobs = r && Array.isArray(r.jobs) ? r.jobs : [];
+            let fresh = 0;
+            for (const job of jobs) {
+              if (!job || job.job_id == null) continue;
+              pr.seen++;
+              const key = idx + ":" + job.job_id;
+              if (known.has(key)) { pr.known++; continue; }
+              const status = String(job.status || "");
+              const outcome = status === "in_progress" ? null : (STATUS_OUTCOME[status] || "error");
+              const name = path.basename(String(job.filename || ""));
+              const end = jobEndMs(job);
+              if (!outcome || !name || end == null || end > settle) { pr.skipped++; continue; }
+              fresh++; known.add(key); changed = true;
+              const hub = hubRowFor(idx, name, job, outcome);
+              if (hub) { hub.history_job = String(job.job_id); hub.history_status = status; applyJob(hub, job); pr.matched++; continue; }
+              L.prints.push(rowFromJob(idx, p, job, outcome, name, end));
+              pr.imported++;
+            }
+            if (jobs.length < IMPORT_PAGE) break;
+            if (!full && fresh === 0) break;
+          }
+          if (pr.pages >= IMPORT_MAX_PAGES) pr.status = "capped";
+        } catch (e) { pr.status = "error"; pr.error = e.message; out.errors++; ctx.hublog("warn", "costing: import from " + pr.name + " - " + e.message); }
+        for (const k of ["pages", "imported", "matched", "known", "skipped"]) out[k] += pr[k];
+      }
+      if (changed) {
+        L.prints.sort((a, b) => a.at - b.at);
+        if (L.prints.length > LEDGER_MAX) { out.dropped = L.prints.length - LEDGER_MAX; L.prints.splice(0, out.dropped); }
+        saveL();
+      }
+      out.requests = GETS - gets0;
+      out.min_gap_ms = MIN_GAP;
+      out.ms = Date.now() - out.at;
+      LAST_IMPORT = out;
+      ctx.hublog("info", "costing: import " + (full ? "(full) " : "") + out.imported + " job" + (out.imported === 1 ? "" : "s") + " imported, " + out.matched + " matched to rows the Hub watched, " + out.known + " already known, " + out.skipped + " skipped" +
+        (out.offline.length ? ", offline: " + out.offline.join(", ") : "") + (out.dropped ? ", " + out.dropped + " oldest rows dropped at the " + LEDGER_MAX + " cap" : "") + "; " + out.requests + " GETs over " + out.pages + " page" + (out.pages === 1 ? "" : "s") + " in " + out.ms + " ms");
+      return out;
+    })().finally(() => { IMPORT = null; });
+    return IMPORT;
+  }
+  const bootImport = () => importHistory({}).catch(e => ctx.hublog("warn", "costing: import failed - " + e.message));
+  if (BACKFILL_BOOT_MS > 0) {
+    const t0 = setTimeout(() => { backfill({ force: false }).catch(e => ctx.hublog("warn", "costing: boot backfill failed - " + e.message)).then(() => { if (IMPORT_BOOT_MS > 0) bootImport(); }); }, BACKFILL_BOOT_MS);
+    if (t0.unref) t0.unref();
+  } else if (IMPORT_BOOT_MS > 0) { const t1 = setTimeout(bootImport, IMPORT_BOOT_MS); if (t1.unref) t1.unref(); }
+  if (IMPORT_MS > 0) { const ti = setInterval(bootImport, IMPORT_MS); if (ti.unref) ti.unref(); }
   if (ctx.events) {
     ctx.events.on("print.started", ev => { if (Number.isInteger(Number(ev.id)) && ev.filename) START.set(Number(ev.id), { file: path.basename(String(ev.filename)), at: Date.now() }); });
     ctx.events.on("print.done", ev => { record(ev, "done").catch(e => ctx.hublog("warn", "costing: ledger write failed - " + e.message)); });
@@ -760,9 +918,41 @@ function register(ctx) {
       unassigned_total: L.prints.filter(r => !r.project_id).length,
       ledger_total: L.prints.length, ledger_max: LEDGER_MAX,
       sources: ledgerSources(R), blank_rows: L.prints.filter(needsFill).length,
-      backfill: { running: !!BACKFILL, last: LAST_BACKFILL, pause_ms: BACKFILL_PAUSE_MS }
+      imported_rows: L.prints.filter(r => r.source === "history").length,
+      backfill: { running: !!BACKFILL, last: LAST_BACKFILL, pause_ms: BACKFILL_PAUSE_MS },
+      import: { running: !!IMPORT, last: LAST_IMPORT, interval_ms: IMPORT_MS, page: IMPORT_PAGE }
     };
   };
+  // ---- the prints list: filters shared by GET /api/costing/prints and the reports ----
+  // from/to: epoch ms or anything Date.parse reads; [from, to). printer: index
+  // or name. assigned: "1" | "0". q: a case-insensitive substring of the file
+  // name, `*` a wildcard. source: "hub" | "history".
+  const timeOf = v => { if (v === "" || v == null) return null; const n = Number(v); if (Number.isFinite(n)) return n; const t = Date.parse(String(v)); return Number.isFinite(t) ? t : null; };
+  const patternOf = s => { const t = clean(s, 200); return t ? new RegExp(t.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*"), "i") : null; };
+  function filtersOf(q) {
+    const f = { from: timeOf(q.from), to: timeOf(q.to), printer: q.printer != null && q.printer !== "" ? String(q.printer) : null, type: q.type ? String(q.type) : null,
+      outcome: OUTCOMES.includes(q.outcome) ? q.outcome : null, assigned: q.assigned === "1" ? true : (q.assigned === "0" || String(q.unassigned || "") === "1" ? false : null),
+      project: q.project ? String(q.project) : null, client: q.client ? String(q.client) : null, q: clean(q.q, 200) || null, source: q.source === "hub" || q.source === "history" ? q.source : null };
+    return f;
+  }
+  function matcherOf(f) {
+    const re = f.q ? patternOf(f.q) : null;
+    const projectsOfClient = f.client ? new Set(Object.values(P.projects).filter(p => p.client_id === f.client).map(p => p.id)) : null;
+    return r => (f.from == null || r.at >= f.from) && (f.to == null || r.at < f.to) &&
+      (f.printer == null || String(r.printer_id) === f.printer || r.printer === f.printer) && (f.type == null || (r.type || "u1") === f.type) &&
+      (f.outcome == null || r.outcome === f.outcome) && (f.assigned == null || (!!r.project_id) === f.assigned) &&
+      (f.project == null || r.project_id === f.project) && (projectsOfClient == null || projectsOfClient.has(r.project_id)) &&
+      (re == null || re.test(r.file)) && (f.source == null || (r.source === "history" ? "history" : "hub") === f.source);
+  }
+  const facets = () => {
+    const printers = new Map(), types = new Set(), materials = new Set();
+    for (const r of L.prints) { printers.set(r.printer_id, { id: r.printer_id, name: r.printer, type: r.type || "u1" }); types.add(r.type || "u1"); if (r.material && r.material.material) materials.add(r.material.material); }
+    return { printers: [...printers.values()].sort((a, b) => a.id - b.id), types: [...types].sort(), materials: [...materials].sort(), outcomes: OUTCOMES };
+  };
+  function reportFor(q) {
+    const f = filtersOf(q);
+    return REPORT.report(L.prints, P.projects, P.clients, conf(), { from: f.from, to: f.to, groupBy: String(q.group_by || q.groupBy || "client"), tz_offset_min: num(q.tz_offset_min) || 0 });
+  }
   const bad = (res, msg) => res.status(400).json({ error: msg });
 
   // ---- routes: rates ------------------------------------------------------------------------
@@ -895,14 +1085,81 @@ function register(ctx) {
   });
 
   // ---- routes: prints ----------------------------------------------------------------------
-  // GET /api/costing/prints?unassigned=1&project=<id>&limit=<n>
+  // GET /api/costing/prints?from&to&printer&type&outcome&assigned=1|0&project&client&q&source&offset&limit
+  // (unassigned=1 still means assigned=0). Newest first, paged, with the total.
   ctx.app.get("/api/costing/prints", (req, res) => {
     const q = req.query || {}, R = conf();
-    let rows = L.prints;
-    if (String(q.unassigned || "") === "1") rows = rows.filter(r => !r.project_id);
-    if (q.project) rows = rows.filter(r => r.project_id === String(q.project));
-    const limit = Math.min(Math.max(1, Number(q.limit) || 200), LEDGER_MAX);
-    res.json({ prints: rows.slice(-limit).reverse().map(r => ({ ...r, cost: costOf(r, R) })), total: rows.length, ledger_total: L.prints.length });
+    const f = filtersOf(q);
+    const rows = L.prints.filter(matcherOf(f)).sort((a, b) => b.at - a.at);   // newest first (an older Hub appended backfilled rows out of order)
+    const limit = Math.min(Math.max(1, Number(q.limit) || 200), 1000);
+    const offset = Math.max(0, Math.floor(Number(q.offset) || 0));
+    res.json({ prints: rows.slice(offset, offset + limit).map(r => ({ ...r, cost: costOf(r, R) })), total: rows.length, offset, limit, ledger_total: L.prints.length, ledger_max: LEDGER_MAX, filters: f, facets: facets() });
+  });
+  // Many rows at once: { print_ids: [...], project_id: <id> | null, counted: bool }.
+  // A key that is absent is left alone; unknown ids are reported, not fatal.
+  ctx.app.post("/api/costing/prints/bulk", (req, res) => {
+    const b = req.body || {};
+    if (!Array.isArray(b.print_ids) || !b.print_ids.length) return bad(res, "Body needs { print_ids: [...] }");
+    if (b.print_ids.length > MATCH_MAX_IDS) return bad(res, "At most " + MATCH_MAX_IDS + " prints at a time");
+    const assign = "project_id" in b, pid = b.project_id ? String(b.project_id) : null;
+    if (assign && pid && !project(pid)) return bad(res, "No such project");
+    if (!assign && !("counted" in b)) return bad(res, "Nothing to change: give project_id or counted");
+    const ids = new Set(b.print_ids.map(String));
+    let updated = 0;
+    for (const r of L.prints) {
+      if (!ids.has(r.id)) continue;
+      if (assign) r.project_id = pid;
+      if ("counted" in b) r.counted = b.counted !== false;
+      updated++;
+    }
+    if (updated) saveL();
+    res.json({ ok: true, updated, missing: ids.size - updated });
+  });
+  // Every print whose file name matches a pattern -> one project. apply:false
+  // (the default) previews the count and a sample; apply:true writes.
+  ctx.app.post("/api/costing/prints/match", (req, res) => {
+    const b = req.body || {};
+    const re = patternOf(b.pattern);
+    if (!re) return bad(res, "Body needs { pattern }");
+    if (b.project_id != null && b.project_id !== "" && !project(b.project_id)) return bad(res, "No such project");
+    const pid = b.project_id ? String(b.project_id) : null;
+    const onlyUnassigned = b.only_unassigned !== false;
+    const hits = L.prints.filter(r => re.test(r.file) && (!onlyUnassigned || !r.project_id) && r.project_id !== pid);
+    const sample = [...new Set(hits.slice().reverse().map(r => r.file))].slice(0, 8);
+    if (!b.apply) return res.json({ ok: true, preview: true, matched: hits.length, sample, project_id: pid });
+    for (const r of hits) r.project_id = pid;
+    if (hits.length) saveL();
+    res.json({ ok: true, preview: false, matched: hits.length, applied: hits.length, sample, project_id: pid });
+  });
+  // Read every printer's job history into the ledger now. { full: true }
+  // pages to the end instead of stopping at the first page with nothing new.
+  ctx.app.post("/api/costing/import", async (req, res) => {
+    if (IMPORT) return res.status(409).json({ error: "An import is already running" });
+    try { res.json({ ok: true, ...(await importHistory({ full: !!(req.body || {}).full })) }); }
+    catch (e) { res.status(500).json({ error: "import failed - " + e.message }); }
+  });
+  ctx.app.get("/api/costing/import", (req, res) => res.json({ running: !!IMPORT, last: LAST_IMPORT, interval_ms: IMPORT_MS, boot_ms: IMPORT_BOOT_MS, page: IMPORT_PAGE, settle_ms: IMPORT_SETTLE_MS }));
+
+  // ---- routes: reports ----------------------------------------------------------------------
+  // ?from&to&group_by=client|project|printer|type|month|material|outcome&tz_offset_min
+  ctx.app.get("/api/costing/report", (req, res) => {
+    const q = req.query || {};
+    if (q.group_by && !REPORT.GROUPINGS.includes(String(q.group_by))) return bad(res, "group_by must be one of " + REPORT.GROUPINGS.join(", "));
+    res.json({ ok: true, ...reportFor(q), groupings: REPORT.GROUPINGS });
+  });
+  ctx.app.get("/api/costing/report.csv", (req, res) => {
+    const q = req.query || {};
+    if (q.group_by && !REPORT.GROUPINGS.includes(String(q.group_by))) return bad(res, "group_by must be one of " + REPORT.GROUPINGS.join(", "));
+    const rep = reportFor(q);
+    res.type("text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="cost-report-by-' + rep.group_by + "-" + new Date().toISOString().slice(0, 10) + '.csv"');
+    res.send("﻿" + REPORT.reportCsv(rep));
+  });
+  ctx.app.get("/api/costing/report/print", (req, res) => {
+    const q = req.query || {};
+    if (q.group_by && !REPORT.GROUPINGS.includes(String(q.group_by))) return res.status(400).send("group_by must be one of " + REPORT.GROUPINGS.join(", "));
+    res.set("Cache-Control", "no-cache");
+    res.type("html").send(REPORT.reportHtml(reportFor(q)));
   });
   ctx.app.post("/api/costing/prints/assign", (req, res) => {
     const b = req.body || {}, row = L.prints.find(r => r.id === b.print_id);
@@ -956,4 +1213,5 @@ function register(ctx) {
 }
 
 module.exports = { register, costOf, projectSummary, pricing, grossUp, netOf, projectCsv, quoteHtml, mmToGrams, materialOf, densityOf,
-                   LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES, DENSITY, FILAMENT_DIAMETER_MM, SUGGESTED, SUGGESTED_NOTES };
+                   report: REPORT.report, reportCsv: REPORT.reportCsv, reportHtml: REPORT.reportHtml, GROUPINGS: REPORT.GROUPINGS, monthKey: REPORT.monthKey,
+                   LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES, STATUS_OUTCOME, DENSITY, FILAMENT_DIAMETER_MM, SUGGESTED, SUGGESTED_NOTES, SUGGESTED_TYPE_NOTES };

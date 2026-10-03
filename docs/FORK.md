@@ -12,7 +12,7 @@ until upstream 2.40 shipped its own; it is upstream's now.)
 |---|---|---|---|
 | `printer-sync` | **off** | off | Copies gcode that lands on a printer some other way (Orca straight to the machine, USB) into the Hub library, one file at a time, never while that printer is printing. See [printer-sync.md](printer-sync.md). |
 | `library-colors` | on | off | Color dots under each library row, and a "printable on" chip bar that filters the library to files whose colors are all loaded on a chosen printer right now. Client only. It reads the match module's `/api/library-palettes`. |
-| `costing` | on | off | A print ledger (every finished, cancelled or failed print with its actual duration and its filament priced from the rolls that were loaded, else from the file, the printer's own metadata or its job history), clients and projects with line items, a cost summary where every line names its source, cited suggested rates for what you have not typed, a pricing helper, CSV export and a printable quote page. Projects tab, a project dropdown on the job card, rates in Settings. See [costing.md](costing.md). |
+| `costing` | on | off | A print ledger (every finished, cancelled or failed print with its actual duration and its filament priced from the rolls that were loaded, else from the file, the printer's own metadata or its job history; plus every printer's own Moonraker job history imported, hourly, for prints the Hub never watched), clients and projects with line items, a cost summary where every line names its source, cited suggested rates per printer type for what you have not typed, a pricing helper, a filterable Prints list with bulk assignment, cost reports by client / project / printer / type / month / material / outcome with CSV and a printable page, and a printable quote page. Projects tab (Projects, Prints, Reports), a project dropdown on the job card, rates in Settings. See [costing.md](costing.md). |
 
 Switch any of them from Settings → Features, or in `config.json`:
 
@@ -27,7 +27,7 @@ does the same with `slicing`.
 
 | File | Change |
 |---|---|
-| `modules/printer-sync.js`, `modules/costing.js` | new, server modules |
+| `modules/printer-sync.js`, `modules/costing.js`, `modules/costing-report.js` | new, server modules (`costing-report.js` is the pure report/CSV/printable-page half of costing, required by `costing.js`; not a feature module of its own) |
 | `public/modules/library-colors-ui.js`, `public/modules/costing-ui.js` | new, client modules |
 | `test/printer-sync-standalone.js`, `test/costing-standalone.js` | new, fork suites (part of `npm run test:standalone`) |
 | `docs/FORK.md`, `docs/printer-sync.md`, `docs/costing.md`, `docs/proposals/costing.md` | new |
@@ -35,7 +35,7 @@ does the same with `slicing`.
 | `core/app.js` | +2 `CLIENT_TABLE` entries |
 | `core/config.js` | 3 keys in `MODULE_DEFAULTS` (`printer-sync`, `library-colors`, `costing`), 3 in `LITE_OFF` |
 | `modules/resources.js` | +1 line in `deductFor()`: `ctx.events.emit("filament.deducted", rec)` after the deduction is saved, so the costing ledger prices a print from the record resources already made instead of deducting again. Reasoning in [costing.md](costing.md#rebase-footprint). |
-| `test/mock-moonraker.js` | +2 routes and 2 state fields: `GET /server/files/gcodes/<name>` serves a stored file's bytes (printer-sync); `GET /server/files/metadata` answers from `state.metadata` and logs `state.metaRequests` when a test sets them (costing), placed before upstream's blank answer so every other test is unchanged |
+| `test/mock-moonraker.js` | +2 routes and 3 state fields: `GET /server/files/gcodes/<name>` serves a stored file's bytes (printer-sync); `GET /server/files/metadata` answers from `state.metadata` and logs `state.metaRequests` when a test sets them (costing), placed before upstream's blank answer so every other test is unchanged; `GET /server/history/list` honours `start`, `order`, `since` and `before` and logs `state.historyRequests` (costing import paging) - with none of those parameters the answer is upstream's |
 | `test/run-tests.js` | `U1HUB_HARNESS_SKIP_SLICE=1` lets a clone without upstream's private slice fixtures run the rest of the harness. The skip is printed. |
 | `package.json` | the fork suites are appended to `test:standalone` |
 | `.gitignore` | `docker-compose.override.yml`, `data/` (Docker deploy state); `projects.json`, `prints.json` (costing state) |
@@ -101,4 +101,4 @@ curl -s localhost:4545/api/fleet          # every printing machine still printin
 |---|---|
 | printer-sync against a real U1 (one small file pulled from an idle printer, Moonraker RSS before and after, busy printer skipped) | **not yet run**. Flip the `MODULE_DEFAULTS` entry to `true` in the commit that records it. |
 | library-colors in a real browser against the live fleet | see the commit that introduced it |
-| costing | no hardware gate needed: it listens to events the Hub already raises, writes its own two files, and reads three Moonraker JSON endpoints that core and other modules already read live. The mock lifecycle (standby → printing → complete, printing → cancelled, done-twice, metadata and history backfill) is in `test/costing-standalone.js`; on the deployed Hub the first boot should log `costing: backfill N blank rows checked, …` and blank rows should show `printer metadata` / `printer history` grams on the Projects tab. |
+| costing | no hardware gate needed: it listens to events the Hub already raises, writes its own two files, and reads three Moonraker JSON endpoints that core and other modules already read live. The mock lifecycle (standby → printing → complete, printing → cancelled, done-twice, metadata and history backfill, the paged job-history import against a U1 mock, a generic-Moonraker mock typed `kobra-s1` and an unreachable printer) is in `test/costing-standalone.js`; on the deployed Hub the first boot should log `costing: backfill N blank rows checked, …` then `costing: import N jobs imported, …` (one page per printer per hour afterwards), blank rows should show `printer metadata` / `printer history` grams on the Projects tab, and the Prints view should list every past job from all three printers' histories marked "imported". **Deployed-Hub check still to run** (first boot after this lands): the import log line and the row count on the Prints view against `GET <printer>/server/history/list?limit=1` `count` per printer. |

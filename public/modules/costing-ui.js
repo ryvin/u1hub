@@ -1,11 +1,15 @@
 // public/modules/costing-ui.js — fork module (ryvin/u1hub), not upstream.
 // Injected only when features.costing is on. Server side: modules/costing.js.
 // Three places:
-//   * the Projects tab: clients and their projects; a project page with the
-//     cost summary (every line says where its number came from), the prints
-//     on it (move, don't count), line items, the pricing helper, charged and
-//     margin, Export CSV and Print quote. An "unassigned prints" strip at the
-//     top for prints that were started from the printer's own screen.
+//   * the Projects tab, in three views under one nav tab (Projects | Prints |
+//     Reports): clients and their projects, with a project page (the cost
+//     summary where every line says where its number came from, the prints
+//     on it, line items, the pricing helper, charged and margin, Export CSV
+//     and Print quote); the full ledger as a filtered, paged list with
+//     multi-select, bulk assign / don't count, and "assign every print whose
+//     file name matches"; and reports over a date range grouped by client,
+//     project, printer, type, month, material or outcome, with CSV and a
+//     printable page.
 //   * the job card: a project dropdown under the worth-printing line, so the
 //     NEXT print of the selected file lands in that project.
 //   * Settings: the rates, global and per printer.
@@ -28,8 +32,16 @@
   const SRC = { deduction: "actual", flat: "flat $/g", slicer: "slicer est.", actual: "actual", watts: "typed W", metered: "metered", typed: "typed", blank: "blank", "hub-clock": "hub clock",
                 "printer-meta": "printer metadata", history: "printer history", suggested: "suggested", "typed+suggested": "typed + suggested" };
   const srcText = t => Object.entries(t || {}).map(([k, n]) => n + " " + (SRC[k] || k)).join(", ") || "—";
+  const qs = o => Object.entries(o).filter(([, v]) => v != null && v !== "").map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&");
 
   let EL = null, DATA = null, OPEN = null, PROJ = null, FORM = null, MSG = "", OKMSG = "";
+  let VIEW = "projects";                                           // projects | prints | reports
+  // the Prints view
+  const PF = { from: "", to: "", printer: "", type: "", outcome: "", assigned: "", project: "", client: "", q: "", source: "", offset: 0, limit: 50 };
+  let PL = null, SEL = new Set(), MATCH = null;
+  // the Reports view
+  const RF = { range: "month", from: "", to: "", group: "client" };
+  let REP = null;
 
   function style() {
     if (document.getElementById("cstcss")) return;
@@ -56,6 +68,25 @@
       ".cst-ok{font-size:12px; color:var(--ok,#3dd68c); margin:6px 0; font-family:var(--mono);}",
       ".cst-note{font-size:12px; color:var(--ink-dim); padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel-2,var(--panel)); margin:4px 0 12px; line-height:1.6;} .cst-note b{color:var(--ink);} .cst-note .mono{font-family:var(--mono); font-size:11px; color:var(--ink-faint);} .cst-note .btn{margin-top:6px;}",
       ".cst-inline{display:flex; gap:6px; align-items:center; flex-wrap:wrap;} .cst-inline select.field, .cst-inline input.field{width:auto; flex:0 1 auto; font-size:12px; padding:3px 7px;}",
+      ".cst-table tr.tot td{border-top:2px solid var(--line); color:var(--ink); font-weight:600;} .cst-table th.l, .cst-table td.l{text-align:left;} .cst-table td.ck, .cst-table th.ck{width:28px; text-align:center; padding:6px 4px;}",
+      ".cst-table tr.sel td{background:color-mix(in srgb, var(--signal) 10%, transparent);} .cst-table tr.off td{opacity:.55;} .cst-table td .fn{font-family:var(--sans); font-size:13px; color:var(--ink); overflow-wrap:anywhere;} .cst-table td .sub{font-family:var(--mono); font-size:10.5px; color:var(--ink-faint);}",
+      ".cst-table select.field{font-size:11.5px; padding:2px 6px; max-width:170px;} .cst-note .btn{margin-right:6px;}",
+      // the three views under the one nav tab
+      ".cst-tabs{display:flex; gap:6px; margin:10px 0 14px; flex-wrap:wrap;} .cst-tab{font:inherit; font-size:12px; font-weight:700; letter-spacing:.05em; padding:7px 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel-2); color:var(--ink-dim); cursor:pointer; transition:background .18s cubic-bezier(.2,.7,.2,1), color .18s cubic-bezier(.2,.7,.2,1);}",
+      ".cst-tab:hover{color:var(--ink);} .cst-tab.on{background:color-mix(in srgb, var(--signal) 14%, var(--panel-2)); color:var(--ink); border-color:color-mix(in srgb, var(--signal) 40%, var(--line));}",
+      ".cst-tab:focus-visible{outline:2px solid color-mix(in srgb, var(--signal) 65%, transparent); outline-offset:2px;}",
+      // filters, the bulk bar, the pager
+      ".cst-filters{display:flex; gap:6px 8px; align-items:center; flex-wrap:wrap; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:10px;} .cst-filters label{display:flex; flex-direction:column; gap:2px; font-family:var(--mono); font-size:10.5px; color:var(--ink-faint); letter-spacing:.04em;}",
+      ".cst-filters .field{font-size:12px; padding:4px 7px; min-width:0;} .cst-filters input[type=date].field{width:138px;} .cst-filters input.q{width:170px;} .cst-filters .btn{align-self:flex-end;} .cst-filters a.btn{align-self:flex-end; text-decoration:none;}",
+      ".cst-bulk{display:flex; gap:6px 10px; align-items:center; flex-wrap:wrap; padding:8px 12px; border:1px solid color-mix(in srgb, var(--signal) 40%, var(--line)); border-radius:10px; background:color-mix(in srgb, var(--signal) 6%, var(--panel)); margin-bottom:10px; font-family:var(--mono); font-size:11.5px; color:var(--ink-dim);}",
+      ".cst-bulk .btn{font-size:11.5px; padding:4px 9px;} .cst-bulk select.field{font-size:12px; padding:3px 7px; width:auto;} .cst-bulk .sp{flex:1;}",
+      ".cst-pager{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; font-family:var(--mono); font-size:11.5px; color:var(--ink-faint);} .cst-pager .sp{flex:1;} .cst-pager .btn{font-size:11.5px; padding:4px 9px;} .cst-pager select.field{font-size:12px; padding:3px 7px; width:auto;}",
+      // the report chart: one series, one hue, plain markup (no library)
+      ".cst-bars{display:grid; grid-template-columns:minmax(90px, 180px) 1fr auto; gap:4px 10px; align-items:center; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:10px;}",
+      ".cst-bars .bl{font-family:var(--mono); font-size:11.5px; color:var(--ink-dim); text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;} .cst-bars .bt{height:16px; background:var(--panel-2); border-radius:0 4px 4px 0;}",
+      ".cst-bars .bf{height:100%; background:var(--signal); border-radius:0 4px 4px 0; min-width:2px; transition:width .3s cubic-bezier(.2,.7,.2,1);} .cst-bars .bv{font-family:var(--mono); font-size:11.5px; color:var(--ink); font-variant-numeric:tabular-nums; white-space:nowrap;}",
+      ".cst-kpis{display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-bottom:10px;} .cst-kpi{padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel);} .cst-kpi .k{font-family:var(--mono); font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint);} .cst-kpi .v{font-size:20px; font-weight:700; color:var(--ink); font-variant-numeric:tabular-nums; margin-top:2px;} .cst-kpi .s{font-family:var(--mono); font-size:10.5px; color:var(--ink-faint);}",
+      "@media (max-width:640px){ .cst-bars{grid-template-columns:minmax(70px, 110px) 1fr auto;} .cst-filters input.q{width:100%;} }",
       // the job card line
       ".cstline{display:none; margin-top:4px; font-family:var(--mono); font-size:11.5px; line-height:1.7; color:var(--ink-dim); align-items:center; gap:8px; flex-wrap:wrap;} .cstline.show{display:flex;}",
       ".cstline .k{color:var(--ink-faint);} .cstline select{font:inherit; font-family:var(--sans); font-size:12.5px; color:var(--ink); background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r-sm,6px); padding:3px 7px; max-width:260px;}",
@@ -71,7 +102,8 @@
   function mount(el) {
     EL = el; style();
     el.innerHTML = '<div class="sechead"><h2>Projects</h2><span class="count" id="cst-count"></span></div>' +
-      '<p class="subnote">What each piece of client work cost - every finished, cancelled or failed print the Hub watched, with the material priced from the rolls that were loaded, plus labour, hardware and shipping - and what to charge for it. Nothing is decided here; rates you have not set show as blanks, never as zero.</p>' +
+      '<p class="subnote">What each piece of client work cost - every finished, cancelled or failed print, the Hub\'s own and the printers\' history, with the material priced from the rolls that were loaded, plus labour, hardware and shipping - and what to charge for it. Nothing is decided here; rates you have not set show as blanks, never as zero.</p>' +
+      '<div class="cst-tabs" role="tablist"><button class="cst-tab on" data-cstview="projects" role="tab">Projects</button><button class="cst-tab" data-cstview="prints" role="tab">Prints</button><button class="cst-tab" data-cstview="reports" role="tab">Reports</button></div>' +
       '<div id="cst-body"></div>';
     el.addEventListener("click", onClick);
     el.addEventListener("change", onChange);
@@ -80,27 +112,31 @@
   async function load() {
     const d = await jget("/api/costing/projects");
     if (d) { DATA = d; refreshCard(true); }
-    if (OPEN) { const p = await jget("/api/costing/projects/" + encodeURIComponent(OPEN)); PROJ = p; if (!p) OPEN = null; }
+    if (VIEW === "projects" && OPEN) { const p = await jget("/api/costing/projects/" + encodeURIComponent(OPEN)); PROJ = p; if (!p) OPEN = null; }
+    if (VIEW === "prints") PL = await jget("/api/costing/prints?" + qs(printsQuery()));
+    if (VIEW === "reports") REP = await jget("/api/costing/report?" + qs(reportQuery()));
     render();
   }
   function onShow() { load(); }
 
   function render() {
     if (!EL || !DATA) return;
-    EL.querySelector("#cst-count").textContent = DATA.projects.length + " project" + (DATA.projects.length === 1 ? "" : "s") + (DATA.unassigned_total ? " · " + DATA.unassigned_total + " unassigned print" + (DATA.unassigned_total === 1 ? "" : "s") : "");
+    EL.querySelector("#cst-count").textContent = DATA.projects.length + " project" + (DATA.projects.length === 1 ? "" : "s") + " · " + DATA.ledger_total + " print" + (DATA.ledger_total === 1 ? "" : "s") + (DATA.unassigned_total ? " · " + DATA.unassigned_total + " unassigned" : "");
+    EL.querySelectorAll(".cst-tab").forEach(t => t.classList.toggle("on", t.dataset.cstview === VIEW));
     const body = EL.querySelector("#cst-body");
-    body.innerHTML = OPEN && PROJ ? renderProject() : renderList();
+    body.innerHTML = VIEW === "prints" ? renderPrints() : (VIEW === "reports" ? renderReports() : (OPEN && PROJ ? renderProject() : renderList()));
     if (MSG) { const m = document.createElement("div"); m.className = "cst-msg"; m.textContent = MSG; body.prepend(m); MSG = ""; }
     if (OKMSG) { const m = document.createElement("div"); m.className = "cst-ok"; m.id = "cst-okmsg"; m.textContent = OKMSG; body.prepend(m); OKMSG = ""; }
     const f = body.querySelector("[data-focus]"); if (f) setTimeout(() => f.focus(), 0);
   }
   const projOpts = (sel, blank) => (blank ? '<option value="">' + esc(blank) + "</option>" : "") + DATA.projects.map(p => '<option value="' + esc(p.id) + '"' + (p.id === sel ? " selected" : "") + ">" + esc(p.name) + (p.client_id ? " · " + esc(clientName(p.client_id)) : "") + "</option>").join("");
   const clientName = id => { const c = DATA.clients.find(x => x.id === id); return c ? c.name : ""; };
+  const srcPill = p => p.source === "history" ? ' <span class="cst-pill" title="imported from the printer\'s own job history">imported</span>' : "";
   const printRow = (p, inProject) => {
     const c = p.cost || {};
     const mat = c.material || {};
     return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '"><div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
-      ' <span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span>" + (p.counted === false ? ' <span class="cst-pill">not counted</span>' : "") + "</div>" +
+      ' <span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span>" + (p.counted === false ? ' <span class="cst-pill">not counted</span>' : "") + srcPill(p) + "</div>" +
       '<div class="s">' + when(p.at) + " · " + esc(p.printer) + " · " + (p.pieces || 1) + " pc · " + hrs(c.hours) + (c.time_source ? " (" + (SRC[c.time_source] || c.time_source) + ")" : "") +
       " · " + (mat.grams != null ? mat.grams + " g" + (mat.grams_source ? " (" + (SRC[mat.grams_source] || mat.grams_source) + ")" : "") : "no grams") + " · material <b>" + usd(mat.cost) + "</b>" + (mat.source ? " (" + (SRC[mat.source] || mat.source) + (mat.partial ? ", partial" : "") + ")" : "") +
       (c.machine ? " · machine <b>" + usd(c.machine.cost) + "</b>" + (c.machine.source !== "typed" ? " (" + (SRC[c.machine.source] || c.machine.source) + ")" : "") : "") +
@@ -114,21 +150,23 @@
   function renderFilledNote() {
     const s = DATA.sources || {};
     const tl = t => srcText(t);
-    const bf = DATA.backfill || {};
+    const bf = DATA.backfill || {}, im = DATA.import || {};
     const last = bf.last ? "Last fill: " + bf.last.checked + " checked, " + bf.last.filled + " filled (" + bf.last.meta + " printer metadata, " + bf.last.history + " job history), " + bf.last.none + " still blank, " + bf.last.requests + " requests." : "";
-    return '<div class="cst-note" id="cst-filled"><b>Filled by the Hub</b> - time from the printer when the print ended; grams from the rolls that were loaded, else the file in the library, else the printer\'s own metadata for the file, else its job history (filament length x density); machine and energy from your rates, or the cited suggestions in Settings until you type your own. ' +
+    const lastImp = im.last ? "Last import: " + im.last.imported + " imported, " + im.last.matched + " matched to prints the Hub watched, " + im.last.known + " already known" + (im.last.offline && im.last.offline.length ? ", offline: " + im.last.offline.join(", ") : "") + ", " + im.last.requests + " requests." : "";
+    return '<div class="cst-note" id="cst-filled"><b>Filled by the Hub</b> - time from the printer when the print ended; grams from the rolls that were loaded, else the file in the library, else the printer\'s own metadata for the file, else its job history (filament length x density); machine and energy from your rates, or the cited suggestions in Settings until you type your own. Prints started from a printer\'s own screen, or finished while the Hub was down, come in from each printer\'s job history' + (im.interval_ms ? " every " + Math.round(im.interval_ms / 60000) + " min" : "") + ' and are marked "imported". ' +
       '<b>Set by you</b> - client, project, pieces, "don\'t count", line items, what you charged, and every rate in Settings &rarr; Project costing.' +
-      '<div class="mono">' + DATA.ledger_total + " rows · grams: " + esc(tl(s.grams)) + " · time: " + esc(tl(s.time)) + " · machine: " + esc(tl(s.machine)) + " · energy: " + esc(tl(s.energy)) + "</div>" +
+      '<div class="mono">' + DATA.ledger_total + " rows (" + (DATA.imported_rows || 0) + " imported) · grams: " + esc(tl(s.grams)) + " · time: " + esc(tl(s.time)) + " · machine: " + esc(tl(s.machine)) + " · energy: " + esc(tl(s.energy)) + "</div>" +
       (DATA.blank_rows ? '<button class="btn ghost" data-backfill' + (bf.running ? " disabled" : "") + ">" + (bf.running ? "Filling from the printers…" : "Fill the " + DATA.blank_rows + " blank row" + (DATA.blank_rows === 1 ? "" : "s") + " from the printers") + "</button>" : "") +
-      (last ? '<div class="mono" id="cst-bflast">' + esc(last) + "</div>" : "") + "</div>";
+      '<button class="btn ghost" data-import' + (im.running ? " disabled" : "") + ">" + (im.running ? "Importing from the printers…" : "Import job history from the printers") + "</button>" +
+      (last ? '<div class="mono" id="cst-bflast">' + esc(last) + "</div>" : "") + (lastImp ? '<div class="mono" id="cst-imlast">' + esc(lastImp) + "</div>" : "") + "</div>";
   }
 
   function renderList() {
     let h = "";
     if (DATA.ledger_total) h += renderFilledNote();
     if (DATA.unassigned.length) {
-      h += '<div class="cst-sec">Unassigned prints <span class="cst-pill">' + DATA.unassigned_total + "</span></div>" + DATA.unassigned.map(p => printRow(p, false)).join("") +
-        (DATA.unassigned_total > DATA.unassigned.length ? '<div class="cst-empty">Showing the newest ' + DATA.unassigned.length + " of " + DATA.unassigned_total + ".</div>" : "");
+      h += '<div class="cst-sec">Unassigned prints <span class="cst-pill">' + DATA.unassigned_total + '</span><span class="sp"></span><button class="btn ghost" data-cstview="prints" data-unassigned>All ' + DATA.unassigned_total + " in Prints</button></div>" + DATA.unassigned.map(p => printRow(p, false)).join("") +
+        (DATA.unassigned_total > DATA.unassigned.length ? '<div class="cst-empty">Showing the newest ' + DATA.unassigned.length + " of " + DATA.unassigned_total + ". The Prints view lists every one, with filters and bulk assignment.</div>" : "");
     }
     h += '<div class="cst-sec">Clients<span class="sp"></span><button class="btn ghost" data-form="client">+ Add client</button><button class="btn ghost" data-form="project">+ Add project</button></div>';
     if (FORM === "client") h += '<div class="cst-form" data-enter><div class="r"><input class="field" id="cst-cn" placeholder="Client name" data-focus><input class="field" id="cst-ce" placeholder="Email (optional)"></div><div class="r"><button class="btn primary" data-go data-addclient>Save</button><button class="btn ghost" data-form="">Cancel</button></div></div>';
@@ -145,7 +183,7 @@
           : '<div class="s">No projects yet.</div>') + "</div>" +
         (g.id ? '<div class="acts"><button class="btn ghost" data-form="rmclient:' + esc(g.id) + '" title="Remove client" aria-label="Remove">×</button>' + (FORM === "rmclient:" + g.id ? '<button class="btn ghost danger" data-rmclient="' + esc(g.id) + '">Remove client</button>' : "") + "</div>" : "") + "</div>";
     }
-    if (!any) h += '<div class="cst-empty">Add a client, then a project for them. Prints join a project from the job card (pick the project before you send the file) or from the unassigned strip above once they finish.</div>';
+    if (!any) h += '<div class="cst-empty">Add a client, then a project for them. Prints join a project from the job card (pick the project before you send the file), from the unassigned strip above once they finish, or in bulk from the Prints view.</div>';
     return h;
   }
 
@@ -189,13 +227,116 @@
     return h;
   }
 
+  // ---- the Prints view: the whole ledger, filtered, paged, multi-select -----------------
+  const opt = (v, label, cur) => '<option value="' + esc(v) + '"' + (String(v) === String(cur) ? " selected" : "") + ">" + esc(label) + "</option>";
+  function renderPrints() {
+    if (!PL) return '<div class="cst-empty">Loading the ledger…</div>';
+    const fx = PL.facets || {};
+    let h = '<div class="cst-filters" data-enter>' +
+      '<label>from<input class="field" type="date" data-pf="from" value="' + esc(PF.from) + '"></label><label>to<input class="field" type="date" data-pf="to" value="' + esc(PF.to) + '"></label>' +
+      '<label>printer<select class="field" data-pf="printer">' + opt("", "any", PF.printer) + (fx.printers || []).map(p => opt(p.id, p.name + " (" + p.type + ")", PF.printer)).join("") + "</select></label>" +
+      ((fx.types || []).length > 1 ? '<label>type<select class="field" data-pf="type">' + opt("", "any", PF.type) + fx.types.map(t => opt(t, t, PF.type)).join("") + "</select></label>" : "") +
+      '<label>outcome<select class="field" data-pf="outcome">' + opt("", "any", PF.outcome) + (fx.outcomes || []).map(o => opt(o, o, PF.outcome)).join("") + "</select></label>" +
+      '<label>assigned<select class="field" data-pf="assigned">' + opt("", "any", PF.assigned) + opt("0", "unassigned", PF.assigned) + opt("1", "assigned", PF.assigned) + "</select></label>" +
+      '<label>project<select class="field" data-pf="project">' + opt("", "any", PF.project) + DATA.projects.map(p => opt(p.id, p.name, PF.project)).join("") + "</select></label>" +
+      '<label>client<select class="field" data-pf="client">' + opt("", "any", PF.client) + DATA.clients.map(c => opt(c.id, c.name, PF.client)).join("") + "</select></label>" +
+      '<label>source<select class="field" data-pf="source">' + opt("", "any", PF.source) + opt("hub", "watched by the Hub", PF.source) + opt("history", "imported", PF.source) + "</select></label>" +
+      '<label>file name<input class="field q" data-pf="q" placeholder="substring, * wildcard" value="' + esc(PF.q) + '"></label>' +
+      '<button class="btn primary" data-go data-pf-apply>Filter</button><button class="btn ghost" data-pf-reset>Reset</button></div>';
+    // bulk actions
+    const n = SEL.size;
+    h += '<div class="cst-bulk"><span><b>' + n + "</b> selected" + (n ? " of " + PL.total : "") + "</span>" +
+      '<select class="field" id="cst-bulkproj">' + projOpts("", "assign to…") + '<option value="__none">unassign</option></select><button class="btn ghost" data-bulk="assign"' + (n ? "" : " disabled") + ">Assign selected</button>" +
+      '<button class="btn ghost" data-bulk="uncount"' + (n ? "" : " disabled") + ">Don't count</button><button class=\"btn ghost\" data-bulk=\"count\"" + (n ? "" : " disabled") + ">Count</button>" +
+      (n ? '<button class="btn ghost" data-bulk="clear">Clear selection</button>' : "") +
+      '<span class="sp"></span><button class="btn ghost" data-form="match">Assign by file name…</button></div>';
+    if (FORM === "match") h += '<div class="cst-form" data-enter><div class="r"><input class="field" id="cst-mp" placeholder="file name contains… (* wildcard, e.g. Frog*)" value="' + esc(MATCH && MATCH.pattern || "") + '" data-focus>' +
+      '<select class="field" id="cst-mproj">' + projOpts(MATCH && MATCH.project_id || "", "to project…") + '</select><label class="cst-inline" style="font-size:12px"><input type="checkbox" id="cst-munass"' + (!MATCH || MATCH.only_unassigned !== false ? " checked" : "") + "> only unassigned</label></div>" +
+      '<div class="r"><button class="btn primary" data-go data-match="preview">Preview</button>' + (MATCH && MATCH.preview ? '<span class="cst-ok" style="margin:0" id="cst-mres">' + MATCH.matched + " print" + (MATCH.matched === 1 ? "" : "s") + " match" + (MATCH.sample.length ? ": " + esc(MATCH.sample.join(", ")) + (MATCH.matched > MATCH.sample.length ? ", …" : "") : "") + "</span>" + (MATCH.matched ? '<button class="btn primary" data-match="apply">Assign ' + MATCH.matched + "</button>" : "") : "") + '<button class="btn ghost" data-form="">Close</button></div></div>';
+    // the table
+    if (!PL.prints.length) h += '<div class="cst-empty">' + (PL.total ? "Nothing on this page." : (PL.ledger_total ? "No prints match these filters." : "No prints yet. The Hub logs every print it watches finish; the printers' own job history comes in by import.")) + "</div>";
+    else {
+      const allSel = PL.prints.every(p => SEL.has(p.id));
+      h += '<div class="cst-wrap"><table class="cst-table" id="cst-ptable"><thead><tr><th class="ck"><input type="checkbox" data-selall' + (allSel ? " checked" : "") + ' aria-label="select this page"></th><th class="l">File</th><th class="l">When</th><th class="l">Printer</th><th>Outcome</th><th>Time</th><th>Grams</th><th>Direct</th><th class="l">Project</th></tr></thead><tbody>' +
+        PL.prints.map(p => { const c = p.cost || {}, m = c.material || {}; return '<tr data-print="' + esc(p.id) + '" class="' + (SEL.has(p.id) ? "sel" : "") + (p.counted === false ? " off" : "") + '"><td class="ck"><input type="checkbox" data-sel="' + esc(p.id) + '"' + (SEL.has(p.id) ? " checked" : "") + "></td>" +
+          '<td class="l"><div class="fn">' + esc(String(p.file).replace(/\.gcode$/i, "")) + '</div><div class="sub">' + (p.pieces || 1) + " pc" + (p.counted === false ? " · not counted" : "") + (p.source === "history" ? " · imported" : "") + (m.grams_source ? " · grams " + (SRC[m.grams_source] || m.grams_source) : "") + "</div></td>" +
+          '<td class="l">' + when(p.at) + '</td><td class="l">' + esc(p.printer) + '</td><td><span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span></td><td>" + hrs(c.hours) + "</td><td>" + (m.grams != null ? m.grams + " g" : "—") + '</td><td class="hi">' + usd(c.direct) + "</td>" +
+          '<td class="l"><select class="field" data-assign="' + esc(p.id) + '">' + projOpts(p.project_id || "", "unassigned") + "</select></td></tr>"; }).join("") + "</tbody></table></div>";
+    }
+    const a = PL.total ? PL.offset + 1 : 0, b = Math.min(PL.total, PL.offset + PL.prints.length);
+    h += '<div class="cst-pager"><span id="cst-pages">' + a + "–" + b + " of " + PL.total + (PL.total !== PL.ledger_total ? " (" + PL.ledger_total + " in the ledger)" : "") + '</span><span class="sp"></span>' +
+      '<button class="btn ghost" data-page="prev"' + (PL.offset > 0 ? "" : " disabled") + ">← newer</button><button class=\"btn ghost\" data-page=\"next\"" + (b < PL.total ? "" : " disabled") + ">older →</button>" +
+      '<select class="field" data-pagesize>' + [25, 50, 100, 200].map(n2 => opt(n2, n2 + " per page", PF.limit)).join("") + "</select></div>";
+    return h;
+  }
+  const dayStart = s => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ""); return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : null; };
+  const dayEnd = s => { const t = dayStart(s); return t == null ? null : new Date(new Date(t).setDate(new Date(t).getDate() + 1)).getTime(); };
+  function readFilters() {
+    EL.querySelectorAll("[data-pf]").forEach(i => { PF[i.dataset.pf] = i.value; });
+    PF.offset = 0;
+  }
+  const printsQuery = () => ({ ...PF, from: dayStart(PF.from), to: dayEnd(PF.to) });
+  const reloadPrints = async () => { PL = await jget("/api/costing/prints?" + qs(printsQuery())); const dd = await jget("/api/costing/projects"); if (dd) DATA = dd; render(); };
+
+  // ---- the Reports view -----------------------------------------------------------------
+  const RANGES = [["month", "this month"], ["last_month", "last month"], ["ytd", "YTD"], ["12m", "last 12 months"], ["all", "all time"], ["custom", "custom"]];
+  const GROUPS = [["client", "client"], ["project", "project"], ["printer", "printer"], ["type", "printer type"], ["month", "month"], ["material", "material"], ["outcome", "outcome"]];
+  function rangeOf() {
+    const now = new Date(), y = now.getFullYear(), m = now.getMonth();
+    switch (RF.range) {
+      case "month": return [new Date(y, m, 1).getTime(), new Date(y, m + 1, 1).getTime()];
+      case "last_month": return [new Date(y, m - 1, 1).getTime(), new Date(y, m, 1).getTime()];
+      case "ytd": return [new Date(y, 0, 1).getTime(), new Date(y + 1, 0, 1).getTime()];
+      case "12m": return [new Date(y, m - 11, 1).getTime(), new Date(y, m + 1, 1).getTime()];
+      case "custom": return [dayStart(RF.from), dayEnd(RF.to)];
+      default: return [null, null];
+    }
+  }
+  function reportQuery() { const [from, to] = rangeOf(); return { from, to, group_by: RF.group, tz_offset_min: new Date().getTimezoneOffset() }; }
+  function renderReports() {
+    let h = '<div class="cst-filters" data-enter><label>range<select class="field" data-rf="range">' + RANGES.map(([v, l]) => opt(v, l, RF.range)).join("") + "</select></label>" +
+      (RF.range === "custom" ? '<label>from<input class="field" type="date" data-rf="from" value="' + esc(RF.from) + '"></label><label>to<input class="field" type="date" data-rf="to" value="' + esc(RF.to) + '"></label>' : "") +
+      '<label>group by<select class="field" data-rf="group">' + GROUPS.map(([v, l]) => opt(v, l, RF.group)).join("") + "</select></label>" +
+      '<button class="btn primary" data-go data-rf-apply>Run</button><span class="sp" style="flex:1"></span>' +
+      '<a class="btn ghost" id="cst-rcsv" href="/api/costing/report.csv?' + qs(reportQuery()) + '" download>Export CSV</a>' +
+      '<a class="btn ghost" id="cst-rprint" href="/api/costing/report/print?' + qs(reportQuery()) + '" target="_blank" rel="noopener">Print report</a></div>';
+    if (!REP) return h + '<div class="cst-empty">Loading…</div>';
+    const T = REP.totals, al = REP.aligned;
+    const pc = c => c.actual_pct == null ? "—" : c.actual_pct + "%";
+    const kpi = (k, v, s) => '<div class="cst-kpi"><div class="k">' + esc(k) + '</div><div class="v">' + v + '</div><div class="s">' + esc(s || "") + "</div></div>";
+    h += '<div class="cst-kpis" id="cst-kpis">' + kpi("prints", T.prints, T.failed + " failed · " + T.counted + " counted") + kpi("print time", hrs(T.hours), T.grams != null ? T.grams + " g" : "") +
+      kpi(al ? "cost" : "print cost", usd(T.cost), al ? "incl. labour, extras, overhead" : "material + machine + energy") +
+      kpi("failed prints", usd(T.failure_cost) + (T.failure_share ? ' <span class="s">' + T.failure_share + "%</span>" : ""), "of the print cost") +
+      (al ? kpi("charged", usd(T.charged), T.margin != null ? "margin " + usd(T.margin) + (T.margin_pct != null ? " (" + T.margin_pct + "%)" : "") : "") : "") +
+      kpi("actual numbers", pc(T.coverage.time), "time · grams " + pc(T.coverage.grams) + " · material " + pc(T.coverage.material)) + "</div>";
+    // the chart: cost per group, one hue, the tail past twelve folded into "other"
+    const gs = REP.groups.filter(g => g.cost != null && g.cost > 0);
+    if (gs.length) {
+      const shown = gs.slice(0, 12), rest = gs.slice(12);
+      if (rest.length) shown.push({ label: "other (" + rest.length + ")", cost: Math.round(rest.reduce((a2, g) => a2 + g.cost, 0) * 100) / 100 });
+      const max = Math.max(...shown.map(g => g.cost));
+      h += '<div class="cst-bars" id="cst-chart" role="img" aria-label="cost per ' + esc(RF.group) + '">' + shown.map(g => '<div class="bl" title="' + esc(g.label) + '">' + esc(g.label) + '</div><div class="bt" title="' + esc(g.label + ": " + usd(g.cost)) + '"><div class="bf" style="width:' + Math.max(1, Math.round(g.cost / max * 100)) + '%"></div></div><div class="bv">' + usd(g.cost) + "</div>").join("") + "</div>";
+    }
+    const row = (g, cls) => '<tr class="' + (cls || "") + '"><td>' + esc(g.label) + (g.projects && RF.group === "client" ? '<div class="note">' + g.projects + " project" + (g.projects === 1 ? "" : "s") + "</div>" : "") + "</td><td>" + g.prints + (g.failed ? ' <span class="note">' + g.failed + " failed</span>" : "") + "</td><td>" + hrs(g.hours) + "</td><td>" + (g.grams != null ? g.grams + " g" : "—") +
+      "</td><td>" + usd(g.material) + "</td><td>" + usd(g.machine) + "</td><td>" + usd(g.energy) + '</td><td class="hi">' + usd(g.direct) + "</td><td>" + usd(g.failure_cost) + (g.failure_share ? ' <span class="note">' + g.failure_share + "%</span>" : "") + "</td>" +
+      (al ? "<td>" + usd(g.labor) + "</td><td>" + usd(g.extras) + "</td><td>" + usd(g.overhead != null || g.failure != null ? (g.overhead || 0) + (g.failure || 0) : null) + '</td><td class="hi">' + usd(g.cost) + "</td><td>" + usd(g.charged) + "</td><td>" + usd(g.margin) + (g.margin_pct != null ? ' <span class="note">' + g.margin_pct + "%</span>" : "") + "</td>" : "") +
+      "<td>" + pc(g.coverage.time) + " · " + pc(g.coverage.grams) + " · " + pc(g.coverage.material) + "</td></tr>";
+    h += '<div class="cst-wrap"><table class="cst-table" id="cst-rtable"><thead><tr><th>' + esc((GROUPS.find(g => g[0] === RF.group) || [])[1] || RF.group) + "</th><th>Prints</th><th>Time</th><th>Grams</th><th>Material</th><th>Machine</th><th>Energy</th><th>Direct</th><th>Failed</th>" +
+      (al ? "<th>Labour</th><th>Extras</th><th>Overhead</th><th>Cost</th><th>Charged</th><th>Margin</th>" : "") + "<th>Actual t·g·m</th></tr></thead><tbody>" +
+      (REP.groups.length ? REP.groups.map(g => row(g, "")).join("") + row(T, "tot") : '<tr><td colspan="' + (al ? 16 : 10) + '">No prints in this range.</td></tr>') + "</tbody></table></div>" +
+      '<div class="cst-empty" style="font-size:12px">' + esc(REP.note) + ' "Actual t·g·m" is the share of counted prints whose time, grams and material are measured (the printer\'s clock, the rolls that were loaded, the filament actually extruded) rather than a slicer, metadata or suggested figure.' + (T.labor_blank ? " Some labour minutes have no labour rate and are not costed." : "") + "</div>";
+    return h;
+  }
+
+  // ---- events ---------------------------------------------------------------------------
   const val = id => { const x = EL.querySelector(id); return x ? x.value : ""; };
   async function onClick(e) {
-    const a = e.target.closest("[data-form],[data-openp],[data-back],[data-addclient],[data-addproject],[data-additem],[data-rmitem],[data-rmclient],[data-rmproject],[data-count],[data-backfill]");
+    const a = e.target.closest("[data-cstview],[data-form],[data-openp],[data-back],[data-addclient],[data-addproject],[data-additem],[data-rmitem],[data-rmclient],[data-rmproject],[data-count],[data-backfill],[data-import],[data-pf-apply],[data-pf-reset],[data-page],[data-bulk],[data-match],[data-rf-apply]");
     if (!a) return;
     e.preventDefault();
     const d = a.dataset;
-    if (d.form != null) { FORM = FORM === d.form || d.form === "" ? null : d.form; render(); return; }
+    if (d.cstview != null) { VIEW = d.cstview; FORM = null; if (d.unassigned != null) { Object.assign(PF, { assigned: "0", offset: 0 }); SEL.clear(); } await load(); return; }
+    if (d.form != null) { FORM = FORM === d.form || d.form === "" ? null : d.form; if (d.form === "match") MATCH = null; render(); return; }
     if (d.openp != null) { OPEN = d.openp; FORM = null; await load(); return; }
     if (d.back != null) { OPEN = null; PROJ = null; FORM = null; await load(); return; }
     if (d.backfill != null) {
@@ -204,6 +345,37 @@
       if (!r.ok) MSG = r.d.error || "The backfill did not run";
       else OKMSG = "Asked the printers: " + r.d.checked + " blank row" + (r.d.checked === 1 ? "" : "s") + " checked, " + r.d.filled + " filled (" + r.d.meta + " from printer metadata, " + r.d.history + " from job history), " + r.d.none + " still blank.";
       await load(); return;
+    }
+    if (d.import != null) {
+      a.disabled = true; a.textContent = "Importing from the printers…";
+      const r = await jpost("/api/costing/import", {});
+      if (!r.ok) MSG = r.d.error || "The import did not run";
+      else OKMSG = "Read the printers' job history: " + r.d.imported + " print" + (r.d.imported === 1 ? "" : "s") + " imported, " + r.d.matched + " matched to prints the Hub watched, " + r.d.known + " already known" + (r.d.offline.length ? "; offline, tried next time: " + r.d.offline.join(", ") : "") + (r.d.dropped ? "; " + r.d.dropped + " oldest rows dropped at the cap" : "") + ".";
+      await load(); return;
+    }
+    if (d.pfApply != null) { readFilters(); SEL.clear(); await reloadPrints(); return; }
+    if (d.pfReset != null) { Object.assign(PF, { from: "", to: "", printer: "", type: "", outcome: "", assigned: "", project: "", client: "", q: "", source: "", offset: 0 }); SEL.clear(); await reloadPrints(); return; }
+    if (d.page != null) { PF.offset = Math.max(0, PF.offset + (d.page === "next" ? PF.limit : -PF.limit)); await reloadPrints(); return; }
+    if (d.rfApply != null) { EL.querySelectorAll("[data-rf]").forEach(i => { RF[i.dataset.rf] = i.value; }); REP = await jget("/api/costing/report?" + qs(reportQuery())); render(); return; }
+    if (d.bulk != null) {
+      if (d.bulk === "clear") { SEL.clear(); render(); return; }
+      const ids = [...SEL]; if (!ids.length) return;
+      let r;
+      if (d.bulk === "assign") { const v = val("#cst-bulkproj"); if (!v) { MSG = "Pick a project to assign to (or 'unassign')."; render(); return; } r = await jpost("/api/costing/prints/bulk", { print_ids: ids, project_id: v === "__none" ? null : v }); }
+      else r = await jpost("/api/costing/prints/bulk", { print_ids: ids, counted: d.bulk === "count" });
+      if (!r.ok) MSG = (r.d.error || "That did not work") + (r.status ? " (HTTP " + r.status + ")" : "");
+      else { OKMSG = r.d.updated + " print" + (r.d.updated === 1 ? "" : "s") + (d.bulk === "assign" ? (val("#cst-bulkproj") === "__none" ? " unassigned." : " assigned.") : (d.bulk === "count" ? " counted." : " not counted.")); SEL.clear(); }
+      await reloadPrints(); return;
+    }
+    if (d.match != null) {
+      const body = { pattern: val("#cst-mp"), project_id: val("#cst-mproj") || null, only_unassigned: !!(EL.querySelector("#cst-munass") || {}).checked, apply: d.match === "apply" };
+      if (!body.pattern) { MSG = "Type part of a file name first."; render(); return; }
+      if (!body.project_id) { MSG = "Pick the project those prints belong to."; render(); return; }
+      const r = await jpost("/api/costing/prints/match", body);
+      if (!r.ok) { MSG = (r.d.error || "That did not work") + (r.status ? " (HTTP " + r.status + ")" : ""); render(); return; }
+      if (r.d.preview) { MATCH = { ...body, matched: r.d.matched, sample: r.d.sample, preview: true }; render(); return; }
+      OKMSG = r.d.applied + " print" + (r.d.applied === 1 ? "" : "s") + " matching “" + body.pattern + "” assigned."; MATCH = null; FORM = null; SEL.clear();
+      await reloadPrints(); return;
     }
     let r = null, said = "";
     if (d.addclient != null) { r = await jpost("/api/costing/clients", { name: val("#cst-cn"), email: val("#cst-ce") }); if (r.ok) said = "Saved client “" + r.d.client.name + "” (projects.json)."; }
@@ -219,6 +391,11 @@
   }
   async function onChange(e) {
     const t = e.target;
+    if (t.dataset.sel != null) { if (t.checked) SEL.add(t.dataset.sel); else SEL.delete(t.dataset.sel); render(); return; }
+    if (t.dataset.selall != null) { for (const p of PL.prints) { if (t.checked) SEL.add(p.id); else SEL.delete(p.id); } render(); return; }
+    if (t.dataset.pagesize != null) { PF.limit = Number(t.value) || 50; PF.offset = 0; await reloadPrints(); return; }
+    if (t.dataset.rf === "range") { RF.range = t.value; render(); return; }
+    if (t.dataset.rf != null || t.dataset.pf != null) return;      // applied by the Run / Filter buttons
     let r = null, said = "";
     if (t.dataset.assign != null) { r = await jpost("/api/costing/prints/assign", { print_id: t.dataset.assign, project_id: t.value || null }); if (r.ok) said = t.value ? "Print assigned to “" + (t.options[t.selectedIndex] || {}).text + "”." : "Print unassigned."; }
     else if (t.dataset.state != null) { r = await jpost("/api/costing/projects/update", { id: OPEN, state: t.value }); if (r.ok) said = "State saved: " + t.value + "."; }
@@ -227,7 +404,7 @@
     else return;
     if (!r.ok) MSG = (r.d.error || "That did not work") + (r.status ? " (HTTP " + r.status + ")" : " (no answer from the Hub)");
     else OKMSG = said;
-    await load();
+    if (VIEW === "prints") await reloadPrints(); else await load();
   }
 
   // ---- the job card ----------------------------------------------------------------
@@ -273,6 +450,11 @@
     ["markup_pct", "markup %", "cost x (1 + markup)"], ["margin_pct", "target margin %", "cost / (1 - margin)"], ["hour_rate", "machine-hour rate $/h", "for the machine-hour method"],
     ["platform_fee_pct", "platform fee %", "e.g. Etsy 6.5 + 3"], ["platform_fee_fixed", "platform fee fixed $", "e.g. 0.45"]];
   const PKEYS = [["purchase", "purchase $"], ["life_hours", "life hours"], ["maint_per_hour", "maintenance $/h"], ["avg_watts", "average watts"]];
+  // The suggestion block for a printer: its type's block, else the default
+  // block when the type is the one it applies to. A type with neither gets
+  // no printer suggestion.
+  const sugFor = (sug, p) => (sug.by_type && sug.by_type[p.type]) || (!sug.applies_to || p.type === sug.applies_to ? sug.printers : null) || null;
+  const noteFor = (sug, p, k) => ((sug.type_notes || {})[p.type] || {})[k] || (!sug.applies_to || p.type === sug.applies_to ? (sug.notes || {})[k] : "") || "";
   function buildSettings() {
     const host = document.getElementById("setModules");
     if (!host || SET) return;
@@ -306,11 +488,11 @@
       const sug = (RATES && RATES.suggested) || {};
       const body = collect();
       let n = 0;
-      for (const k of Object.keys(sug)) if (k !== "printers" && k !== "notes" && k !== "applies_to" && (body[k] === "" || body[k] == null) && sug[k] != null) { body[k] = sug[k]; n++; }
+      for (const k of Object.keys(sug)) if (k !== "printers" && k !== "notes" && k !== "type_notes" && k !== "by_type" && k !== "applies_to" && (body[k] === "" || body[k] == null) && sug[k] != null) { body[k] = sug[k]; n++; }
       for (const p of (RATES && RATES.printer_names) || []) {
-        if (sug.applies_to && p.type !== sug.applies_to) continue;
+        const sp = sugFor(sug, p); if (!sp) continue;
         const pb = body.printers[String(p.idx)] = body.printers[String(p.idx)] || {};
-        for (const [k, v] of Object.entries(sug.printers || {})) if ((pb[k] === "" || pb[k] == null) && v != null) { pb[k] = v; n++; }
+        for (const [k, v] of Object.entries(sp)) if ((pb[k] === "" || pb[k] == null) && v != null) { pb[k] = v; n++; }
       }
       const d = await save(body);
       if (d) { const m = SET.querySelector("#cstMsg"); m.className = "pstatus ok"; m.textContent = n ? "Saved " + n + " suggested value" + (n === 1 ? "" : "s") + " as your rates (config.json). Change any of them whenever you know better." : "Nothing to fill - every suggested rate is already set."; }
@@ -330,21 +512,22 @@
     });
     const set = Object.keys(s.keys ? s : {}).filter(k => s.keys.includes(k) && s[k] != null).length;
     SET.querySelector("#cstHint").textContent = set ? set + " of " + s.keys.length + " rates set" : "no rates set yet - lines with a suggested value are costed from it and say so";
-    const hrs = p => p.hours != null ? '<div class="hint" title="print hours on this printer, from its own Moonraker history totals">' + Math.round(p.hours).toLocaleString() + " h printed" + (sug.printers && sug.printers.life_hours && ((s.printers || {})[String(p.idx)] || {}).life_hours == null ? " of " + sug.printers.life_hours.toLocaleString() + " suggested (" + Math.round(p.hours / sug.printers.life_hours * 100) + "%)" : "") + "</div>" : "";
+    const hrsOf = p => { const sp = sugFor(sug, p); return p.hours != null ? '<div class="hint" title="print hours on this printer, from its own Moonraker history totals">' + Math.round(p.hours).toLocaleString() + " h printed" + (sp && sp.life_hours && ((s.printers || {})[String(p.idx)] || {}).life_hours == null ? " of " + sp.life_hours.toLocaleString() + " suggested (" + Math.round(p.hours / sp.life_hours * 100) + "%)" : "") + "</div>" : ""; };
+    const typed = new Set();
     SET.querySelector("#cstPrinters").innerHTML = '<table class="cst-ptable"><thead><tr><th>Printer</th>' + PKEYS.map(([, l]) => "<th>" + esc(l) + "</th>").join("") + "</tr></thead><tbody>" +
-      (s.printer_names || []).map(p => "<tr><td>" + esc(p.name) + hrs(p) + "</td>" + PKEYS.map(([k]) => {
+      (s.printer_names || []).map(p => { const sp = sugFor(sug, p); if (sp) typed.add(p.type); return "<tr><td>" + esc(p.name) + ' <span class="hint">' + esc(p.type) + "</span>" + hrsOf(p) + "</td>" + PKEYS.map(([k]) => {
         const v = (s.printers || {})[String(p.idx)] && s.printers[String(p.idx)][k] != null ? esc(s.printers[String(p.idx)][k]) : "";
-        const sv = sug.printers && (!sug.applies_to || p.type === sug.applies_to) ? sug.printers[k] : null;
-        return '<td><input class="field" type="number" min="0" step="0.01" data-pidx="' + p.idx + '" data-pkey="' + k + '" value="' + v + '"' + (sv != null ? ' placeholder="suggested ' + esc(sv) + '" title="' + esc(notes[k] || "") + '"' : "") + "></td>";
-      }).join("") + "</tr>").join("") + "</tbody></table>" +
-      (sug.printers ? '<div class="hint" style="margin-top:6px; max-width:640px">Greyed values are suggestions for a Snapmaker U1 - sources: ' + esc([notes.purchase, notes.life_hours, notes.maint_per_hour, notes.avg_watts].filter(Boolean).join(" · ")) + ".</div>" : "");
+        const sv = sp ? sp[k] : null;
+        return '<td><input class="field" type="number" min="0" step="0.01" data-pidx="' + p.idx + '" data-pkey="' + k + '" value="' + v + '"' + (sv != null ? ' placeholder="suggested ' + esc(sv) + '"' : "") + ' title="' + esc(noteFor(sug, p, k)) + '"></td>';
+      }).join("") + "</tr>"; }).join("") + "</tbody></table>" +
+      (typed.size ? '<div class="hint" style="margin-top:6px; max-width:640px">Greyed values are suggestions per printer type - ' + [...typed].map(t => esc(t) + ": " + esc(Object.values(t === sug.applies_to ? notes : ((sug.type_notes || {})[t] || {})).filter(Boolean).join(" · "))).join("<br>") + ".</div>" : "");
   }
   // Core's Settings feature list prints the raw key for anything it has no
   // label for; name this flag there.
   function relabel() {
     const box = document.getElementById("setFeatures"); if (!box) return;
     const i = box.querySelector('input[data-feat="costing"]'); const t = i && i.nextSibling;
-    if (t && t.nodeType === 3 && t.textContent.trim() === "costing") t.textContent = " Project costing: print ledger, clients & quotes (fork)";
+    if (t && t.nodeType === 3 && t.textContent.trim() === "costing") t.textContent = " Project costing: print ledger, clients, reports & quotes (fork)";
   }
 
   async function init() {

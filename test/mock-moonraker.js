@@ -33,7 +33,8 @@ function createMock(profile) {
     camGrabs: 0,                   // v2.35: monitor.jpg fetches seen (issue #4: one per grab, not per viewer)
     camDelayMs: 600,               // how long the "camera" takes to answer
     metadata: null,                // fork (ryvin/u1hub): { [filename]: metadata } for /server/files/metadata; null = upstream's blank answer
-    metaRequests: []               // fork (ryvin/u1hub): every metadata GET, { filename, at }
+    metaRequests: [],              // fork (ryvin/u1hub): every metadata GET, { filename, at }
+    historyRequests: []            // fork (ryvin/u1hub): every /server/history/list GET, { limit, start, order, at }
   };
 
   const objectsList = profile === "u1"
@@ -188,7 +189,21 @@ function createMock(profile) {
     // from. Shape as Moonraker answers it: { result: { count, jobs } }.
     if (u.pathname === "/server/history/list") {
       const limit = Number(u.searchParams.get("limit")) || 50;
-      return send(200, { result: { count: state.history.length, jobs: state.history.slice(0, limit) } });
+      // Fork (ryvin/u1hub): `start` (offset), `order` (asc|desc), `since` and
+      // `before` (epoch seconds, on start_time) as Moonraker reads them, so the
+      // costing import's paging can be exercised. Every request is logged.
+      // Without those parameters the answer is upstream's: the stored list
+      // (newest first) cut to `limit`.
+      const start = Math.max(0, Number(u.searchParams.get("start")) || 0);
+      const order = String(u.searchParams.get("order") || "desc").toLowerCase();
+      const since = u.searchParams.has("since") ? Number(u.searchParams.get("since")) : null;
+      const before = u.searchParams.has("before") ? Number(u.searchParams.get("before")) : null;
+      let jobs = state.history.slice();
+      if (Number.isFinite(since)) jobs = jobs.filter(j => (j.start_time || 0) >= since);
+      if (Number.isFinite(before)) jobs = jobs.filter(j => (j.start_time || 0) <= before);
+      if (order === "asc") jobs.reverse();
+      state.historyRequests.push({ limit, start, order, at: Date.now() });
+      return send(200, { result: { count: jobs.length, jobs: jobs.slice(start, start + limit) } });
     }
 
     // v2.21 fixture, for the Klipper reverse proxy only: reflect what actually

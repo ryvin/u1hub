@@ -12,9 +12,17 @@
 // Every wait is on an observable (the fleet reporting the state, the ledger
 // row appearing), never a fixed sleep (CLAUDE.md rule 7).
 //
+// The import half (a second, non-U1 mock printer and a third that is
+// offline) seeds Moonraker job histories with explicit timestamps and drives
+// POST /api/costing/import, so paging, pacing, idempotency, the dedupe
+// against a row the Hub watched, the status mapping, the ledger cap and the
+// offline skip are all asserted against what the run returned.
+//
 // Run: node test/costing-standalone.js   (part of npm run test:standalone)
 // Rule 6 evidence: U1HUB_COSTING_FALSIFY=1 flips the actual-seconds
-// expectation on the ledger row; the run must then go red.
+// expectation on the ledger row, the printer-metadata grams expectation, the
+// "second import brings nothing" expectation and one report total; the run
+// must then go red.
 
 "use strict";
 
@@ -52,11 +60,14 @@ async function startHub(dir, extraEnv) {
            U1HUB_SYNC_MS: "3600000", U1HUB_PROFILE: "",
            // The boot backfill is OFF unless a section turns it on: every
            // Moonraker GET in this suite follows a call the test made (rule 7).
-           U1HUB_COSTING_BACKFILL_BOOT_MS: "0", U1HUB_COSTING_BACKFILL_PAUSE_MS: String(PAUSE_MS), ...(extraEnv || {}) }
+           U1HUB_COSTING_BACKFILL_BOOT_MS: "0", U1HUB_COSTING_BACKFILL_PAUSE_MS: String(PAUSE_MS),
+           // The job-history import likewise: no boot run, no hourly run, and
+           // three jobs a page so a seven-job history takes three pages.
+           U1HUB_COSTING_IMPORT_BOOT_MS: "0", U1HUB_COSTING_IMPORT_MS: "0", U1HUB_COSTING_IMPORT_PAGE: "3", U1HUB_COSTING_IMPORT_SETTLE_MS: "5000", ...(extraEnv || {}) }
   });
   CHILD.stdout.on("data", d => LOG += d);
   CHILD.stderr.on("data", d => LOG += d);
-  for (let i = 0; i < 240; i++) {   // up to 60 s: a boot from a /mnt Windows mount measured 12.9 s
+  for (let i = 0; i < 480; i++) {   // up to 120 s: a boot from a /mnt Windows mount measured 12.9 s, and 21 s with the host at load 16 (2026-10-03); the require phase is synchronous, so nothing is logged until it ends
     await sleep(250);
     try { const r = await fetch(HUB + "/api/version"); if (r.ok) return; } catch {}
     if (CHILD.exitCode !== null) throw new Error("hub exited early:\n" + LOG);
@@ -194,6 +205,84 @@ function pureChecks() {
   ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;") && !html.includes("<script>"), "the quote page escapes the project name", null);
   ok(html.includes("&quot;quoted&quot; &amp; &lt;b&gt;bold&lt;/b&gt;") && html.includes("Bob &amp; Co"), "…and the notes and client name", null);
   ok(html.includes("$24.60") && html.includes("$73.80") && html.includes("(not charged)"), "…and carries the cost, the prices and the uncounted marker", null);
+
+  console.log("\n== PURE: suggested rates are keyed by printer type ==");
+  ok(C.SUGGESTED.by_type.u1.purchase === 849 && C.SUGGESTED.by_type["kobra-s1"].purchase === 401 && C.SUGGESTED.by_type["kobra-s1"].life_hours === 5000 && C.SUGGESTED.by_type["kobra-s1"].avg_watts === undefined && C.SUGGESTED.by_type["kobra-s1"].maint_per_hour === undefined,
+    "a Kobra S1 gets its cited price ($401) and the generic life hours, and NO watts or maintenance reserve (nothing citable)", C.SUGGESTED.by_type);
+  ok(/store\.anycubic\.com/.test(C.SUGGESTED_TYPE_NOTES["kobra-s1"].purchase) && /no suggestion/.test(C.SUGGESTED_TYPE_NOTES["kobra-s1"].avg_watts), "…with the source named and the gaps explained", C.SUGGESTED_TYPE_NOTES);
+  c = C.costOf({ printer_id: 2, type: "kobra-s1", seconds: 3600, material: { grams: 100, source: "slicer" } }, RSug);
+  ok(c.machine && c.machine.per_hour === 0.08 && c.machine.basis === "depreciation" && c.machine.source === "suggested" && c.energy === null && c.blanks.some(b => /no watts/.test(b)), "Kobra S1 row: machine 401/5000 = $0.08/h (depreciation only, suggested); energy blank, named", c);
+  c = C.costOf({ printer_id: 2, type: "kobra-s1", seconds: 3600, material: { grams: 100, source: "slicer" } }, { ...RSug, printers: { "2": { avg_watts: 180 } } });
+  ok(c.energy && c.energy.watts === 180 && c.energy.watts_source === "typed" && c.energy.cost === 0.03, "…a typed 180 W fills it: 0.18 kWh x $0.183 = $0.03", c.energy);
+
+  console.log("\n== PURE: report() by every grouping vs hand-computed numbers (explicit timestamps, UTC) ==");
+  const T = s => Date.parse(s);
+  const RR = { kwh_rate: 0.16, cost_per_g: 0.02, labor_rate: 30, overhead_pct: 10, printers: { "0": { purchase: 1099, life_hours: 5000, maint_per_hour: 0.10, avg_watts: 250 } } };
+  const rows = [
+    { id: "r1", at: T("2026-01-10T10:00:00Z"), printer_id: 0, printer: "U1-mock", type: "u1", outcome: "done", seconds: 3600, seconds_source: "actual", project_id: "pA", material: { grams: 100, source: "slicer", grams_source: "slicer", material: "PLA" } },
+    { id: "r2", at: T("2026-01-31T23:30:00Z"), printer_id: 0, printer: "U1-mock", type: "u1", outcome: "cancelled", seconds: 1800, seconds_source: "actual", project_id: "pA", material: { grams: 50, source: "slicer", grams_source: "slicer", material: "PLA", partial: true } },
+    { id: "r3", at: T("2026-02-01T00:00:00Z"), printer_id: 1, printer: "Kobra-mock", type: "kobra-s1", outcome: "done", seconds: 3600, seconds_source: "history", project_id: "pB", source: "history", material: { grams: 100, source: "history", grams_source: "history", material: "PETG" } },
+    { id: "r4", at: T("2026-02-14T12:00:00Z"), printer_id: 0, printer: "U1-mock", type: "u1", outcome: "done", seconds: 3600, seconds_source: "actual", project_id: "pC", material: { grams: 100, cost: 0.64, source: "deduction", grams_source: "deduction", material: "PLA" } },
+    { id: "r5", at: T("2026-02-20T12:00:00Z"), printer_id: 0, printer: "U1-mock", type: "u1", outcome: "done", seconds: 3600, seconds_source: "actual", project_id: null, counted: false, material: { grams: 100, source: "slicer", grams_source: "slicer" } },
+    { id: "r6", at: T("2026-03-01T00:00:00Z"), printer_id: 0, printer: "U1-mock", type: "u1", outcome: "error", seconds: null, est_minutes: 60, est_source: "slicer", project_id: null, material: { grams: null, material: "PLA" } }
+  ];
+  const projects = { pA: { id: "pA", name: "Spring <order>", client_id: "cX", charged: 20, created: T("2026-01-01T00:00:00Z"), items: [{ id: "i1", kind: "labor", label: "support", minutes: 30, created: T("2026-01-15T00:00:00Z") }, { id: "i2", kind: "hardware", label: "inserts", cost: 6.2, created: T("2026-02-05T00:00:00Z") }] },
+                     pB: { id: "pB", name: "Signs", client_id: "cX", charged: null, created: T("2026-01-20T00:00:00Z"), items: [] },
+                     pC: { id: "pC", name: "Loose", client_id: null, charged: 5, created: T("2026-02-10T00:00:00Z"), items: [] } };
+  const clients = { cX: { id: "cX", name: "Acme & Co" } };
+  let rep = C.report(rows, projects, clients, RR, { groupBy: "client" });
+  const GR = (r, label) => r.groups.find(g => g.label === label);
+  ok(rep.group_by === "client" && rep.aligned === true && rep.rows === 6 && rep.groups.map(g => g.label).join("|") === "Acme & Co|(no client)|(no project)", "by client, all time: three groups, biggest cost first", rep.groups.map(g => g.label + ":" + g.cost));
+  let grp = GR(rep, "Acme & Co");
+  ok(grp.prints === 3 && grp.done === 2 && grp.failed === 1 && grp.counted === 3 && grp.projects === 2 && grp.hours === 2.5 && grp.grams === 250, "Acme: 3 prints (1 failed) over 2 projects, 2.5 h, 250 g", grp);
+  ok(grp.material === 5 && grp.machine === 0.48 && grp.energy === 0.06 && grp.direct === 5.54, "Acme direct: material 2+1+2, machine 0.32+0.16 (the Kobra has no rates), energy 0.04+0.02 = 5.54", grp);
+  ok(grp.failure_cost === 1.18 && grp.failure_share === 21.3, "Acme failed prints cost 1.18 = 21.3% of its print cost", { fc: grp.failure_cost, fs: grp.failure_share });
+  ok(grp.labor === 15 && grp.labor_minutes === 30 && grp.extras === 6.2 && grp.overhead === 2.67 && grp.failure === 0 && grp.cost === 29.41, "Acme cost: pA 3.54 + 15 labour + 6.2 extras + 2.47 overhead = 27.21, pB 2.00 + 0.20 = 2.20; together 29.41", grp);
+  ok(grp.charged === 20 && grp.margin === -9.41 && grp.margin_pct === -47, "Acme charged 20 (pA, whose newest print is in range) -> margin -9.41 (-47%)", grp);
+  ok(grp.coverage.time.actual === 3 && grp.coverage.grams.actual === 1 && grp.coverage.grams.estimated === 2 && grp.coverage.material.actual === 0 && grp.coverage.machine.actual === 2 && grp.coverage.machine.blank === 1 && grp.coverage.grams.actual_pct === 33,
+    "Acme coverage: time 3/3 actual; grams 1 actual (history) 2 estimated (33%); material none actual; machine 2 typed 1 blank", g.coverage);
+  grp = GR(rep, "(no client)");
+  ok(grp.prints === 1 && grp.direct === 1 && grp.material === 0.64 && grp.coverage.material.actual === 1 && grp.cost === 1.1 && grp.charged === 5 && grp.margin === 3.9 && grp.margin_pct === 78, "(no client) = pC: the deduction-priced print, 1.00 + 10% overhead = 1.10, charged 5, margin 3.90 (78%)", grp);
+  grp = GR(rep, "(no project)");
+  ok(grp.prints === 2 && grp.counted === 1 && grp.uncounted === 1 && grp.failed === 1 && grp.hours === 1 && grp.grams === null && grp.material === null && grp.direct === 0.36 && grp.failure_cost === 0.36 && grp.failure_share === 100 && grp.labor === null && grp.cost === 0.36 && grp.charged === null,
+    "(no project): the uncounted print is counted in prints only; the error print costs 0.36 of machine+energy on its slicer hour, grams blank, no labour/extras possible", g);
+  ok(grp.coverage.time.estimated === 1 && grp.coverage.grams.blank === 1 && grp.coverage.material.blank === 1, "…and its coverage says estimated time, blank grams, blank material", grp.coverage);
+  const tot = rep.totals;
+  const wantCost = FALSIFY ? 30.88 : 30.87;
+  ok(tot.prints === 6 && tot.done === 4 && tot.failed === 2 && tot.counted === 5 && tot.uncounted === 1 && tot.hours === 4.5 && tot.grams === 350, "totals: 6 prints, 4 done, 2 failed, 5 counted, 4.5 h, 350 g", tot);
+  ok(tot.material === 5.64 && tot.machine === 1.12 && tot.energy === 0.14 && tot.direct === 6.9 && tot.failure_cost === 1.54 && tot.failure_share === 22.3, "totals direct: 5.64 + 1.12 + 0.14 = 6.90; failed 1.54 (22.3%)", tot);
+  ok(tot.labor === 15 && tot.extras === 6.2 && tot.overhead === 2.77 && tot.cost === wantCost && tot.charged === 25 && tot.margin === -5.87 && tot.margin_pct === -23, "totals cost 29.41 + 1.10 + 0.36 = " + wantCost + "; charged 25; margin -5.87 (-23%)" + (FALSIFY ? " [FALSIFIED]" : ""), tot);
+  ok(tot.coverage.time.actual_pct === 80 && tot.coverage.grams.actual_pct === 40 && tot.coverage.material.actual_pct === 20 && tot.coverage.machine.actual_pct === 80 && tot.coverage.energy.actual_pct === 80, "totals coverage: time 80%, grams 40%, material 20%, machine 80%, energy 80% actual", tot.coverage);
+  // a date range with both edges: Feb 2026. r3 sits exactly on the start (in), r6 exactly on the end (out), r2 is 30 min before the start (out).
+  rep = C.report(rows, projects, clients, RR, { groupBy: "project", from: T("2026-02-01T00:00:00Z"), to: T("2026-03-01T00:00:00Z") });
+  ok(rep.rows === 3 && rep.groups.map(g2 => g2.label).join("|") === "Spring <order>|Signs|Loose|(no project)", "by project, February: 3 rows (the start edge is in, the end edge is out); pA joins with no prints because an item was created inside the range", rep.groups.map(g2 => g2.label + ":" + g2.prints + ":" + g2.cost));
+  grp = GR(rep, "Spring <order>");
+  ok(grp.prints === 0 && grp.labor === 0 && grp.extras === 6.2 && grp.overhead === 0.62 && grp.cost === 6.82 && grp.charged === null, "pA in February: no prints, the hardware item (6.20) + 10% = 6.82; its charge is NOT here (its newest print is January)", grp);
+  ok(GR(rep, "Signs").cost === 2.2 && GR(rep, "Signs").charged === null && GR(rep, "Loose").cost === 1.1 && GR(rep, "Loose").charged === 5 && GR(rep, "(no project)").counted === 0 && GR(rep, "(no project)").cost === null, "pB 2.20 uncharged, pC 1.10 charged 5, the uncounted print's group costs null", rep.groups);
+  ok(rep.totals.prints === 3 && rep.totals.cost === 10.12 && rep.totals.charged === 5 && rep.totals.margin === -5.12, "February totals: 3 prints, cost 10.12, charged 5, margin -5.12", rep.totals);
+  rep = C.report(rows, projects, clients, RR, { groupBy: "month" });
+  ok(rep.aligned === false && rep.groups.map(g2 => g2.label).join("|") === "2026-01|2026-02|2026-03" && rep.groups.map(g2 => g2.direct).join("|") === "3.54|3|0.36" && rep.groups.every(g2 => g2.labor === null && g2.charged === null && g2.cost === g2.direct),
+    "by month (UTC): Jan 3.54, Feb 3.00, Mar 0.36 in order; labour and charges are not attributable, cost = print cost", rep.groups.map(g2 => g2.label + ":" + g2.direct));
+  rep = C.report(rows, projects, clients, RR, { groupBy: "month", tz_offset_min: 60 });
+  ok(rep.groups.map(g2 => g2.label + ":" + g2.direct).join("|") === "2026-01:5.54|2026-02:1.36", "…an hour west of UTC, the two midnight-UTC prints (Feb 1, Mar 1) belong to the month before: Jan 5.54, Feb 1.36, no March", rep.groups.map(g2 => g2.label + ":" + g2.direct));
+  ok(C.monthKey(T("2026-02-01T00:00:00Z"), 0) === "2026-02" && C.monthKey(T("2026-02-01T00:00:00Z"), 60) === "2026-01" && C.monthKey(T("2026-02-01T00:00:00Z"), -60) === "2026-02", "monthKey honours the offset in both directions", null);
+  rep = C.report(rows, projects, clients, RR, { groupBy: "printer" });
+  ok(rep.groups.map(g2 => g2.label + ":" + g2.prints).join("|") === "U1-mock:5|Kobra-mock:1" && GR(rep, "Kobra-mock").machine === null && GR(rep, "Kobra-mock").direct === 2, "by printer: U1-mock 5 prints, Kobra-mock 1 (material only, no rates typed)", rep.groups.map(g2 => g2.label + ":" + g2.prints));
+  rep = C.report(rows, projects, clients, RR, { groupBy: "type" });
+  ok(rep.groups.map(g2 => g2.label + ":" + g2.prints).join("|") === "u1:5|kobra-s1:1", "by printer type: u1 5, kobra-s1 1", rep.groups.map(g2 => g2.label));
+  rep = C.report(rows, projects, clients, RR, { groupBy: "material" });
+  ok(rep.groups.map(g2 => g2.label + ":" + g2.prints).join("|") === "PLA:4|PETG:1|(unknown):1", "by material: PLA 4, PETG 1, unknown 1 (the row with no material)", rep.groups.map(g2 => g2.label + ":" + g2.prints));
+  rep = C.report(rows, projects, clients, RR, { groupBy: "outcome" });
+  ok(rep.groups.map(g2 => g2.label + ":" + g2.prints).join("|") === "done:4|cancelled:1|error:1" && GR(rep, "done").failed === 0 && GR(rep, "cancelled").failure_share === 100, "by outcome: done 4, cancelled 1, error 1; the failed groups are 100% failure cost", rep.groups.map(g2 => g2.label + ":" + g2.prints));
+  ok(C.report([], {}, {}, RR, { groupBy: "client" }).groups.length === 0 && C.report(rows, projects, clients, RR, { groupBy: "nonsense" }).group_by === "client", "an empty ledger reports no groups; an unknown grouping falls back to client", null);
+  ok(C.report(rows, Object.values(projects), Object.values(clients), RR, { groupBy: "client" }).totals.cost === 30.87, "projects and clients may be arrays or maps", null);
+  const rcsv = C.reportCsv(C.report(rows, projects, clients, RR, { groupBy: "client" }));
+  const rl = rcsv.split("\r\n").filter(Boolean);
+  ok(rl[0] === "group,prints,done,failed,counted,pieces,hours,grams,material,machine,energy,direct,failure_cost,failure_share_pct,labour,labour_minutes,extras,failure_allowance,overhead,cost,charged,margin,margin_pct,time_actual_pct,grams_actual_pct,material_actual_pct,machine_typed_pct,energy_typed_pct", "report CSV header names every column", rl[0]);
+  ok(rl.length === 1 + 3 + 1 && rl[1].startsWith("Acme & Co,3,2,1,3,2,2.5,250,5,0.48,0.06,5.54,1.18,21.3,15,30,6.2,0,2.67,29.41,20,-9.41,-47,100,33,0,67,67") && rl[4].startsWith("TOTAL,6,4,2,5,"), "…one line per group plus TOTAL, with the numbers above", rl);
+  const rhtml = C.reportHtml(C.report(rows, projects, clients, RR, { groupBy: "project", from: T("2026-01-01T00:00:00Z"), to: T("2026-04-01T00:00:00Z") }));
+  ok(rhtml.includes("Spring &lt;order&gt;") && !rhtml.includes("Spring <order>") && !/<script/.test(rhtml), "the printable report escapes the project name and carries no script", null);
+  ok(rhtml.includes("2026-01-01 to 2026-03-31") && rhtml.includes("$27.21") && rhtml.includes("Cost report by project") && /class="bar"/.test(rhtml), "…and shows the range, the project's cost and a bar per group", null);
 }
 
 // ---- live half ---------------------------------------------------------------------------------
@@ -506,6 +595,202 @@ function pureChecks() {
     const Du = rows.find(x => x.id === "pt_D");
     ok(r.status === 200 && Du && Du.cost.machine.source === "typed" && Du.cost.energy.source === "watts" && Du.cost.machine.cost === Ds.cost.machine.cost && Du.cost.energy.cost === Ds.cost.energy.cost, "'use suggested values' = the same numbers saved as real rates: identical costs, now labelled typed", Du && Du.cost);
     await stopHub();
+
+    console.log("\n== LIVE: the Prints list - filters, paging, totals; bulk assign; assign by file name ==");
+    // Three printers from here on: the U1 mock, a Kobra S1 (generic Moonraker,
+    // its own type and folder) and one that is never reachable.
+    const kobra = createMock("generic");
+    const portK = await kobra.listen(0);
+    fs.mkdirSync(path.join(gcode, "kobra-s1"), { recursive: true });
+    const threeConfig = () => fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(tmp, "config.json"), "utf8")),
+      types: [{ slug: "u1", label: "U1" }, { slug: "kobra-s1", label: "Kobra S1" }],
+      printers: [{ name: "U1-mock", url: URL1, type: "u1" }, { name: "Kobra-mock", url: "http://127.0.0.1:" + portK, type: "kobra-s1" }, { name: "Offline-mock", url: "http://127.0.0.1:9", type: "u1" }] }, null, 2));
+    threeConfig();
+    await startHub(tmp);
+    r = await jget("/api/costing/prints");
+    const ALL = r.body.prints;
+    ok(r.status === 200 && r.body.total === 7 && ALL.length === 7 && r.body.offset === 0 && r.body.limit === 200 && r.body.ledger_total === 7, "no filters: all 7 rows, total 7, newest first", { total: r.body.total, n: ALL.length });
+    ok(ALL.every((x, i) => i === 0 || ALL[i - 1].at >= x.at), "…sorted newest first", ALL.map(x => x.at));
+    ok(r.body.facets && r.body.facets.printers.length === 1 && r.body.facets.printers[0].name === "U1-mock" && r.body.facets.types.join() === "u1" && r.body.facets.outcomes.length === 3, "facets list the printers, types and outcomes present in the ledger", r.body.facets);
+    r = await jget("/api/costing/prints?limit=3&offset=0");
+    const p1 = r.body.prints.map(x => x.id);
+    r = await jget("/api/costing/prints?limit=3&offset=3");
+    const p2 = r.body.prints.map(x => x.id);
+    r = await jget("/api/costing/prints?limit=3&offset=6");
+    ok(p1.length === 3 && p2.length === 3 && r.body.prints.length === 1 && r.body.total === 7 && p1.concat(p2, r.body.prints.map(x => x.id)).join() === ALL.map(x => x.id).join(), "paging: 3 + 3 + 1 rows over three pages are the whole list in order, total 7 on every page", { p1, p2, p3: r.body.prints.map(x => x.id) });
+    r = await jget("/api/costing/prints?outcome=cancelled");
+    ok(r.body.total === 1 && r.body.prints[0].id === cx.id, "outcome=cancelled: the one cancelled row", r.body.total);
+    r = await jget("/api/costing/prints?q=" + encodeURIComponent("Backfill*"));
+    ok(r.body.total === 4 && r.body.prints.every(x => /^Backfill/.test(x.file)), "q=Backfill*: the four backfill rows (wildcard)", r.body.prints.map(x => x.file));
+    r = await jget("/api/costing/prints?q=frog");
+    ok(r.body.total === 2, "q=frog: case-insensitive substring, both Frog rows", r.body.total);
+    r = await jget("/api/costing/prints?assigned=0");
+    ok(r.body.total === 7 && (await jget("/api/costing/prints?assigned=1")).body.total === 0 && (await jget("/api/costing/prints?unassigned=1")).body.total === 7, "assigned=0 / unassigned=1: every row is unassigned since the projects were removed; assigned=1: none", r.body.total);
+    r = await jget("/api/costing/prints?printer=0");
+    ok(r.body.total === 7 && (await jget("/api/costing/prints?printer=1")).body.total === 0 && (await jget("/api/costing/prints?printer=U1-mock")).body.total === 7 && (await jget("/api/costing/prints?type=kobra-s1")).body.total === 0, "printer by index or name; type: nothing on the Kobra yet", r.body.total);
+    const mid = ALL.find(x => x.id === row.id), fromMid = ALL.filter(x => x.at >= mid.at).length;   // the Frog print's timestamp is its own; the three blank rows share one
+    r = await jget("/api/costing/prints?from=" + mid.at + "&to=" + (mid.at + 1));
+    ok(r.body.total === 1 && r.body.prints[0].id === mid.id && (await jget("/api/costing/prints?from=" + mid.at + "&to=" + mid.at)).body.total === 0, "from/to is [from, to) on the row's own timestamp: one row in, none when to == from", r.body.total);
+    r = await jget("/api/costing/prints?from=" + new Date(mid.at).toISOString() + "&source=hub");
+    ok(r.body.total === fromMid && r.body.filters.from === mid.at, "from accepts an ISO date too (" + fromMid + " rows from that instant); source=hub keeps the Hub-watched rows (all of them, none imported yet)", { total: r.body.total, from: r.body.filters.from });
+    // bulk
+    r = await jpost("/api/costing/projects", { name: "Bulk <job>" });
+    const P3 = r.body.project.id;
+    r = await jpost("/api/costing/prints/bulk", { print_ids: [], project_id: P3 });
+    ok(r.status === 400, "KNOWN-BAD bulk with no ids -> 400", r.body);
+    r = await jpost("/api/costing/prints/bulk", { print_ids: [row.id], project_id: "pr_nope" });
+    ok(r.status === 400, "KNOWN-BAD bulk to an unknown project -> 400", r.body);
+    r = await jpost("/api/costing/prints/bulk", { print_ids: [row.id, cx.id, pm.id, "pt_nope"], project_id: P3 });
+    ok(r.status === 200 && r.body.updated === 3 && r.body.missing === 1, "bulk assign: 3 rows moved, 1 unknown id reported", r.body);
+    r = await jget("/api/costing/prints?project=" + P3);
+    ok(r.body.total === 3 && (await jget("/api/costing/prints?assigned=0")).body.total === 4, "project=<id> lists the 3; 4 remain unassigned", r.body.total);
+    r = await jpost("/api/costing/prints/bulk", { print_ids: [row.id, cx.id], counted: false });
+    ok(r.status === 200 && r.body.updated === 2 && (await jget("/api/costing/prints?project=" + P3)).body.prints.filter(x => x.counted === false).length === 2, "bulk don't-count: 2 rows", r.body);
+    r = await jpost("/api/costing/prints/bulk", { print_ids: [row.id, cx.id], counted: true });
+    ok(r.body.updated === 2 && (await jget("/api/costing/prints?project=" + P3)).body.prints.every(x => x.counted !== false), "…and counted again", r.body);
+    r = await jpost("/api/costing/clients", { name: "Bulk Client" });
+    await jpost("/api/costing/projects/update", { id: P3, client_id: r.body.client.id });
+    ok((await jget("/api/costing/prints?client=" + r.body.client.id)).body.total === 3 && (await jget("/api/costing/prints?client=cl_nope")).body.total === 0, "client=<id> follows the project's client", null);
+    // assign by file name
+    r = await jpost("/api/costing/prints/match", { pattern: "", project_id: P3 });
+    ok(r.status === 400, "KNOWN-BAD empty pattern -> 400", r.body);
+    r = await jpost("/api/costing/prints/match", { pattern: "Backfill", project_id: "pr_nope" });
+    ok(r.status === 400, "KNOWN-BAD unknown project -> 400", r.body);
+    r = await jpost("/api/costing/prints/match", { pattern: "backfill *", project_id: P3 });
+    ok(r.status === 200 && r.body.preview === true && r.body.matched === 4 && r.body.sample.length === 4 && (await jget("/api/costing/prints?project=" + P3)).body.total === 3, "preview: 4 unassigned rows match 'backfill *' (case-insensitive, wildcard); nothing changed", r.body);
+    r = await jpost("/api/costing/prints/match", { pattern: "backfill *", project_id: P3, apply: true });
+    ok(r.status === 200 && r.body.applied === 4 && (await jget("/api/costing/prints?project=" + P3)).body.total === 7, "apply: the 4 join the project (7 now)", r.body);
+    r = await jpost("/api/costing/prints/match", { pattern: "backfill *", project_id: P3 });
+    ok(r.body.matched === 0, "a second preview finds nothing left to move", r.body);
+    r = await jpost("/api/costing/prints/match", { pattern: "Backfill A", project_id: null, only_unassigned: false, apply: true });
+    ok(r.status === 200 && r.body.applied === 1 && (await jget("/api/costing/prints?assigned=0")).body.total === 1, "only_unassigned:false with project null unassigns the one that matches", r.body);
+
+    console.log("\n== LIVE: importing every printer's job history - paged, paced, deduped against Hub rows, idempotent, offline skipped ==");
+    const nowS = Math.floor(Date.now() / 1000);
+    const doneRow = (await jget("/api/costing/prints?q=" + encodeURIComponent("Frog x10") + "&outcome=done")).body.prints[0];
+    // Seven jobs on the U1 (newest first), older than the two-minute settle
+    // window except where the test wants them skipped:
+    //   j7 in_progress (skipped), j6 completed but ended within the settle window (skipped until it is older),
+    //   j5 = the Frog print the Hub watched (matched to its row, not added),
+    //   j4 klippy_shutdown, j3 interrupted, j2 cancelled at 25% of its estimate (scaled grams), j1 completed (weight from metadata).
+    mock.state.history = [
+      { job_id: "000017", filename: "Live.gcode", status: "in_progress", start_time: nowS - 300, end_time: null, print_duration: 200, total_duration: 300, filament_used: 100, metadata: {} },
+      { job_id: "000016", filename: "Fresh.gcode", status: "completed", start_time: nowS - 400, end_time: nowS, print_duration: 380, total_duration: 390, filament_used: 500, metadata: { filament_type: "PLA" } },
+      { job_id: "000015", filename: FILE, status: "completed", start_time: Math.floor(doneRow.at / 1000) - 3660, end_time: Math.floor(doneRow.at / 1000) - 60, print_duration: 3600, total_duration: 3600, filament_used: 9000, metadata: { filament_type: "PLA;PLA;PLA;PLA" } },
+      { job_id: "000014", filename: "gcodes/Shut.gcode", status: "klippy_shutdown", start_time: nowS - 86400 - 600, end_time: nowS - 86400, print_duration: 500, total_duration: 600, filament_used: 1000, metadata: { filament_type: "PETG" } },
+      { job_id: "000013", filename: "Interrupted.gcode", status: "interrupted", start_time: nowS - 90000, end_time: nowS - 89000, print_duration: 0, total_duration: 1000, filament_used: 0, metadata: {} },
+      { job_id: "000012", filename: "Quarter x2.gcode", status: "cancelled", start_time: nowS - 172800, end_time: nowS - 172800 + 900, print_duration: 900, total_duration: 900, filament_used: 7000, metadata: { estimated_time: 3600, filament_weight_total: 80, filament_type: "PLA" } },
+      { job_id: "000011", filename: "Oldest.gcode", status: "completed", start_time: nowS - 259200, end_time: nowS - 259200 + 7200, print_duration: 7000, total_duration: 7200, filament_used: 40361.57, metadata: { estimated_time: 7100, filament_weight_total: 120.38, filament_type: "PLA" } }
+    ];
+    kobra.state.history = [
+      { job_id: "000002", filename: "Kobra B.gcode", status: "error", start_time: nowS - 7200, end_time: nowS - 3600, print_duration: 3000, total_duration: 3600, filament_used: 2000, metadata: { filament_type: "ASA" } },
+      { job_id: "000001", filename: "Kobra A.gcode", status: "completed", start_time: nowS - 200000, end_time: nowS - 196400, print_duration: 3500, total_duration: 3600, filament_used: 12000, metadata: { estimated_time: 3550, filament_weight_total: 35.5, filament_type: "PETG" } }
+    ];
+    mock.state.historyRequests.length = 0; kobra.state.historyRequests.length = 0;
+    for (let i = 0; i < 60; i++) { const f = (await jget("/api/fleet")).body || []; if (f[2] && f[2].online === false && f[1] && f[1].online) break; await sleep(250); }
+    r = await jget("/api/costing/import");
+    ok(r.status === 200 && r.body.running === false && r.body.last === null && r.body.page === 3 && r.body.boot_ms === 0 && r.body.interval_ms === 0 && r.body.settle_ms === 5000, "GET /api/costing/import: nothing has run (boot and hourly runs are off under test; 5 s settle window)", r.body);
+    mock.state.history[1].end_time = Math.floor(Date.now() / 1000);     // Fresh ended this second: inside the 5 s settle window by construction
+    const t1 = Date.now();
+    r = await jpost("/api/costing/import", {});
+    const ms1 = Date.now() - t1;
+    const im = r.body;
+    ok(r.status === 200 && im.imported === 6 && im.matched === 1 && im.known === 0 && im.skipped === 2 && im.errors === 0, "first import: 6 rows added (4 U1 + 2 Kobra), 1 matched to the Frog print the Hub watched, 2 skipped (in progress, settling)", im);
+    const pu = im.printers.find(p => p.name === "U1-mock"), pk = im.printers.find(p => p.name === "Kobra-mock"), po = im.printers.find(p => p.name === "Offline-mock");
+    ok(pu && pu.status === "ok" && pu.pages === 3 && pu.seen === 7 && pu.imported === 4 && pu.matched === 1 && pu.skipped === 2, "U1: 7 jobs over 3 pages of 3", pu);
+    ok(pk && pk.status === "ok" && pk.type === "kobra-s1" && pk.pages === 1 && pk.seen === 2 && pk.imported === 2, "Kobra (a generic Moonraker, its own type): 2 jobs on 1 page", pk);
+    ok(po && po.status === "offline" && im.offline.join() === "Offline-mock" && po.pages === 0, "the unreachable printer is skipped as offline, nothing asked of it", po);
+    ok(mock.state.historyRequests.map(q => q.start + "/" + q.limit + "/" + q.order).join(" ") === "0/3/desc 3/3/desc 6/3/desc", "the U1 was paged with start=0,3,6 limit=3 newest first", mock.state.historyRequests);
+    ok(im.requests === 4 && im.pages === 4 && im.pause_ms === PAUSE_MS && im.min_gap_ms >= PAUSE_MS - 2 && ms1 >= 3 * PAUSE_MS - 2, "4 paced GETs: smallest gap " + im.min_gap_ms + " ms (pause " + PAUSE_MS + "), " + ms1 + " ms in all", { requests: im.requests, min_gap: im.min_gap_ms, ms: ms1 });
+    rows = (await jget("/api/costing/prints?limit=100")).body.prints;
+    ok(rows.length === 13 && rows.every((x, i) => i === 0 || rows[i - 1].at >= x.at), "the ledger has 13 rows, still newest first after the merge", rows.map(x => x.file + "@" + x.at));
+    const byJob = j => rows.find(x => x.history_job === j && x.printer_id === 0);
+    const fr = rows.find(x => x.id === doneRow.id);
+    ok(fr && fr.history_job === "000015" && fr.history_status === "completed" && fr.source !== "history" && fr.seconds === 3600 && fr.seconds_source === "actual" && fr.material.grams === 25.7 && rows.filter(x => x.file === FILE).length === 2,
+      "the Frog print the Hub watched kept its row (actual seconds, slicer grams), gained the job id; no duplicate was added", fr && { job: fr.history_job, s: fr.seconds, g: fr.material.grams });
+    let j = byJob("000011");
+    ok(j && j.source === "history" && j.outcome === "done" && j.file === "Oldest.gcode" && j.at === (nowS - 259200 + 7200) * 1000 && j.seconds === 7000 && j.seconds_source === "history" && j.est_minutes === 118 && j.est_source === "printer-meta" && j.type === "u1",
+      "a completed job: outcome done, at = end_time, 7000 s (history), 118 min estimate (printer-meta), type u1", j);
+    ok(j && j.material.grams === 120.38 && j.material.grams_source === "printer-meta" && j.material.material === "PLA" && j.material.partial === false && j.cost.material.cost === 2.41 && j.cost.time_source === "history", "…grams from the job's metadata weight (120.38 g), priced at the flat $/g", j && j.material);
+    j = byJob("000012");
+    ok(j && j.outcome === "cancelled" && j.file === "Quarter x2.gcode" && j.pieces === 2 && j.material.progress === 0.25 && j.material.grams === 20 && j.material.grams_source === "printer-meta" && j.material.partial === true,
+      "a cancelled job at 900 of 3600 estimated seconds: 25% of the file's 80 g = 20 g, partial, pieces from the name", j && j.material);
+    j = byJob("000013");
+    ok(j && j.outcome === "error" && j.history_status === "interrupted" && j.seconds === null && j.material.grams === null && j.counted === true, "interrupted -> error; nothing printed leaves time and grams blank", j);
+    j = byJob("000014");
+    ok(j && j.outcome === "error" && j.history_status === "klippy_shutdown" && j.file === "Shut.gcode" && j.material.grams === 3.05 && j.material.grams_source === "history" && j.material.material === "PETG" && j.material.density === 1.27,
+      "klippy_shutdown -> error; the file name loses its gcodes/ folder; no estimate to scale, so 1000 mm of PETG = 3.05 g (history)", j && j.material);
+    ok(!rows.some(x => x.history_job === "000016" || x.history_job === "000017"), "the in-progress job and the one that ended seconds ago are not in the ledger", rows.map(x => x.history_job));
+    const kb = rows.filter(x => x.printer_id === 1);
+    ok(kb.length === 2 && kb.every(x => x.type === "kobra-s1" && x.printer === "Kobra-mock" && x.source === "history"), "the Kobra's two jobs carry its type and name", kb.map(x => ({ t: x.type, p: x.printer })));
+    const ka = kb.find(x => x.history_job === "000001"), kbb = kb.find(x => x.history_job === "000002");
+    ok(ka && ka.outcome === "done" && ka.material.grams === 35.5 && ka.seconds === 3500 && ka.cost.machine && ka.cost.machine.source === "suggested" && ka.cost.machine.per_hour === 0.08 && ka.cost.energy === null, "Kobra A: 35.5 g, 3500 s; costed with the Kobra S1 suggestion (depreciation only) and no energy", ka && ka.cost);
+    ok(kbb && kbb.outcome === "error" && kbb.history_status === "error" && kbb.material.grams === 5.15 && kbb.material.material === "ASA" && kbb.material.density === 1.07, "Kobra B: error; 2000 mm of ASA = 5.15 g", kbb && kbb.material);
+    r = await jget("/api/costing/projects");
+    ok(r.body.imported_rows === 6 && r.body.import.last && r.body.import.last.imported === 6 && r.body.unassigned_total === 7, "the tab's view counts 6 imported rows and shows the last import; the new rows are unassigned", { imported: r.body.imported_rows, un: r.body.unassigned_total });
+    ok((await jget("/api/costing/prints?source=history")).body.total === 6 && (await jget("/api/costing/prints?type=kobra-s1")).body.total === 2 && (await jget("/api/costing/prints?printer=1")).body.total === 2, "source=history, type=kobra-s1 and printer=1 filter the imported rows", null);
+    // idempotent: a second run reads one page per online printer and adds nothing
+    // (Fresh is made in-progress first, so its settle window cannot decide this)
+    mock.state.history[1].status = "in_progress";
+    mock.state.historyRequests.length = 0;
+    r = await jpost("/api/costing/import", {});
+    const wantImp = FALSIFY ? 1 : 0;
+    ok(r.status === 200 && r.body.imported === wantImp && r.body.matched === 0 && r.body.known === 3 && r.body.pages === 2 && mock.state.historyRequests.length === 1, "a second run imports " + wantImp + ": the first page of each printer is already known, so it stops there (2 GETs)" + (FALSIFY ? " [FALSIFIED]" : ""), r.body);
+    ok((await jget("/api/costing/prints?limit=100")).body.total === 13, "…and the ledger is still 13 rows", null);
+    r = await jpost("/api/costing/import", { full: true });
+    ok(r.body.imported === 0 && r.body.pages === 4 && r.body.known === 7, "a full run pages to the end (3 + 1) and still adds nothing", r.body);
+    const hlog2 = (((await jget("/api/diagnostics?logs=0")).body || {}).log || []).map(x => x.msg).filter(m => /costing: import/.test(m));
+    ok(hlog2.length === 3 && /6 jobs imported, 1 matched to rows the Hub watched, 0 already known, 2 skipped, offline: Offline-mock; 4 GETs over 4 pages/.test(hlog2[0]), "every run is logged with its counts", hlog2);
+    // the settled job comes in once it has finished and is older than the settle window
+    mock.state.history[1].status = "completed"; mock.state.history[1].end_time = nowS - 900; mock.state.history[1].start_time = nowS - 1300;
+    r = await jpost("/api/costing/import", {});
+    ok(r.body.imported === 1 && byJob("000016") === undefined && (await jget("/api/costing/prints?q=Fresh")).body.total === 1, "a job that had been settling is imported on the next run", r.body);
+
+    console.log("\n== LIVE: the boot import runs after the backfill; the ledger cap drops the oldest rows ==");
+    await stopHub();
+    const before14 = JSON.parse(fs.readFileSync(path.join(tmp, "prints.json"), "utf8")).prints;
+    ok(before14.length === 14 && before14.every((x, i) => i === 0 || before14[i - 1].at <= x.at), "on disk: 14 rows in time order", before14.length);
+    const oldestTwo = before14.slice(0, 2).map(x => x.id);
+    kobra.state.history.unshift(
+      { job_id: "000004", filename: "Kobra D.gcode", status: "completed", start_time: nowS - 1000, end_time: nowS - 700, print_duration: 280, total_duration: 300, filament_used: 300, metadata: {} },
+      { job_id: "000003", filename: "Kobra C.gcode", status: "completed", start_time: nowS - 2000, end_time: nowS - 1700, print_duration: 280, total_duration: 300, filament_used: 300, metadata: {} });
+    await startHub(tmp, { U1HUB_COSTING_IMPORT_BOOT_MS: "500", U1HUB_COSTING_LEDGER_MAX: "15" });
+    let last = null;
+    for (let i = 0; i < 80; i++) { last = (await jget("/api/costing/import")).body.last; if (last) break; await sleep(250); }
+    ok(last && last.imported === 2 && last.dropped === 1, "the boot import (500 ms, no backfill boot) brought the Kobra's 2 new jobs and dropped 1 row at the 15-row cap", last);
+    const after15 = (await jget("/api/costing/prints?limit=100")).body;
+    ok(after15.total === 15 && after15.ledger_max === 15 && !after15.prints.some(x => x.id === oldestTwo[0]) && after15.prints.some(x => x.id === oldestTwo[1]), "15 rows remain; the oldest row went, the next oldest stayed", { total: after15.total, gone: oldestTwo[0] });
+    ok(after15.prints.filter(x => x.printer_id === 1).length === 4 && after15.facets.printers.length === 2 && after15.facets.types.join() === "kobra-s1,u1", "the Kobra has 4 rows; the facets now list both printers and types", after15.facets);
+
+    console.log("\n== LIVE: reports over the API, CSV and the printable page ==");
+    r = await jget("/api/costing/report?group_by=nonsense");
+    ok(r.status === 400, "KNOWN-BAD unknown group_by -> 400", r.body);
+    r = await jget("/api/costing/report?group_by=printer");
+    const gU = r.body.groups.find(g => g.label === "U1-mock"), gK = r.body.groups.find(g => g.label === "Kobra-mock");
+    ok(r.status === 200 && r.body.aligned === false && r.body.groups.length === 2 && gU && gU.prints === 11 && gK && gK.prints === 4 && r.body.totals.prints === 15, "by printer: U1-mock 11, Kobra-mock 4, 15 in all", r.body.groups.map(g => g.label + ":" + g.prints));
+    r = await jget("/api/costing/report?group_by=type");
+    ok(r.body.groups.map(g => g.label + ":" + g.prints).sort().join("|") === "kobra-s1:4|u1:11", "by type: u1 11, kobra-s1 4", r.body.groups.map(g => g.label));
+    r = await jget("/api/costing/report?group_by=client");
+    const gB = r.body.groups.find(g => g.label === "Bulk Client");
+    ok(r.body.aligned === true && gB && gB.prints === 6 && gB.projects === 1 && r.body.groups.find(g => g.label === "(no project)").prints === 9, "by client: Bulk Client's project holds 6 prints; 9 have no project", r.body.groups.map(g => g.label + ":" + g.prints));
+    const sumDirect = r2(r.body.groups.reduce((a, g) => a + (g.direct || 0), 0));
+    ok(r.body.totals.direct === sumDirect && r.body.totals.prints === 15, "totals are the sum of the groups (direct " + sumDirect + ")", { tot: r.body.totals.direct, sum: sumDirect });
+    const lo = Math.min(...after15.prints.map(x => x.at)), hi = Math.max(...after15.prints.map(x => x.at));
+    r = await jget("/api/costing/report?group_by=outcome&from=" + lo + "&to=" + hi);
+    ok(r.body.rows === 14 && r.body.from === lo && r.body.to === hi, "from/to on the ledger's own edges: [oldest, newest) leaves the newest row out (14 of 15)", { rows: r.body.rows });
+    const rc = await fetch(HUB + "/api/costing/report.csv?group_by=printer");
+    const rcB = Buffer.from(await rc.arrayBuffer()), rcT = rcB.toString("utf8").replace(/^﻿/, "");
+    const rcL = rcT.split("\r\n").filter(Boolean);
+    ok(rc.status === 200 && /text\/csv/.test(rc.headers.get("content-type")) && rcB[0] === 0xef && /cost-report-by-printer-/.test(rc.headers.get("content-disposition")) && rcL[0].startsWith("group,prints,done,failed,") && rcL.length === 1 + 2 + 1 && rcL[3].startsWith("TOTAL,15,"), "report CSV: BOM, attachment name, header, 2 groups + TOTAL", rcL);
+    const rp = await fetch(HUB + "/api/costing/report/print?group_by=client");
+    const rpT = await rp.text();
+    ok(rp.status === 200 && /text\/html/.test(rp.headers.get("content-type")) && rpT.includes("Bulk &lt;job&gt;") === false && rpT.includes("Bulk Client") && rpT.includes("Cost report by client") && !/<script/.test(rpT), "the printable report page answers as HTML, named by client, no script", null);
+    const rp2 = await (await fetch(HUB + "/api/costing/report/print?group_by=project")).text();
+    ok(rp2.includes("Bulk &lt;job&gt;") && !rp2.includes("Bulk <job>"), "…and by project the hostile project name is escaped", null);
+    ok((await fetch(HUB + "/api/costing/report/print?group_by=nonsense")).status === 400, "KNOWN-BAD unknown grouping on the page -> 400", null);
+    await stopHub();
+    try { await kobra.close(); } catch {}
+    writeConfig(tmp, gcode, portU1, null);
 
     console.log("\n== OFF and LITE ==");
     writeConfig(tmp, gcode, portU1, { costing: false });
