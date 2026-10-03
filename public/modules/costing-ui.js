@@ -38,7 +38,7 @@
       ".cst-sec{margin:18px 0 8px; font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent,#f5b316); display:flex; gap:10px; align-items:center; flex-wrap:wrap;}",
       ".cst-sec .sp{flex:1} .cst-sec .btn{font-family:inherit; letter-spacing:normal; text-transform:none;}",
       ".cst-row{display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:8px; flex-wrap:wrap;}",
-      ".cst-row .main{flex:1 1 240px; min-width:0;} .cst-row .t{font-weight:600; color:var(--ink); overflow-wrap:anywhere;} .cst-row .t a{color:inherit; text-decoration:none;} .cst-row .t a:hover{color:var(--signal);}",
+      ".cst-row .cmain{flex:1 1 240px; min-width:0;} .cst-row .t{font-weight:600; color:var(--ink); overflow-wrap:anywhere;} .cst-row .t a{color:inherit; text-decoration:none;} .cst-row .t a:hover{color:var(--signal);}",
       ".cst-row .s{font-family:var(--mono); font-size:11px; color:var(--ink-faint); margin-top:3px; overflow-wrap:anywhere;} .cst-row .s b{color:var(--ink-dim); font-weight:600;}",
       ".cst-row .acts{display:flex; gap:6px; align-items:center; flex-wrap:wrap;} .cst-row .btn{font-size:11.5px; padding:4px 9px;}",
       ".cst-row.off{opacity:.55;} .cst-row .btn.danger{color:var(--bad,#e5484d); border-color:color-mix(in srgb, var(--bad,#e5484d) 45%, var(--line));}",
@@ -95,7 +95,7 @@
   const printRow = (p, inProject) => {
     const c = p.cost || {};
     const mat = c.material || {};
-    return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '"><div class="main"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
+    return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '"><div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
       ' <span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span>" + (p.counted === false ? ' <span class="cst-pill">not counted</span>' : "") + "</div>" +
       '<div class="s">' + when(p.at) + " · " + esc(p.printer) + " · " + (p.pieces || 1) + " pc · " + hrs(c.hours) + (c.time_source ? " (" + (SRC[c.time_source] || c.time_source) + ")" : "") +
       " · " + (mat.grams != null ? mat.grams + " g" : "no grams") + " · material <b>" + usd(mat.cost) + "</b>" + (mat.source ? " (" + (SRC[mat.source] || mat.source) + (mat.partial ? ", partial" : "") + ")" : "") +
@@ -119,7 +119,7 @@
       const ps = DATA.projects.filter(p => (p.client_id || null) === g.id);
       if (!ps.length && g.id === null) continue;
       any = true;
-      h += '<div class="cst-row"><div class="main"><div class="t">' + esc(g.name) + (g.email ? ' <span class="s" style="display:inline">' + esc(g.email) + "</span>" : "") + "</div>" +
+      h += '<div class="cst-row"><div class="cmain"><div class="t">' + esc(g.name) + (g.email ? ' <span class="s" style="display:inline">' + esc(g.email) + "</span>" : "") + "</div>" +
         (ps.length ? ps.map(p => { const s = p.summary || {}; return '<div class="s" style="margin-top:6px"><a href="#" data-openp="' + esc(p.id) + '" style="color:var(--ink); text-decoration:none; font-family:var(--sans); font-size:13px">' + esc(p.name) + "</a> · " + esc(p.state) + " · " + s.prints + " print" + (s.prints === 1 ? "" : "s") + (s.failed ? " (" + s.failed + " failed)" : "") +
           " · cost <b>" + usd(s.cost) + "</b>" + (s.partial ? " <span class=\"cst-pill warn\" title=\"some lines are blank or partial\">partial</span>" : "") + (s.charged != null ? " · charged <b>" + usd(s.charged) + "</b> · margin <b>" + usd(s.margin) + "</b>" + (s.margin_pct != null ? " (" + s.margin_pct + "%)" : "") : "") + "</div>"; }).join("")
           : '<div class="s">No projects yet.</div>') + "</div>" +
@@ -136,7 +136,7 @@
       '<a class="btn ghost" href="/api/costing/projects/' + encodeURIComponent(p.id) + '/quote" target="_blank" rel="noopener" style="text-decoration:none">Print quote</a>' +
       '<button class="btn ghost" data-form="rmproject" title="Remove project">×</button></div>' +
       (FORM === "rmproject" ? '<div class="cst-form"><div class="r">Remove this project? Its prints go back to unassigned.<button class="btn ghost danger" data-rmproject>Remove</button><button class="btn ghost" data-form="">Keep</button></div></div>' : "") +
-      '<div class="cst-row"><div class="main"><div class="t">' + esc(p.name) + (c ? ' <span class="s" style="display:inline">' + esc(c.name) + "</span>" : "") + "</div>" +
+      '<div class="cst-row"><div class="cmain"><div class="t">' + esc(p.name) + (c ? ' <span class="s" style="display:inline">' + esc(c.name) + "</span>" : "") + "</div>" +
       '<div class="s cst-inline" style="margin-top:6px">state <select class="field" data-state><option' + (p.state === "open" ? " selected" : "") + '>open</option><option' + (p.state === "quoted" ? " selected" : "") + '>quoted</option><option' + (p.state === "delivered" ? " selected" : "") + '>delivered</option><option' + (p.state === "closed" ? " selected" : "") + ">closed</option></select>" +
       ' client <select class="field" data-client><option value="">none</option>' + DATA.clients.map(x => '<option value="' + esc(x.id) + '"' + (x.id === p.client_id ? " selected" : "") + ">" + esc(x.name) + "</option>").join("") + "</select>" +
       ' charged $<input class="field" type="number" min="0" step="0.01" data-charged value="' + (p.charged != null ? esc(p.charged) : "") + '" placeholder="what you billed" style="width:110px"></div></div></div>';
@@ -157,7 +157,7 @@
     // items
     h += '<div class="cst-sec">Line items<span class="sp"></span><button class="btn ghost" data-form="item">+ Add item</button></div>';
     if (FORM === "item") h += '<div class="cst-form" data-enter><div class="r"><select class="field" id="cst-ik" style="flex:0 0 140px"><option value="labor">Labour (minutes)</option><option value="hardware">Hardware</option><option value="packaging">Packaging</option><option value="shipping">Shipping</option><option value="other">Other</option></select><input class="field" id="cst-il" placeholder="What (e.g. support removal, M3 inserts x40, UPS)" data-focus><input class="field num" id="cst-iv" type="number" min="0" step="0.01" placeholder="minutes / $"></div><div class="r"><button class="btn primary" data-go data-additem>Save</button><button class="btn ghost" data-form="">Cancel</button></div></div>';
-    h += p.items.length ? p.items.map(i => '<div class="cst-row"><div class="main"><div class="t">' + esc(i.label) + ' <span class="cst-pill">' + esc(i.kind) + '</span></div><div class="s">' + (i.kind === "labor" ? i.minutes + " min" : usd(i.cost)) + '</div></div><div class="acts"><button class="btn ghost" data-rmitem="' + esc(i.id) + '" title="Remove" aria-label="Remove">×</button></div></div>').join("") : '<div class="cst-empty">Labour, hardware, packaging, shipping - anything the printers did not do.</div>';
+    h += p.items.length ? p.items.map(i => '<div class="cst-row"><div class="cmain"><div class="t">' + esc(i.label) + ' <span class="cst-pill">' + esc(i.kind) + '</span></div><div class="s">' + (i.kind === "labor" ? i.minutes + " min" : usd(i.cost)) + '</div></div><div class="acts"><button class="btn ghost" data-rmitem="' + esc(i.id) + '" title="Remove" aria-label="Remove">×</button></div></div>').join("") : '<div class="cst-empty">Labour, hardware, packaging, shipping - anything the printers did not do.</div>';
     // pricing
     h += '<div class="cst-sec">Pricing helper</div>';
     if (!pz) h += '<div class="cst-empty">Nothing to price yet - the cost is blank.</div>';
