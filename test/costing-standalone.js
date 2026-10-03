@@ -56,7 +56,7 @@ async function startHub(dir, extraEnv) {
   });
   CHILD.stdout.on("data", d => LOG += d);
   CHILD.stderr.on("data", d => LOG += d);
-  for (let i = 0; i < 80; i++) {
+  for (let i = 0; i < 240; i++) {   // up to 60 s: a boot from a /mnt Windows mount measured 12.9 s
     await sleep(250);
     try { const r = await fetch(HUB + "/api/version"); if (r.ok) return; } catch {}
     if (CHILD.exitCode !== null) throw new Error("hub exited early:\n" + LOG);

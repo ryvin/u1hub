@@ -46,7 +46,7 @@ async function startHub(dir) {
   });
   CHILD.stdout.on("data", d => LOG += d);
   CHILD.stderr.on("data", d => LOG += d);
-  for (let i = 0; i < 80; i++) {
+  for (let i = 0; i < 240; i++) {   // up to 60 s: a boot from a /mnt Windows mount measured 12.9 s
     await sleep(250);
     try { const r = await fetch(HUB + "/api/version"); if (r.ok) return; } catch {}
     if (CHILD.exitCode !== null) throw new Error("hub exited early:\n" + LOG);
@@ -96,7 +96,7 @@ function writeConfig(dir, gcode, portU1, features) {
       cwd: REPO, stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, U1HUB_DIR: tmp, U1HUB_PORT: String(PORT), U1HUB_PROFILE: "lite" }
     });
-    for (let i = 0; i < 80; i++) { await sleep(250); try { if ((await fetch(HUB + "/api/version")).ok) break; } catch {} }
+    for (let i = 0; i < 240; i++) { await sleep(250); try { if ((await fetch(HUB + "/api/version")).ok) break; } catch {} }
     cfg = (await jget("/api/config")).body || {};
     ok(cfg.features && cfg.features["printer-sync"] === false && cfg.features["library-colors"] === false,
       "Lite: printer-sync and library-colors are off", cfg.features);
