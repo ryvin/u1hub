@@ -207,6 +207,11 @@ function sampleCtx(over) {
     process.env.FAKE_CLAUDE_MODE = "ok";
     let res = await CLAUDE.runClaude({ model: "sonnet", mode: "review", systemPrompt: sys, prompt: "hello" });
     ok(res.ok && res.json && res.json.type === "result" && res.model_id === "claude-sonnet-5" && res.usage && res.usage.cost_usd === 0.0123, "a json result: ok, model id from modelUsage, cost from total_cost_usd", { ok: res.ok, id: res.model_id, usage: res.usage });
+    ok(CLAUDE.extractJson(res.text) && CLAUDE.extractJson(res.text).verdict, "the event-ARRAY answer (Claude Code 2.1.289's --output-format json) yields the review text", res.text && res.text.slice(0, 80));
+    process.env.FAKE_CLAUDE_SHAPE = "object";
+    const resObj = await CLAUDE.runClaude({ model: "sonnet", mode: "review", systemPrompt: sys, prompt: "hello" });
+    delete process.env.FAKE_CLAUDE_SHAPE;
+    ok(resObj.ok && resObj.json && resObj.json.type === "result" && CLAUDE.extractJson(resObj.text), "the older single-object answer still parses", resObj.text && resObj.text.slice(0, 80));
     const args = CLAUDE.claudeArgs("sonnet", "review", "S");
     ok(args[0] === "-p" && args.includes("--output-format") && args[args.indexOf("--tools") + 1] === "" && args.includes("--no-session-persistence") && args[args.indexOf("--permission-prompts") + 1] === "none" && args.includes("--strict-mcp-config") && args[args.indexOf("--append-system-prompt") + 1] === "S" && !args.includes("--bare"), "review flags: -p, json, tools off, no persistence, no prompts, no MCP, system prompt appended, never --bare (it drops the subscription login)", args);
     const rargs = CLAUDE.claudeArgs("opus", "refresh", "S");

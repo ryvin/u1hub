@@ -37,7 +37,14 @@ process.stdin.on("end", () => {
       system_has_schema: /Output schema/.test(opt("--append-system-prompt") || ""), sections: (stdin.match(/^## /gm) || []).length
     }) + "\n");
   } catch {}
-  const out = (obj, code) => { process.stdout.write(JSON.stringify(obj) + "\n"); process.exit(code || 0); };
+  // Claude Code 2.1.289 (measured 2026-10-04) prints --output-format json as an
+  // ARRAY of events ending in the "result" object; FAKE_CLAUDE_SHAPE=object
+  // keeps the older single-object shape so both stay covered.
+  const out = (obj, code) => {
+    const body = process.env.FAKE_CLAUDE_SHAPE === "object" ? obj
+      : [{ type: "system", subtype: "init", model: id, tools: [] }, { type: "assistant", message: { model: id } }, { type: "rate_limit_event" }, obj];
+    process.stdout.write(JSON.stringify(body) + "\n"); process.exit(code || 0);
+  };
   const envelope = (text, extra) => ({ type: "result", subtype: "success", is_error: false, result: text, session_id: "fake-" + Date.now(), duration_ms: 123, num_turns: 1,
     total_cost_usd: 0.0123, usage: { input_tokens: Math.round(stdin.length / 4), output_tokens: 400 }, modelUsage: { [id]: { inputTokens: Math.round(stdin.length / 4), outputTokens: 400, costUSD: 0.0123 } }, ...(extra || {}) });
 

@@ -51,6 +51,12 @@ function runClaude(o) {
       done = true; clearTimeout(timer);
       let json = null;
       try { json = JSON.parse(out.trim()); } catch { const m = /\{[\s\S]*\}\s*$/.exec(out); if (m) { try { json = JSON.parse(m[0]); } catch {} } }
+      // Claude Code 2.1.289 answers --output-format json with an ARRAY of
+      // events (system/assistant/rate_limit_event/result); older builds sent
+      // the result object alone. Measured 2026-10-04: the first real review
+      // was rejected as "no JSON object" because only the object shape was
+      // read. Take the last "result" event when the answer is an array.
+      if (Array.isArray(json)) json = json.filter(e => e && e.type === "result").pop() || null;
       const text = json ? String(json.result != null ? json.result : "") : out;
       const isErr = code !== 0 || (json && json.is_error === true);
       const all = text + "\n" + err;
