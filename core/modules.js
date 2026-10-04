@@ -57,6 +57,10 @@ const MODULE_TABLE = {
   // into the library, one at a time, never while that printer is busy.
   // Provides nothing and uses only ctx, so its place here is arbitrary.
   "printer-sync": require("../modules/printer-sync.js"),
+  // Fork (ryvin/u1hub): the 3D-printing SME review store + context builder for
+  // the headless reviewer (scripts/sme-runner.js). AFTER costing and models:
+  // it uses costing.prints and models.open/index/info at call time.
+  sme: require("../modules/sme.js"),
   // Last on purpose: it owns no data anyone else reads, and its only side
   // effect is one outbound HTTPS GET that must never delay a registration
   // above it.

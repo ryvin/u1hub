@@ -130,6 +130,7 @@ function stageHub(dir) {
   fs.cpSync(path.join(REPO, "core"), path.join(dir, "core"), { recursive: true });        // v2.23: the split core (Dockerfile COPY core)
   fs.cpSync(path.join(REPO, "modules"), path.join(dir, "modules"), { recursive: true });
   fs.cpSync(path.join(REPO, "public"), path.join(dir, "public"), { recursive: true });
+  fs.cpSync(path.join(REPO, "sme"), path.join(dir, "sme"), { recursive: true });            // fork (ryvin/u1hub): the SME core (Dockerfile COPY sme)
   // Dependencies are copied INTO the staged dir rather than reached via
   // NODE_PATH — module resolution across a network-mapped repo drive (SMB)
   // hangs in spawned children on Windows (hardware-verified 2026-08-16:

@@ -102,3 +102,12 @@ data/
 # clients/projects/line items. Real client data - never commit.
 projects.json
 prints.json
+
+# Fork (ryvin/u1hub) SME module state and the runner's own files: reviews,
+# content-hash cache, lessons, the runner's lock/state/log. Never commit.
+sme.json
+sme-lessons.json
+sme-runner.lock
+sme-runner.json
+sme-runner.log
+sme/knowledge.md.bak

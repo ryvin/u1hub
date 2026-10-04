@@ -34,7 +34,9 @@ function createMock(profile) {
     camDelayMs: 600,               // how long the "camera" takes to answer
     metadata: null,                // fork (ryvin/u1hub): { [filename]: metadata } for /server/files/metadata; null = upstream's blank answer
     metaRequests: [],              // fork (ryvin/u1hub): every metadata GET, { filename, at }
-    historyRequests: []            // fork (ryvin/u1hub): every /server/history/list GET, { limit, start, order, at }
+    historyRequests: [],           // fork (ryvin/u1hub): every /server/history/list GET, { limit, start, order, at }
+    configfile: null,              // fork (ryvin/u1hub): Klipper configfile.settings the SME reads; null = empty
+    configRequests: []             // fork (ryvin/u1hub): every objects/query that asked for configfile, { at }
   };
 
   const objectsList = profile === "u1"
@@ -76,8 +78,21 @@ function createMock(profile) {
       if (want.some(k => k.startsWith("virtual_sdcard"))) status.virtual_sdcard = { progress: 0 };
       if (want.some(k => k.startsWith("heater_bed"))) status.heater_bed = { temperature: 25, target: 0 };
       if (want.some(k => k.startsWith("exclude_object"))) status.exclude_object = {};
+      // Fork (ryvin/u1hub): Klipper's configfile.settings, when a test stores
+      // some (state.configfile = { printer: {...}, extruder: {...} }), for the
+      // SME's read-only tuning summary. Logged so pacing/caching can be asserted.
+      if (want.some(k => k.startsWith("configfile"))) { state.configRequests.push({ at: Date.now() }); status.configfile = { settings: state.configfile || {} }; }
       return send(200, { result: { status } });
     }
+
+    // Fork (ryvin/u1hub): the config root (state.configFiles = ["printer.cfg",
+    // "extended/klipper/x.cfg", ...]) for the SME's firmware/overlay check,
+    // and /printer/info with state.softwareVersion. Upstream's gcodes listing
+    // below is unchanged for every other root.
+    if (u.pathname === "/server/files/list" && u.searchParams.get("root") === "config")
+      return send(200, { result: (state.configFiles || []).map(p => ({ path: p, size: 100, modified: Date.now() / 1000, permissions: "rw" })) });
+    if (u.pathname === "/printer/info")
+      return send(200, { result: { state: "ready", software_version: state.softwareVersion || "v0.12.0-mock", hostname: profile + "-mock", cpu_info: "mock" } });
 
     if (u.pathname === "/server/files/list")
       return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: Date.now() / 1000, permissions: "rw" })) });

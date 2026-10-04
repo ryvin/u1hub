@@ -1209,6 +1209,8 @@ function register(ctx) {
 
   ctx.provide("costing.costOf", (print, rates) => costOf(print, rates || conf()));
   ctx.provide("costing.projectSummary", id => { const pr = project(id); return pr ? projectSummary(pr, printsOf(pr.id), conf()) : null; });
+  // The ledger rows themselves (read-only; the SME ranks and judges by them).
+  ctx.provide("costing.prints", () => L.prints);
   ctx.hublog("info", "costing (ryvin/u1hub fork module) armed: " + L.prints.length + " ledger rows, " + Object.keys(P.projects).length + " projects");
 }
 

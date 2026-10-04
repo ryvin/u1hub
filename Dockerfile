@@ -22,6 +22,9 @@ COPY scripts ./scripts
 COPY core ./core
 COPY modules ./modules
 COPY public ./public
+# Fork (ryvin/u1hub): the SME core modules/sme.js requires (schema, tiers,
+# lessons, families). The runner itself runs on the host, not in here.
+COPY sme ./sme
 
 # config.json and gcode/ are expected to be mounted as volumes (see
 # docker-compose.yml). The server creates sane defaults if they're absent.
