@@ -51,6 +51,14 @@
       ".cst-sec{margin:18px 0 8px; font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent,#f5b316); display:flex; gap:10px; align-items:center; flex-wrap:wrap;}",
       ".cst-sec .sp{flex:1} .cst-sec .btn{font-family:inherit; letter-spacing:normal; text-transform:none;}",
       ".cst-row{display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:8px; flex-wrap:wrap;}",
+      // job pictures: a fixed box so rows never jump as images arrive; an
+      // empty box (no picture anywhere) still reads as "no image", not a gap
+      ".cst-th{flex:none; width:64px; height:64px; border-radius:8px; border:1px solid var(--line-soft); background:var(--panel-2); overflow:hidden; display:flex; align-items:center; justify-content:center; cursor:zoom-in;}",
+      ".cst-th.sm{width:56px; height:56px; border-radius:6px;} .cst-th img{width:100%; height:100%; object-fit:contain;}",
+      ".cst-th:focus-visible{outline:2px solid var(--signal); outline-offset:2px;} .cst-table td.th, .cst-table th.th{width:64px; padding-right:0;}",
+      ".cst-lightbox{position:fixed; inset:0; z-index:1000; background:color-mix(in srgb, #000 72%, transparent); display:flex; align-items:center; justify-content:center; padding:16px; cursor:zoom-out;}",
+      ".cst-lightbox figure{margin:0; max-width:min(520px, 100%); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px;}",
+      ".cst-lightbox img{display:block; width:100%; height:auto; border-radius:8px; background:var(--panel-2);} .cst-lightbox figcaption{margin-top:8px; font-size:13px; color:var(--ink); overflow-wrap:anywhere;}",
       ".cst-row .cmain{flex:1 1 240px; min-width:0;} .cst-row .t{font-weight:600; color:var(--ink); overflow-wrap:anywhere;} .cst-row .t a{color:inherit; text-decoration:none;} .cst-row .t a:hover{color:var(--signal);}",
       ".cst-row .s{font-family:var(--mono); font-size:11px; color:var(--ink-faint); margin-top:3px; overflow-wrap:anywhere;} .cst-row .s b{color:var(--ink-dim); font-weight:600;}",
       ".cst-row .acts{display:flex; gap:6px; align-items:center; flex-wrap:wrap;} .cst-row .btn{font-size:11.5px; padding:4px 9px;}",
@@ -107,7 +115,7 @@
       '<div id="cst-body"></div>';
     el.addEventListener("click", onClick);
     el.addEventListener("change", onChange);
-    el.addEventListener("keydown", e => { if (e.key === "Enter" && e.target.matches("input.field") && e.target.closest("[data-enter]")) { e.preventDefault(); const b = e.target.closest("[data-enter]").querySelector("[data-go]"); if (b) b.click(); } if (e.key === "Escape" && FORM) { FORM = null; render(); } });
+    el.addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ") && e.target.matches("[data-thumb]")) { e.preventDefault(); showThumb(e.target.dataset.thumb, e.target.dataset.thumbname || ""); return; } if (e.key === "Enter" && e.target.matches("input.field") && e.target.closest("[data-enter]")) { e.preventDefault(); const b = e.target.closest("[data-enter]").querySelector("[data-go]"); if (b) b.click(); } if (e.key === "Escape" && FORM) { FORM = null; render(); } });
   }
   async function load() {
     const d = await jget("/api/costing/projects");
@@ -128,14 +136,38 @@
     if (MSG) { const m = document.createElement("div"); m.className = "cst-msg"; m.textContent = MSG; body.prepend(m); MSG = ""; }
     if (OKMSG) { const m = document.createElement("div"); m.className = "cst-ok"; m.id = "cst-okmsg"; m.textContent = OKMSG; body.prepend(m); OKMSG = ""; }
     const f = body.querySelector("[data-focus]"); if (f) setTimeout(() => f.focus(), 0);
+    if (typeof window.armLazy === "function") window.armLazy(body);
   }
   const projOpts = (sel, blank) => (blank ? '<option value="">' + esc(blank) + "</option>" : "") + DATA.projects.map(p => '<option value="' + esc(p.id) + '"' + (p.id === sel ? " selected" : "") + ">" + esc(p.name) + (p.client_id ? " · " + esc(clientName(p.client_id)) : "") + "</option>").join("");
   const clientName = id => { const c = DATA.clients.find(x => x.id === id); return c ? c.name : ""; };
+  // What was printed, as a picture: the slicer thumbnail embedded in the gcode.
+  // /api/pthumb tries the library copy in that printer's type folder first,
+  // then the printer's own metadata (cached server-side), so a job whose file
+  // has since been deleted everywhere just shows the empty box. Images load
+  // only as they scroll into view (core's lazyImg/armLazy), never a page-full
+  // of requests to the printers at once. Click opens a larger view.
+  const thumbUrl = p => p.printer_id == null || !p.file ? "" : "/api/pthumb?id=" + encodeURIComponent(p.printer_id) + "&file=" + encodeURIComponent(p.file);
+  const thumb = (p, cls) => {
+    const u = thumbUrl(p);
+    const img = !u ? "" : (typeof window.lazyImg === "function" ? window.lazyImg("cst-img", u) : '<img class="cst-img" loading="lazy" src="' + esc(u) + '" onerror="this.style.display=\'none\'">');
+    return '<span class="cst-th ' + (cls || "") + '"' + (u ? ' role="button" tabindex="0" data-thumb="' + esc(u) + '" data-thumbname="' + esc(String(p.file).replace(/\.gcode$/i, "")) + '" title="Show larger"' : "") + ">" + img + "</span>";
+  };
+  function showThumb(u, name) {
+    const o = document.createElement("div");
+    o.className = "cst-lightbox";
+    o.innerHTML = '<figure><img src="' + esc(u) + '" alt=""><figcaption>' + esc(name) + "</figcaption></figure>";
+    const close = () => { o.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = e => { if (e.key === "Escape") close(); };
+    o.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+    o.querySelector("img").addEventListener("error", () => { o.querySelector("figure").insertAdjacentHTML("afterbegin", '<div class="cst-empty">No picture: the file is gone from the library and the printer.</div>'); o.querySelector("img").remove(); });
+    document.body.appendChild(o);
+  }
   const srcPill = p => p.source === "history" ? ' <span class="cst-pill" title="imported from the printer\'s own job history">imported</span>' : "";
   const printRow = (p, inProject) => {
     const c = p.cost || {};
     const mat = c.material || {};
-    return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '"><div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
+    return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '">' + thumb(p) + '<div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
       ' <span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span>" + (p.counted === false ? ' <span class="cst-pill">not counted</span>' : "") + srcPill(p) + "</div>" +
       '<div class="s">' + when(p.at) + " · " + esc(p.printer) + " · " + (p.pieces || 1) + " pc · " + hrs(c.hours) + (c.time_source ? " (" + (SRC[c.time_source] || c.time_source) + ")" : "") +
       " · " + (mat.grams != null ? mat.grams + " g" + (mat.grams_source ? " (" + (SRC[mat.grams_source] || mat.grams_source) + ")" : "") : "no grams") + " · material <b>" + usd(mat.cost) + "</b>" + (mat.source ? " (" + (SRC[mat.source] || mat.source) + (mat.partial ? ", partial" : "") + ")" : "") +
@@ -257,8 +289,9 @@
     if (!PL.prints.length) h += '<div class="cst-empty">' + (PL.total ? "Nothing on this page." : (PL.ledger_total ? "No prints match these filters." : "No prints yet. The Hub logs every print it watches finish; the printers' own job history comes in by import.")) + "</div>";
     else {
       const allSel = PL.prints.every(p => SEL.has(p.id));
-      h += '<div class="cst-wrap"><table class="cst-table" id="cst-ptable"><thead><tr><th class="ck"><input type="checkbox" data-selall' + (allSel ? " checked" : "") + ' aria-label="select this page"></th><th class="l">File</th><th class="l">When</th><th class="l">Printer</th><th>Outcome</th><th>Time</th><th>Grams</th><th>Direct</th><th class="l">Project</th></tr></thead><tbody>' +
+      h += '<div class="cst-wrap"><table class="cst-table" id="cst-ptable"><thead><tr><th class="ck"><input type="checkbox" data-selall' + (allSel ? " checked" : "") + ' aria-label="select this page"></th><th class="th"></th><th class="l">File</th><th class="l">When</th><th class="l">Printer</th><th>Outcome</th><th>Time</th><th>Grams</th><th>Direct</th><th class="l">Project</th></tr></thead><tbody>' +
         PL.prints.map(p => { const c = p.cost || {}, m = c.material || {}; return '<tr data-print="' + esc(p.id) + '" class="' + (SEL.has(p.id) ? "sel" : "") + (p.counted === false ? " off" : "") + '"><td class="ck"><input type="checkbox" data-sel="' + esc(p.id) + '"' + (SEL.has(p.id) ? " checked" : "") + "></td>" +
+          '<td class="th">' + thumb(p, "sm") + "</td>" +
           '<td class="l"><div class="fn">' + esc(String(p.file).replace(/\.gcode$/i, "")) + '</div><div class="sub">' + (p.pieces || 1) + " pc" + (p.counted === false ? " · not counted" : "") + (p.source === "history" ? " · imported" : "") + (m.grams_source ? " · grams " + (SRC[m.grams_source] || m.grams_source) : "") + "</div></td>" +
           '<td class="l">' + when(p.at) + '</td><td class="l">' + esc(p.printer) + '</td><td><span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span></td><td>" + hrs(c.hours) + "</td><td>" + (m.grams != null ? m.grams + " g" : "—") + '</td><td class="hi">' + usd(c.direct) + "</td>" +
           '<td class="l"><select class="field" data-assign="' + esc(p.id) + '">' + projOpts(p.project_id || "", "unassigned") + "</select></td></tr>"; }).join("") + "</tbody></table></div>";
@@ -331,6 +364,8 @@
   // ---- events ---------------------------------------------------------------------------
   const val = id => { const x = EL.querySelector(id); return x ? x.value : ""; };
   async function onClick(e) {
+    const th = e.target.closest("[data-thumb]");
+    if (th) { e.preventDefault(); showThumb(th.dataset.thumb, th.dataset.thumbname || ""); return; }
     const a = e.target.closest("[data-cstview],[data-form],[data-openp],[data-back],[data-addclient],[data-addproject],[data-additem],[data-rmitem],[data-rmclient],[data-rmproject],[data-count],[data-backfill],[data-import],[data-pf-apply],[data-pf-reset],[data-page],[data-bulk],[data-match],[data-rf-apply]");
     if (!a) return;
     e.preventDefault();
