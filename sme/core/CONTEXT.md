@@ -58,8 +58,10 @@ other.
 ```
 
 Tier-1 (routine) prompts send only `file`, `settings`, `outcome`, `loadout`
-plus the knowledge sections that match the material and printer type; tiers
-2-3 send every section and the whole knowledge base (under 60 KB). Keep the
+plus the knowledge sections that match the material and printer type. Tier 2
+sends every context section but only the matching knowledge sections (printer
+type, Filaments, Orca, Speed-vs-quality, Failure modes); tier 3 sends
+everything, including the whole knowledge base (under 60 KB). Keep the context
 sections under ~30 KB in all.
 
 ## Review (what comes back)

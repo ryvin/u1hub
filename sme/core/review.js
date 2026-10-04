@@ -46,7 +46,7 @@ const TYPE_TERMS = { u1: ["Snapmaker U1", "U1", "paxx12"], "kobra-s1": ["Kobra S
 function knowledgeFor(ctx, tier, md) {
   const f = ctx.facts || {}, fw = ctx.firmware || f.firmware || {};
   const terms = [].concat(...(f.printer_types || []).map(t => TYPE_TERMS[t] || [t]), (fw.multiace || /davinci/i.test(String(ctx.name))) ? ["multiACE"] : []);
-  const sel = TIERS.selectKnowledge(md, { tier, materials: f.materials || [], printerTypes: terms, terms: tier === 1 ? ["Filaments"] : [] });
+  const sel = TIERS.selectKnowledge(md, { tier, materials: f.materials || [], printerTypes: terms, terms: tier === 1 ? ["Filaments"] : (tier === 2 ? ["Filaments", "Orca", "Speed", "Failure"] : []) });
   if (tier === 1 && sel.text) {
     const mats = (f.materials || []).map(m => String(m).toUpperCase());
     sel.text = sel.text.split("\n").filter(l => !/^\|/.test(l) || /^\|\s*-/.test(l) || /^\|\s*(Material|Filament|Thing|Item)/i.test(l) || mats.some(m => l.toUpperCase().includes(m))).join("\n");

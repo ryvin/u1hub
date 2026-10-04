@@ -102,8 +102,10 @@ function sampleCtx(over) {
     ok(sel.mode === "matched" && sel.sections.some(h => /Filaments/.test(h)) && sel.sections.some(h => /^2\. Snapmaker U1/.test(h)) && sel.sections.some(h => /^2b\./.test(h)) && !sel.sections.some(h => /Kobra/.test(h)) && sel.text.length < md.length / 2, "tier 1 for PLA on a U1: the filament section, §2 and §2b, not the Kobra section", sel.sections);
     sel = TIERS.selectKnowledge(md, { tier: 1, materials: ["PETG"], printerTypes: ["Kobra S1", "Rinkhals"], terms: ["Filaments"] });
     ok(sel.sections.some(h => /Kobra/.test(h)) && !sel.sections.some(h => /^2\. Snapmaker/.test(h)), "tier 1 for the Kobra: §3, not §2", sel.sections);
-    sel = TIERS.selectKnowledge(md, { tier: 2, materials: ["PLA"] });
-    ok(sel.mode === "full" && sel.text === md, "tier 2: the whole file (under the size cap)", { mode: sel.mode, len: sel.text.length });
+    sel = TIERS.selectKnowledge(md, { tier: 2, materials: ["PLA"], printerTypes: ["Snapmaker U1"], terms: ["Filaments", "Orca", "Speed", "Failure"] });
+    ok(sel.mode === "matched" && sel.text.length < md.length && sel.sections.some(h => /Orca/.test(h)) && sel.sections.some(h => /Failure/.test(h)) && !sel.sections.some(h => /Kobra/.test(h)), "tier 2: matched sections (printer, filaments, Orca, playbook, failures), never the whole file", { mode: sel.mode, len: sel.text.length, secs: sel.sections });
+    sel = TIERS.selectKnowledge(md, { tier: 3, materials: ["PLA"] });
+    ok(sel.mode === "full" && sel.text === md, "tier 3: the whole file (under the size cap)", { mode: sel.mode, len: sel.text.length });
     sel = TIERS.selectKnowledge(md, { tier: 2, materials: ["PLA"], max: 1000 });
     ok(sel.mode === "matched" && sel.text.length < md.length && /Last refreshed/.test(sel.text), "over the cap: matching sections plus the preamble (date header)", sel.sections);
     ok(TIERS.selectKnowledge("", { tier: 2 }).mode === "none", "no knowledge file: nothing, no error", null);
@@ -235,7 +237,7 @@ function sampleCtx(over) {
     out = await REVIEW.reviewContext(sampleCtx({ key: "other:path.gcode" }), { log: s => logs.push(s) });
     ok(out.status === "cached" && out.from_cache && out.review.verdict === "TUNE" && fakeLog().length === n0, "the same content hash from another path/project: served from the cache, no model call", out.status);
     out = await REVIEW.reviewContext(sampleCtx(), { force: true, tier: 2, log: () => {} });
-    ok(out.status === "stored" && out.tier === 2 && out.model === "sonnet" && fakeLog().length === n0 + 1 && fakeLog()[n0].knowledge_mode === "full" && fakeLog()[n0].has_klipper, "--force skips the cache; a forced tier 2 sends the full knowledge base and every section", { tier: out.tier, mode: fakeLog()[n0].knowledge_mode });
+    ok(out.status === "stored" && out.tier === 2 && out.model === "sonnet" && fakeLog().length === n0 + 1 && fakeLog()[n0].knowledge_mode === "matched" && fakeLog()[n0].has_klipper, "--force skips the cache; a forced tier 2 sends matched knowledge and every context section", { tier: out.tier, mode: fakeLog()[n0].knowledge_mode });
     out = await REVIEW.reviewContext(sampleCtx({ content_hash: "b".repeat(40) }), { dry: true, log: () => {} });
     ok(out.status === "dry" && out.prompt && /=== KNOWLEDGE BASE/.test(out.prompt) && /=== TARGET CONTEXT ===/.test(out.prompt) && fakeLog().length === n0 + 1, "dry run: the prompt is built, nothing is called or stored", out.status);
     // lessons-only: seed the shared store with an exact, well-confirmed lesson

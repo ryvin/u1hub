@@ -140,7 +140,10 @@ function selectKnowledge(md, opt) {
     const hit = secs.filter(s => s.heading && matches(s));
     return { text: hit.map(s => "## " + s.heading + "\n" + s.body).join("\n"), sections: hit.map(s => s.heading), mode: hit.length ? "matched" : "none" };
   }
-  if (text.length <= (o.max || KNOWLEDGE_MAX_CHARS)) return { text, sections: secs.filter(s => s.heading).map(s => s.heading), mode: "full" };
+  // Tier 3 (hard cases) reads the whole file when it fits; tier 2 never does:
+  // it gets the preamble plus the matching sections, so a routine review does
+  // not pay ~15k tokens for printers and materials it is not about.
+  if (o.tier !== 2 && text.length <= (o.max || KNOWLEDGE_MAX_CHARS)) return { text, sections: secs.filter(s => s.heading).map(s => s.heading), mode: "full" };
   const pre = secs.find(s => !s.heading);
   const hit = secs.filter(s => s.heading && matches(s));
   return { text: (pre ? pre.body + "\n" : "") + hit.map(s => "## " + s.heading + "\n" + s.body).join("\n"), sections: hit.map(s => s.heading), mode: "matched" };
