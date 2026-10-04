@@ -9,8 +9,8 @@
 # Two tasks, both running the runner inside WSL as the current user, only
 # while that user is logged on (the Claude subscription login lives in the
 # WSL home directory of that user):
-#   "U1 Hub SME review"             hourly:  node scripts/sme-runner.js
-#   "U1 Hub SME knowledge refresh"  the 1st of every month at 03:30:
+#   "U1 Hub SME review"             hourly at :50:  node scripts/sme-runner.js
+#   "U1 Hub SME knowledge refresh"  the 1st of every month at 03:50:
 #                                   node scripts/sme-runner.js --refresh-knowledge
 # The runner holds its own lock, so an overlapping start just exits. A pause
 # after a usage limit is the runner's own state file; the tasks keep firing
@@ -58,21 +58,26 @@ $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hour
 
 # Hourly review: a daily trigger that repeats every hour, indefinitely.
 $hourlyAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument (Get-WslArgs "node scripts/sme-runner.js")
-$hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(15) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration ([TimeSpan]::MaxValue)
+$hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(50) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)   # [TimeSpan]::MaxValue is rejected: HRESULT 0x80041318, Duration P99999999D... (measured 2026-10-04)
 if (Get-ScheduledTask -TaskName $HourlyName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $HourlyName -Confirm:$false }
 Register-ScheduledTask -TaskName $HourlyName -Action $hourlyAction -Trigger $hourlyTrigger -Principal $principal -Settings $settings -Description "Reviews the next few gcode / 3MF / printer targets with Claude Code on the owner's subscription (scripts/sme-runner.js). Advice only; nothing is applied." | Out-Null
 Write-Host ("installed: {0} (hourly, as {1}, only when logged on)" -f $HourlyName, $user)
 
-# Monthly knowledge refresh: the 1st of every month at 03:30. New-ScheduledTaskTrigger
-# has no -Monthly parameter, so the trigger is built from the CIM class directly.
-$monthlyAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument (Get-WslArgs "node scripts/sme-runner.js --refresh-knowledge")
-$class = Get-CimClass -ClassName MSFT_TaskMonthlyTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
-$monthlyTrigger = New-CimInstance -CimClass $class -ClientOnly
-$monthlyTrigger.DaysOfMonth = 1
-$monthlyTrigger.MonthsOfYear = 4095        # bitmask: all twelve months
-$monthlyTrigger.StartBoundary = (Get-Date -Date (Get-Date).Date.AddHours(3).AddMinutes(30)).ToString("yyyy-MM-ddTHH:mm:ss")
-$monthlyTrigger.Enabled = $true
+# Monthly knowledge refresh: the 1st of every month at 03:50. New-ScheduledTaskTrigger
+# has no -Monthly parameter, and the CIM MSFT_TaskMonthlyTrigger class on this
+# Windows build has no MonthsOfYear property (measured 2026-10-04), so the task
+# is registered with a daily trigger and its XML is then rewritten to a
+# monthly calendar trigger (day 1, every month). schtasks.exe /SC MONTHLY was
+# tried and mangles the quoted wsl.exe argument list.
 if (Get-ScheduledTask -TaskName $MonthlyName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $MonthlyName -Confirm:$false }
-Register-ScheduledTask -TaskName $MonthlyName -Action $monthlyAction -Trigger $monthlyTrigger -Principal $principal -Settings $settings -Description "Rewrites sme/knowledge.md with fresh web research (Claude Code, web tools on). The old file is kept as knowledge.md.bak." | Out-Null
-Write-Host ("installed: {0} (1st of the month 03:30, as {1}, only when logged on)" -f $MonthlyName, $user)
+$monthlyAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument (Get-WslArgs "node scripts/sme-runner.js --refresh-knowledge")
+$seedTrigger = New-ScheduledTaskTrigger -Daily -At ((Get-Date).Date.AddHours(3).AddMinutes(50))
+Register-ScheduledTask -TaskName $MonthlyName -Action $monthlyAction -Trigger $seedTrigger -Principal $principal -Settings $settings -Description "Rewrites sme/knowledge.md with fresh web research (Claude Code, web tools on). The old file is kept as knowledge.md.bak." | Out-Null
+$xml = Export-ScheduledTask -TaskName $MonthlyName
+$months = "<Months>" + ((@("January","February","March","April","May","June","July","August","September","October","November","December") | ForEach-Object { "<$_ />" }) -join "") + "</Months>"
+$xml = [regex]::Replace($xml, "<ScheduleByDay>[\s\S]*?</ScheduleByDay>", ("<ScheduleByMonth><DaysOfMonth><Day>1</Day></DaysOfMonth>" + $months + "</ScheduleByMonth>"))
+if ($xml -notmatch "<ScheduleByMonth>") { throw "could not rewrite the trigger to monthly" }
+Unregister-ScheduledTask -TaskName $MonthlyName -Confirm:$false
+Register-ScheduledTask -TaskName $MonthlyName -Xml $xml | Out-Null
+Write-Host ("installed: {0} (1st of the month 03:50, as {1}, only when logged on)" -f $MonthlyName, $user)
 Write-Host "Check: powershell -File scripts\sme-schedule-install.ps1 -Status   |   log: sme-runner.log in the repo"

@@ -157,9 +157,12 @@ function shouldEscalate(review, facts, validation) {
   if (validation && validation.ok === false) return { escalate: true, reason: "schema: " + validation.error };
   if (!review) return { escalate: true, reason: "no review" };
   if (review.confidence === "low") return { escalate: true, reason: "confidence low" };
-  const covers = new Set((facts && facts.covers) || []);
-  const gap = (review.gaps || []).find(g => g && covers.has(String(g.topic)));
-  if (gap) return { escalate: true, reason: "not enough data on " + gap.topic + ", which the context covers" };
+  // A "not enough data" gap is NOT a reason to escalate. Measured on the first
+  // real runs (2026-10-04): 3 of 4 sonnet reviews escalated on gaps like "no
+  // cancel reason recorded" or "no roll recorded for the loaded heads" - data
+  // that is absent, not misread - and opus reported the very same gaps, so the
+  // escalation bought nothing but opus tokens. Gaps stay on the review as the
+  // list of data worth feeding the SME next.
   return { escalate: false, reason: null };
 }
 

@@ -130,9 +130,12 @@ from the CLI's `modelUsage`), plus token usage and cost when the CLI's JSON
 reports them (`usage`, `total_cost_usd`).
 
 **Escalation** (one per target per run, never past tier 3): the answer fails
-the schema, rates its own `confidence` low, or says "not enough data" on a
-topic the context actually covers (`gaps[].topic` ∈ `facts.covers`). The
-record says `escalated` and `escalated_from`.
+the schema, or rates its own `confidence` low. A "not enough data" gap does
+NOT escalate: on the first real runs (2026-10-04) 3 of 4 tier-2 reviews
+escalated on gaps such as "no cancel reason recorded" or "no roll recorded for
+the loaded heads", and opus then reported the same gaps - missing data, which
+a bigger model cannot supply. Gaps stay on the review as the list of data
+worth feeding the SME next. The record says `escalated` and `escalated_from`.
 
 **Lean prompts.** Tier 1 sends only the file / settings / outcome / loadout
 sections and the knowledge sections that match the material and printer type
@@ -244,9 +247,10 @@ powershell -ExecutionPolicy Bypass -File scripts\sme-schedule-install.ps1 -Unins
 ```
 
 Two tasks as the current user, only while logged on (the subscription login
-lives in that user's WSL home): **"U1 Hub SME review"** hourly, running
+lives in that user's WSL home): **"U1 Hub SME review"** hourly at :50 (a minute no other task on this PC uses;
+the Channel-* and Snapmaker-* Claude jobs sit on :00-:45), running
 `wsl.exe -e bash -lc "cd /mnt/e/Code/u1hub && node scripts/sme-runner.js"`,
-and **"U1 Hub SME knowledge refresh"** on the 1st of every month at 03:30
+and **"U1 Hub SME knowledge refresh"** on the 1st of every month at 03:50
 with `--refresh-knowledge`. Written, not run, in the commit that introduced
 it (**UNVERIFIED** on Windows — to confirm: run the install line, then
 `-Status`).

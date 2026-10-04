@@ -91,7 +91,7 @@ function sampleCtx(over) {
     const esc1 = TIERS.shouldEscalate({ confidence: "low", gaps: [] }, { covers: ["settings"] }, { ok: true });
     const esc2 = TIERS.shouldEscalate({ confidence: "high", gaps: [{ topic: "klipper" }] }, { covers: ["settings", "klipper"] }, { ok: true });
     const esc3 = TIERS.shouldEscalate({ confidence: "high", gaps: [{ topic: "geometry" }] }, { covers: ["settings"] }, { ok: true });
-    ok(esc1.escalate && esc2.escalate && !esc3.escalate && TIERS.shouldEscalate(null, {}, { ok: false, error: "x" }).escalate, "escalate on low confidence, on a gap the context covers, on schema failure; not on a gap it does not cover", [esc1, esc2, esc3]);
+    ok(esc1.escalate && !esc2.escalate && !esc3.escalate && TIERS.shouldEscalate(null, {}, { ok: false, error: "x" }).escalate, "escalate on low confidence and on schema failure only; a data gap (covered topic or not) never escalates - a bigger model cannot invent missing data", [esc1, esc2, esc3]);
     ok(TIERS.sectionsForTier("gcode", 1).join() === "file,settings,outcome,loadout" && TIERS.sectionsForTier("gcode", 2) === null && TIERS.sectionsForTier("3mf", 1) === null, "tier-1 gcode prompts drop the Klipper section", null);
 
     console.log("\n== PURE: knowledge sections by tier ==");
