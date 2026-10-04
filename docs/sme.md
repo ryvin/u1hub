@@ -57,8 +57,8 @@ path — in this order, skipping anything already reviewed at its current
 content and anything that errored in the last 6 h:
 
 1. gcode files and **families** by completed prints, most first (ledger counts over every path of the content);
-2. 3MFs by how often gcode sliced from them was printed (the Models tab's own name-and-link matching, fed from the ledger), most first;
-3. one tuning review per reachable printer;
+2. one tuning review per reachable printer (moved ahead of the 3MFs on 2026-10-04: a handful of reviews the owner asked for, which otherwise waited behind ~1,800 3MFs);
+3. 3MFs by how often gcode sliced from them was printed (the Models tab's own name-and-link matching, fed from the ledger), most first;
 4. anything new and never printed: gcode, then families, then 3MFs, newest first;
 5. anything **changed** since its review: a re-sliced file (new content id), a family with a new variant or new outcomes, a printer whose Klipper settings changed.
 

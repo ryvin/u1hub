@@ -494,8 +494,10 @@ function register(ctx) {
     groups.changed.sort((a, b) => ((R.reviews[tkey(a.kind, a.kind === "family" ? familyKey(a.key) : a.kind === "printer" ? a.key : a.content_hash)] || {}).reviewed_at || 0) - ((R.reviews[tkey(b.kind, b.kind === "family" ? familyKey(b.key) : b.kind === "printer" ? b.key : b.content_hash)] || {}).reviewed_at || 0));
     const items = [].concat(
       groups.printed.map(x => ({ ...x, reason: (x.kind === "family" ? "family printed " : "printed ") + x.prints + "x" })),
-      groups.models.map(x => ({ ...x, reason: "model printed " + x.prints + "x" })),
+      // printers before 3MFs (2026-10-04): there are only a few, they are what
+      // the owner asked to tune, and behind ~1,800 3MFs they waited for weeks
       groups.printers.map(x => ({ ...x, reason: "printer tuning" })),
+      groups.models.map(x => ({ ...x, reason: "model printed " + x.prints + "x" })),
       groups.fresh.map(x => ({ ...x, reason: "new, never printed" })),
       groups.changed.map(x => ({ ...x, reason: x.kind === "family" ? "new variant or new outcomes" : "changed since its review" })));
     const q = { generated_at: now, items, totals, unique_targets: Object.values(totals).reduce((n, t) => n + t.total, 0), paths: cat.paths,
@@ -516,8 +518,40 @@ function register(ctx) {
     const fe = fleet.find(x => x && x.id === idx) || null;
     return ADV.printerBrief(p, idx, ctx.loadout ? (ctx.loadout(idx) || []) : [], fe, null).filter(l => !/^COLOR MAPPING/.test(l));
   }
+  // Why prints stopped: the upstream Logbook records every firmware pause or
+  // error with its message and the file that was printing ("e0_filament
+  // runout", "detected noodle (extruder 0)", "[multiACE] Runout on Head 3").
+  // The first real reviews (2026-10-04) all listed "no cancel/error reason
+  // recorded" as their main gap, so outcome sections carry these. Read from
+  // logbook.json (the logbook module's own state file, read-only here),
+  // re-read only when its mtime changes.
+  const LOGBOOK_FILE = path.join(ctx.baseDir, "logbook.json");
+  let LOGBOOK = { mtime: 0, byFile: new Map() };
+  async function refreshLogbook() {
+    try {
+      const st = await fsp.stat(LOGBOOK_FILE);
+      if (st.mtimeMs === LOGBOOK.mtime) return;
+      const j = JSON.parse(await fsp.readFile(LOGBOOK_FILE, "utf8"));
+      const byFile = new Map();
+      for (const e of (j && Array.isArray(j.entries) ? j.entries : [])) {
+        if (!e || e.kind !== "issue" || !e.file) continue;
+        const k = path.basename(String(e.file));
+        if (!byFile.has(k)) byFile.set(k, []);
+        byFile.get(k).push(e);
+      }
+      LOGBOOK = { mtime: st.mtimeMs, byFile };
+    } catch { /* no logbook (module off, fresh install): no reasons, nothing breaks */ }
+  }
+  function reasonLines(rows) {
+    const files = [...new Set(rows.map(r => path.basename(String(r.file || ""))))];
+    const hits = files.flatMap(f => LOGBOOK.byFile.get(f) || []).sort((a, b) => b.at - a.at).slice(0, 8);
+    if (!hits.length) return [];
+    return ["  FAILURE REASONS (Hub Logbook, the printer's own pause/error messages for this file):",
+            ...hits.map(e => "    " + new Date(e.at).toISOString().slice(0, 16).replace("T", " ") + " on " + (e.name || "printer " + e.printer) + ": " + str(e.what, 160) + (e.fix ? " | fix noted: " + str(e.fix, 120) : ""))];
+  }
   function outcomeLines(s, rows, label) {
     const L = [(label || "OUTCOME HISTORY") + " (the Hub's print ledger): done " + s.done + ", cancelled " + s.cancelled + ", error " + s.error + (s.last_at ? ", last " + new Date(s.last_at).toISOString().slice(0, 10) : "")];
+    L.push(...reasonLines(rows));
     if (s.actual_s.length) {
       const mins = v => Math.round(v / 60);
       L.push("  actual print time (done): median " + mins(median(s.actual_s)) + " min, min " + mins(Math.min(...s.actual_s)) + ", max " + mins(Math.max(...s.actual_s)) + (s.time_ratio != null ? "; actual / slicer estimate = " + s.time_ratio : ""));
@@ -787,6 +821,7 @@ function register(ctx) {
     if (!KINDS.includes(kind) || !key) return bad(res, 400, "kind must be one of " + KINDS.join(", ") + " and key is required");
     try {
       if (!CAT.at) await buildCatalogue(false);
+      await refreshLogbook();
       const c = await contextFor(kind, key);
       if (!c) return bad(res, 404, "no such " + kind + ": " + key);
       const text = assemble(c.sections, c.order);

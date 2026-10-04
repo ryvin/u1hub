@@ -145,6 +145,11 @@ const klipper = (pa, extra) => ({ printer: { kinematics: "corexy", max_velocity:
   prints.push(row("pt_kb", now - 5 * D, 1, "Kobra-mock", "kobra-s1", KOBRA, "done", 7300, 120, "PETG"));
   void k;
   fs.writeFileSync(path.join(tmp, "prints.json"), JSON.stringify({ prints }));
+  // the upstream Logbook's own state file: one firmware reason for REGAL, one for a file nobody asks about
+  fs.writeFileSync(path.join(tmp, "logbook.json"), JSON.stringify({ entries: [
+    { id: "log_a", printer: 0, name: "U1-mock", kind: "issue", at: now - 14 * D, what: "detected noodle (extruder 0) · code 2", fix: "", source: "firmware", file: REGAL },
+    { id: "log_b", printer: 0, name: "U1-mock", kind: "issue", at: now - 3 * D, what: "e1_filament runout (extruder 1) · code 0", fix: "", source: "firmware", file: "unrelated_thing.gcode" }
+  ], tasks: [], hours: {} }));
   const mock = createMock("u1"), kobra = createMock("generic");
   const portU1 = await mock.listen(0), portK = await kobra.listen(0);
   mock.state.configfile = klipper(0.04); mock.state.softwareVersion = "v1.5.2-paxx12-21"; mock.state.configFiles = ["printer.cfg", "extended/extended2.cfg", "extended/klipper/overrides.cfg", "extended/moonraker/x.cfg", "extended/multiace/ace.cfg", "extended/ace.cfg"];
@@ -200,8 +205,8 @@ const klipper = (pa, extra) => ({ printer: { kinematics: "corexy", max_velocity:
     const keys = q.items.map(i => i.kind + ":" + i.key);
     const wantOrder = FALSIFY
       ? ["gcode:u1:" + REGAL, "family:gcode:sakura framed"]
-      : ["family:gcode:sakura framed", "gcode:u1:" + REGAL, "gcode:kobra-s1:" + KOBRA, "3mf:Yosh/Sakura Framed/Sakura Framed.3mf", "printer:U1-mock", "printer:Kobra-mock"];
-    ok(wantOrder.every((w, i) => keys[i] === w), "order: the sakura family (7 done) > regal (2) > kobra thing (1) > the sakura 3MF (7 derived) > printers U1-mock, Kobra-mock" + (FALSIFY ? " [FALSIFIED]" : ""), keys);
+      : ["family:gcode:sakura framed", "gcode:u1:" + REGAL, "gcode:kobra-s1:" + KOBRA, "printer:U1-mock", "printer:Kobra-mock", "3mf:Yosh/Sakura Framed/Sakura Framed.3mf"];
+    ok(wantOrder.every((w, i) => keys[i] === w), "order: the sakura family (7 done) > regal (2) > kobra thing (1) > printers U1-mock, Kobra-mock > the sakura 3MF (7 derived)" + (FALSIFY ? " [FALSIFIED]" : ""), keys);
     const fresh = keys.slice(6);
     ok(fresh[0] === "gcode:u1:" + HUGE && fresh[1] === "gcode:u1:" + LONELY && fresh.slice(2).join() === "3mf:Yosh/Yosh/Aug26/Collectibles/Game/Poster/Mini/Deep Poster.3mf,3mf:Yosh/Other Model/Other Model.3mf".replace("3mf:Yosh/Yosh", "3mf:Yosh") || true, "then the never-printed: newest gcode first, then the never-printed 3MFs", fresh);
     ok(fresh.includes("3mf:Yosh/Aug26/Collectibles/Game/Poster/Mini/Deep Poster.3mf"), "a 3MF seven folders deep (past upstream's four) is a target", fresh);
@@ -223,6 +228,7 @@ const klipper = (pa, extra) => ({ printer: { kinematics: "corexy", max_velocity:
     ok(r.status === 200 && c.content_hash === regalItem.content_hash && c.paths.length === 2 && c.chars <= 30000, "gcode context: the same content id, both paths, under the cap", { hash: c.content_hash, chars: c.chars });
     ok(/SLICER SETTINGS:/.test(c.sections.settings) && /retraction_length = 0\.8/.test(c.sections.settings) && /ALSO AT \(identical content\): kobra-s1:/.test(c.sections.file), "…slicer settings and the duplicate path", c.sections.file);
     ok(/OUTCOME HISTORY .*done 2, cancelled 0, error 0/.test(c.sections.outcome) && /actual \/ slicer estimate = 0\.98/.test(c.sections.outcome), "…outcome history with actual vs estimate (22000 s / 376 min = 0.98)", c.sections.outcome);
+    ok(c.sections.outcome.includes("FAILURE REASONS (Hub Logbook") && /detected noodle \(extruder 0\)/.test(c.sections.outcome) && !/e1_filament runout/.test(c.sections.outcome), "…the Logbook's firmware reason for this file, and not another file's", c.sections.outcome);
     ok(/LOADED IN ITS HEADS/.test(c.sections.loadout) && /KLIPPER SETTINGS for U1-mock \(read-only/.test(c.sections.klipper) && /extruder\.pressure_advance = 0\.04/.test(c.sections.klipper) && /input_shaper\.shaper_freq_x = 55\.2/.test(c.sections.klipper) && !/gcode_macro/.test(c.sections.klipper) && !/step_pin/.test(c.sections.klipper),
       "…what is loaded and a whitelisted Klipper summary (PA, shaper; no macros, no pins)", c.sections.klipper);
     ok(c.facts.materials.join() === "PLA" && c.facts.prints.done === 2 && c.facts.time_ratio === 0.98 && c.facts.printer_types.join() === "u1" && c.facts.covers.includes("klipper") && c.settings.retraction_length === "0.8", "…facts for the tier router and settings for the lesson matcher", c.facts);
