@@ -3647,7 +3647,14 @@ async function stopHub() {
 
     let t = await fetch(HUB + "/api/models/thumb?file=" + encodeURIComponent("Cinderwing3D/Baby Dragon/Baby_Dragon_Color.3mf"));
     ok(t.status === 200 && (t.headers.get("content-type") || "").includes("png"), "thumbnail comes out of the zip as a PNG", t.status);
-    ok(fs.existsSync(path.join(hubDir, "thumbs", "models")) && fs.readdirSync(path.join(hubDir, "thumbs", "models")).length >= 1, "…and is cached on local disk");
+    // Fork (ryvin/u1hub), rule 7: modules/models.js writes the cache after it
+    // answers (fire-and-forget), so the file can land a moment after the
+    // response. Wait for the observable state instead of racing the write -
+    // under load (load average 12, 2026-10-04) the bare check failed 2 of 3 runs.
+    const thumbDir = path.join(hubDir, "thumbs", "models");
+    const cached = () => fs.existsSync(thumbDir) && fs.readdirSync(thumbDir).length >= 1;
+    for (let i = 0; i < 50 && !cached(); i++) await sleep(100);
+    ok(cached(), "…and is cached on local disk");
     t = await fetch(HUB + "/api/models/thumb?file=loose.3mf");
     ok(t.status === 404, "a file with no preview answers 404, the card shows a placeholder");
     t = await fetch(HUB + "/api/models/thumb?file=" + encodeURIComponent("../config.json"));
