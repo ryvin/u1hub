@@ -132,6 +132,7 @@
   const LABELS = {
     "printer-sync": "Copy new printer files into the library (fork)",
     "library-colors": "Library color dots & printable-on filter (fork)",
+    bl2u1: "Convert to U1 via bl2u1 (fork)",
     timelapse: "Timelapse capture"
   };
   function relabelSettings(box) {

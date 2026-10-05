@@ -39,6 +39,10 @@ const MODULE_TABLE = {
   // v2.28: also provides models.open/models.info, which advisor's 3MF
   // suggester uses at call time (provide/use resolves late, so advisor
   // registering first is fine).
+  // Fork (ryvin/u1hub): BEFORE models on purpose - it answers POST
+  // /api/models/convert through the owner's bl2u1 converter and calls next()
+  // to upstream's template convert when bl2u1 cannot help.
+  bl2u1: require("../modules/bl2u1.js"),
   models: require("../modules/models.js"),
   // v2.28: "worth printing?" - three numbers on the job card from the file's
   // own grams and time. Pure arithmetic and two settings; provides margin.quote.
