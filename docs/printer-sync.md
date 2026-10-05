@@ -6,7 +6,8 @@ manage that row but can never pick it as a job. `printer-sync` closes that gap: 
 `U1HUB_SYNC_MS` (default 60 s) it compares each printer's own listing with the
 library and copies anything the library lacks.
 
-Feature flag `printer-sync`. It ships **off** (see [FORK.md](FORK.md) → Live gates).
+Feature flag `printer-sync`. It ships **on** since its live gate passed on
+2026-10-05 (see [FORK.md](FORK.md) → Live gates).
 
 ## Rules
 

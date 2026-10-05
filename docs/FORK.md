@@ -10,7 +10,7 @@ until upstream 2.40 shipped its own; it is upstream's now.)
 
 | Feature flag | Default | Lite | What it does |
 |---|---|---|---|
-| `printer-sync` | **off** | off | Copies gcode that lands on a printer some other way (Orca straight to the machine, USB) into the Hub library, one file at a time, never while that printer is printing. See [printer-sync.md](printer-sync.md). |
+| `printer-sync` | on | off | Copies gcode that lands on a printer some other way (Orca straight to the machine, USB) into the Hub library, one file at a time, never while that printer is printing. See [printer-sync.md](printer-sync.md). |
 | `library-colors` | on | off | Color dots under each library row, and a "printable on" chip bar that filters the library to files whose colors are all loaded on a chosen printer right now. Client only. It reads the match module's `/api/library-palettes`. |
 | `costing` | on | off | A print ledger (every finished, cancelled or failed print with its actual duration and its filament priced from the rolls that were loaded, else from the file, the printer's own metadata or its job history; plus every printer's own Moonraker job history imported, hourly, for prints the Hub never watched), clients and projects with line items, a cost summary where every line names its source, cited suggested rates per printer type for what you have not typed, a pricing helper, a filterable Prints list with bulk assignment, cost reports by client / project / printer / type / month / material / outcome with CSV and a printable page, and a printable quote page. Projects tab (Projects, Prints, Reports), a project dropdown on the job card, rates in Settings. See [costing.md](costing.md). |
 | `multiace` | on | off | "Print via multiACE" for a U1 that [multiACE](https://github.com/decay71/multiACE) feeds from Anycubic ACE units (probed per printer: `/multiace/api/version` + `ace.api_version` 1). A loadout strip on the card; for a file that needs more than the four heads, the printer's **own** preflight analyses the original file and the card shows its mapping (tiers, ΔE), three plans with swaps / est. added time / est. purge top-up, and the spool moves a proposed plan needs (suggested, never made). Print = identity extruder map, then the engine rewrites, uploads and starts; 413 → the multiACE inbox + link. Records plan/swaps/purge on the costing ledger row; the SME's printer brief gets the ACE slots. See [multiace.md](multiace.md). |
@@ -22,8 +22,7 @@ Switch any of them from Settings → Features, or in `config.json`:
 "features": { "printer-sync": true }
 ```
 
-`printer-sync` ships off until its live hardware gate is recorded below. Upstream
-does the same with `slicing`.
+`printer-sync` ships on: its live hardware gate passed on 2026-10-05 (recorded below).
 
 ## The whole diff against upstream
 
@@ -106,7 +105,7 @@ curl -s localhost:4545/api/fleet          # every printing machine still printin
 
 | Gate | Status |
 |---|---|
-| printer-sync against a real U1 (one small file pulled from an idle printer, Moonraker RSS before and after, busy printer skipped) | **not yet run**. Flip the `MODULE_DEFAULTS` entry to `true` in the commit that records it. |
+| printer-sync against real printers | **passed 2026-10-05.** First pass on the live Hub: 24 files copied (13 from davinci incl. 108-163 MB gcodes, 11 from kobrakai), davinci's Moonraker answered `/server/info` 200 on every 10 s check during the pass, the printing snapdragon was listed busy and left alone, one same-name/different-bytes file was skipped (`Eye Tree Tray`). Two copies failed their final rename with `EACCES` on the Windows-mounted gcode folder (a fresh file briefly locked) and both succeeded on the next pass a minute later; no `.part` left. Default flipped to on in this commit. Moonraker RSS was not measured (no SSH used). |
 | library-colors in a real browser against the live fleet | see the commit that introduced it |
 | sme | no hardware gate needed: it reads three small JSON endpoints per printer (`objects/query?configfile=settings`, `/printer/info`, `/server/files/list?root=config`), cached ten minutes, and never writes to a printer. **Still to run on the deployed Hub**: `node scripts/sme-runner.js --dry-run` against the real shelf, one real run with `SME_BATCH=1`, the schedule install (docs/sme.md "Verification record"). |
 | multiace | mock-gated only so far (`test/multiace-standalone.js`, a Playwright pass on a throwaway Hub). The probe and loadout reads are three small GETs that davinci answered read-only on 2026-10-04 (docs/multiace.md "Contract"). **Still to run on the real davinci, idle, by the owner**: one preflight POST of a library file (analysis only), then the first real print via this route with a small as-sliced job (docs/multiace.md "Verification record"). The module ships on because it does nothing on a printer that does not probe as multiACE and sends nothing without a confirm dialog. |

@@ -81,10 +81,10 @@ function writeConfig(dir, gcode, portU1, features) {
     writeConfig(tmp, gcode, portU1, null);
     await startHub(tmp);
     let cfg = (await jget("/api/config")).body || {};
-    ok(cfg.features && cfg.features["printer-sync"] === false, "printer-sync ships off (no live hardware gate yet)", cfg.features);
+    ok(cfg.features && cfg.features["printer-sync"] === true, "printer-sync ships on (live gate passed 2026-10-05)", cfg.features);
     ok(cfg.features && cfg.features["library-colors"] === true, "library-colors ships on", cfg.features);
     let r = await jget("/api/printer-sync");
-    ok(r.status === 404, "printer-sync off: its API is absent", r.status);
+    ok(r.status === 200 && r.body && r.body.enabled === true, "printer-sync on by default: its API answers", r.status);
     let page = await (await fetch(HUB + "/")).text();
     ok(page.includes("/modules/library-colors-ui.js"), "library-colors on: its client script is injected");
     const ui = await fetch(HUB + "/modules/library-colors-ui.js");
