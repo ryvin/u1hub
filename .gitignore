@@ -111,3 +111,7 @@ sme-runner.lock
 sme-runner.json
 sme-runner.log
 sme/knowledge.md.bak
+
+# Fork (ryvin/u1hub) multiace module state: what was sent through the
+# printer's multiACE preflight (plan, swaps, purge estimate). Never commit.
+multiace.json

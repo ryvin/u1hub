@@ -713,6 +713,19 @@ function register(ctx) {
     if (outcome === "done" && row.project_id) { delete P.pending[key]; saveP(); }
     const stash = STASH.get(idx + ":" + name);
     if (stash && Date.now() - stash.at < STASH_MS) { applyDeduction(row, stash.rec); STASH.delete(idx + ":" + name); }
+    // Fork module multiace: a print started through the printer's multiACE
+    // preflight carries the plan, its swap count and the Hub's purge-top-up
+    // estimate on the row (additive; absent when the module is off or the
+    // print went the stock way). The estimated swap time joins est_minutes
+    // because that is the fallback when no actual duration exists; actual
+    // seconds already contain the swaps.
+    try {
+      const mj = ctx.use("multiace.jobinfo"), mi = mj ? mj(idx, name) : null;
+      if (mi) {
+        row.multiace = { plan: mi.plan, swaps: mi.swaps, est_added_sec: mi.est_added_sec, purge_mm: mi.purge_mm, purge_g: mi.purge_g, heads: mi.heads || [], sent_at: mi.ts };
+        if (num(row.est_minutes) > 0 && num(mi.est_added_sec) > 0) { row.est_minutes = r2(row.est_minutes + mi.est_added_sec / 60); row.est_source = (row.est_source || "slicer") + "+multiace"; }
+      }
+    } catch {}
     L.prints.push(row);
     if (L.prints.length > LEDGER_MAX) L.prints.splice(0, L.prints.length - LEDGER_MAX);
     saveL();

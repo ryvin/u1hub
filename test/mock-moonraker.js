@@ -36,7 +36,9 @@ function createMock(profile) {
     metaRequests: [],              // fork (ryvin/u1hub): every metadata GET, { filename, at }
     historyRequests: [],           // fork (ryvin/u1hub): every /server/history/list GET, { limit, start, order, at }
     configfile: null,              // fork (ryvin/u1hub): Klipper configfile.settings the SME reads; null = empty
-    configRequests: []             // fork (ryvin/u1hub): every objects/query that asked for configfile, { at }
+    configRequests: [],            // fork (ryvin/u1hub): every objects/query that asked for configfile, { at }
+    ace: null,                     // fork (ryvin/u1hub): multiACE's `ace` status object (objects/query?ace); null = no multiACE
+    multiace: null                 // fork (ryvin/u1hub): (req, res, url) handler for /multiace/* (test/mock-multiace.js); null = 404
   };
 
   const objectsList = profile === "u1"
@@ -82,8 +84,14 @@ function createMock(profile) {
       // some (state.configfile = { printer: {...}, extruder: {...} }), for the
       // SME's read-only tuning summary. Logged so pacing/caching can be asserted.
       if (want.some(k => k.startsWith("configfile"))) { state.configRequests.push({ at: Date.now() }); status.configfile = { settings: state.configfile || {} }; }
+      if (want.some(k => k === "ace" || k.startsWith("ace=")) && state.ace) status.ace = state.ace;   // fork (ryvin/u1hub): multiACE
       return send(200, { result: { status } });
     }
+
+    // Fork (ryvin/u1hub): the multiACE web backend lives beside Moonraker on
+    // the printer's port 80 under /multiace/; a test that sets state.multiace
+    // (test/mock-multiace.js) gets it here, every other test gets the 404.
+    if (u.pathname.startsWith("/multiace/") && state.multiace) return state.multiace(req, res, u);
 
     // Fork (ryvin/u1hub): the config root (state.configFiles = ["printer.cfg",
     // "extended/klipper/x.cfg", ...]) for the SME's firmware/overlay check,

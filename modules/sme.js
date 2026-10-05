@@ -516,7 +516,23 @@ function register(ctx) {
   function loadoutLines(idx, fleet) {
     const p = printers()[idx]; if (!p) return [];
     const fe = fleet.find(x => x && x.id === idx) || null;
-    return ADV.printerBrief(p, idx, ctx.loadout ? (ctx.loadout(idx) || []) : [], fe, null).filter(l => !/^COLOR MAPPING/.test(l));
+    const lines = ADV.printerBrief(p, idx, ctx.loadout ? (ctx.loadout(idx) || []) : [], fe, null).filter(l => !/^COLOR MAPPING/.test(l));
+    // Fork module multiace: the ACE slots behind the four heads, from the
+    // module's probe cache (no network here). Absent when it is off or the
+    // printer is not multiACE.
+    try {
+      const ml = ctx.use("multiace.loadout"), lo = ml ? ml(idx) : null;
+      if (lo) {
+        lines.push("MULTIACE LOADOUT (web " + (lo.web || "?") + ", engine api_version " + lo.api_version + ", mode " + lo.mode + ", " + lo.device_count + " ACE unit(s); in multi mode slot N feeds head T(N+1), so a colour reaches a head only from that slot number):");
+        if (lo.manual) lines.push("  a head is in manual bypass; multiACE cannot place colours");
+        for (const s of (lo.live_slots || []).slice().sort((a, b) => a.ace - b.ace || a.slot - b.slot)) {
+          const feeds = Object.entries(lo.head_source || {}).find(([, src]) => src && src.ace_index === s.ace && src.slot === s.slot);
+          lines.push("  ACE " + s.ace + " slot " + s.slot + ": " + (s.material || "?") + " " + (s.color || "") + (feeds ? " (feeding T" + (Number(feeds[0]) + 1) + ")" : ""));
+        }
+        lines.push("  Air Print Detection " + (lo.airprint_detection ? "ON (multiACE needs it off)" : "off") + "; prints sent via the Hub's multiACE route carry plan/swaps/purge on their ledger rows (row.multiace)");
+      }
+    } catch {}
+    return lines;
   }
   // Why prints stopped: the upstream Logbook records every firmware pause or
   // error with its message and the file that was printing ("e0_filament
@@ -558,6 +574,9 @@ function register(ctx) {
     }
     for (const [pn, v] of Object.entries(s.printers)) L.push("  on " + pn + " (" + v.type + "): " + v.done + " done, " + v.failed + " failed");
     for (const r of rows.filter(r => r.outcome !== "done").slice(-5)) L.push("  " + r.outcome + " on " + r.printer + " " + new Date(r.at).toISOString().slice(0, 16).replace("T", " ") + (num(r.seconds) > 0 ? " after " + Math.round(r.seconds / 60) + " min" : "") + (r.note ? " - " + str(r.note, 120) : ""));
+    // Fork module multiace: prints that went through the printer's multiACE preflight (row.multiace, written by costing).
+    const ma = rows.filter(r => r.multiace && r.multiace.plan).slice(-5);
+    for (const r of ma) L.push("  via multiACE on " + r.printer + " " + new Date(r.at).toISOString().slice(0, 10) + ": plan " + r.multiace.plan + ", " + r.multiace.swaps + " swaps (~+" + Math.round((r.multiace.est_added_sec || 0) / 60) + " min est.), ~" + r.multiace.purge_g + " g purge top-up est., outcome " + r.outcome);
     return L;
   }
   function klipperLines(name, kl) {

@@ -61,6 +61,7 @@ const MODULE_TABLE = {
   // the headless reviewer (scripts/sme-runner.js). AFTER costing and models:
   // it uses costing.prints and models.open/index/info at call time.
   sme: require("../modules/sme.js"),
+  multiace: require("../modules/multiace.js"),   // fork (ryvin/u1hub): "Print via multiACE" through the printer's own preflight API; provides multiace.jobinfo (costing reads it at call time) and multiace.loadout (sme)
   // Last on purpose: it owns no data anyone else reads, and its only side
   // effect is one outbound HTTPS GET that must never delay a registration
   // above it.
