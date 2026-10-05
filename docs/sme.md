@@ -184,7 +184,7 @@ skips it).
 ## The runner (`scripts/sme-runner.js`)
 
 ```
-node scripts/sme-runner.js                          # the next SME_BATCH (4) targets
+node scripts/sme-runner.js                          # the next SME_BATCH targets (4 by hand; the scheduled task passes SME_BATCH=1 since 2026-10-05: 24/day, to save tokens)
 node scripts/sme-runner.js --dry-run                # build the prompts, call and store nothing
 node scripts/sme-runner.js --kind gcode --key "u1:file.gcode" [--force]
 node scripts/sme-runner.js --refresh-knowledge      # monthly: rewrite knowledge.md with web research

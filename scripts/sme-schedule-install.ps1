@@ -23,7 +23,10 @@ param(
   [string]$RepoLinuxPath = "/mnt/e/Code/u1hub",
   [string]$Distro = "",
   [string]$HourlyName = "U1 Hub SME review",
-  [string]$MonthlyName = "U1 Hub SME knowledge refresh"
+  [string]$MonthlyName = "U1 Hub SME knowledge refresh",
+  # Reviews per hourly run. 1 since 2026-10-05 (the owner cut the SME to 25%
+  # of its 4-per-run pace to save tokens): 24 reviews a day at most.
+  [int]$Batch = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,7 +60,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -Ru
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew -StartWhenAvailable -RunOnlyIfNetworkAvailable
 
 # Hourly review: a daily trigger that repeats every hour, indefinitely.
-$hourlyAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument (Get-WslArgs "node scripts/sme-runner.js")
+$hourlyAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument (Get-WslArgs ("SME_BATCH=" + $Batch + " node scripts/sme-runner.js"))
 $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(50) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)   # [TimeSpan]::MaxValue is rejected: HRESULT 0x80041318, Duration P99999999D... (measured 2026-10-04)
 if (Get-ScheduledTask -TaskName $HourlyName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $HourlyName -Confirm:$false }
 Register-ScheduledTask -TaskName $HourlyName -Action $hourlyAction -Trigger $hourlyTrigger -Principal $principal -Settings $settings -Description "Reviews the next few gcode / 3MF / printer targets with Claude Code on the owner's subscription (scripts/sme-runner.js). Advice only; nothing is applied." | Out-Null
