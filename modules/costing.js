@@ -156,6 +156,20 @@ const HUB_START_SLACK_MS = 5 * 60 * 1000;               // ...or their starts (e
 // Moonraker job status -> ledger outcome. in_progress is skipped (the Hub's
 // own events will write it when it ends); anything unknown is a failed print.
 const STATUS_OUTCOME = Object.freeze({ completed: "done", cancelled: "cancelled", error: "error", klippy_shutdown: "error", klippy_disconnect: "error", interrupted: "error", server_exit: "error" });
+// Rinkhals (the Kobra S1 jailbreak) records finished prints as "cancelled":
+// measured 2026-10-04 on kobrakai, 0 "completed" in 127 jobs, and 37 of its
+// "cancelled" jobs had used 100% of the file's filament at 1.0x the slicer
+// time. A "cancelled" job that consumed at least this share of the file's own
+// filament total finished; the row keeps history_status so the printer's word
+// is still visible.
+const CANCELLED_BUT_DONE_SHARE = 0.99;
+function outcomeOf(status, job) {
+  if (status === "in_progress") return null;
+  const o = STATUS_OUTCOME[status] || "error";
+  if (o !== "cancelled") return o;
+  const tot = Number(((job && job.metadata) || {}).filament_total), used = Number(job && job.filament_used);
+  return (tot > 0 && used / tot >= CANCELLED_BUT_DONE_SHARE) ? "done" : "cancelled";
+}
 const MATCH_MAX_IDS = 10000;
 
 const r2 = v => Math.round(v * 100) / 100;
@@ -826,9 +840,22 @@ function register(ctx) {
               if (!job || job.job_id == null) continue;
               pr.seen++;
               const key = idx + ":" + job.job_id;
-              if (known.has(key)) { pr.known++; continue; }
               const status = String(job.status || "");
-              const outcome = status === "in_progress" ? null : (STATUS_OUTCOME[status] || "error");
+              const outcome = outcomeOf(status, job);
+              if (known.has(key)) {
+                pr.known++;
+                // a row imported before outcomeOf() knew about Rinkhals: fix it in place (a full import revisits every page)
+                if (outcome === "done") {
+                  const row = L.prints.find(r => r.printer_id === idx && String(r.history_job) === String(job.job_id) && r.outcome === "cancelled");
+                  if (row) {
+                    row.outcome = "done"; row.history_status = status;
+                    if (row.material) { row.material.partial = false; row.material.progress = null; if (row.material.grams_source !== "deduction") { row.material.grams = null; row.material.cost = null; } }
+                    applyJob(row, job);   // re-derive grams for a whole print
+                    pr.reclassified = (pr.reclassified || 0) + 1; changed = true;
+                  }
+                }
+                continue;
+              }
               const name = path.basename(String(job.filename || ""));
               const end = jobEndMs(job);
               if (!outcome || !name || end == null || end > settle) { pr.skipped++; continue; }
@@ -1216,4 +1243,4 @@ function register(ctx) {
 
 module.exports = { register, costOf, projectSummary, pricing, grossUp, netOf, projectCsv, quoteHtml, mmToGrams, materialOf, densityOf,
                    report: REPORT.report, reportCsv: REPORT.reportCsv, reportHtml: REPORT.reportHtml, GROUPINGS: REPORT.GROUPINGS, monthKey: REPORT.monthKey,
-                   LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES, STATUS_OUTCOME, DENSITY, FILAMENT_DIAMETER_MM, SUGGESTED, SUGGESTED_NOTES, SUGGESTED_TYPE_NOTES };
+                   LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES, STATUS_OUTCOME, outcomeOf, CANCELLED_BUT_DONE_SHARE, DENSITY, FILAMENT_DIAMETER_MM, SUGGESTED, SUGGESTED_NOTES, SUGGESTED_TYPE_NOTES };

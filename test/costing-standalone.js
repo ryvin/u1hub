@@ -118,6 +118,14 @@ function pureChecks() {
   c = C.costOf({ printer_id: 0, seconds: 3600, energy: { kwh: 0.8, source: "metered" } }, R);
   ok(c.energy.kwh === 0.8 && c.energy.cost === 0.13 && c.energy.source === "metered", "a metered kWh on the row beats the typed watts (the v2 hook)", c.energy);
 
+  console.log("\n== PURE: Moonraker status -> outcome (Rinkhals calls finished prints cancelled) ==");
+  ok(C.outcomeOf("cancelled", { filament_used: 12000, metadata: { filament_total: 12000 } }) === "done" && C.outcomeOf("cancelled", { filament_used: 11900, metadata: { filament_total: 12000 } }) === "done",
+    "a 'cancelled' job that used >= 99% of the file's own filament total finished (kobrakai 2026-10-04: 37 such jobs, 0 'completed' in 127)", null);
+  ok(C.outcomeOf("cancelled", { filament_used: 3000, metadata: { filament_total: 12000 } }) === "cancelled" && C.outcomeOf("cancelled", { filament_used: 500, metadata: {} }) === "cancelled" && C.outcomeOf("cancelled", { filament_used: 500 }) === "cancelled",
+    "a real stop (25%) or a job with no filament total stays cancelled", null);
+  ok(C.outcomeOf("completed", {}) === "done" && C.outcomeOf("klippy_shutdown", { filament_used: 9, metadata: { filament_total: 9 } }) === "error" && C.outcomeOf("in_progress", {}) === null && C.outcomeOf("weird", {}) === "error",
+    "completed -> done, a shutdown stays an error even at 100%, in_progress -> skipped, unknown -> error", null);
+
   console.log("\n== PURE: filament length -> grams (Moonraker filament_used / filament_total are millimetres) ==");
   let gg = C.mmToGrams(40361.57, "PLA;PLA;PLA;PLA");
   ok(gg && gg.grams === 120.38 && gg.density === 1.24 && gg.material === "PLA" && gg.assumed === false, "40361.57 mm of 1.75 mm PLA = 120.38 g, the figure Moonraker itself reports as filament_weight_total for that file", gg);

@@ -139,7 +139,13 @@ The **import** reads that history into the ledger:
   `history_status` = Moonraker's own word. Status → outcome: `completed` →
   done, `cancelled` → cancelled, `error` / `klippy_shutdown` /
   `klippy_disconnect` / `interrupted` / `server_exit` (and anything unknown)
-  → error; `in_progress` is skipped. Imported rows are unassigned; the
+  → error; `in_progress` is skipped. **Exception:** a `cancelled` job that
+  used ≥ 99 % of the file's own `metadata.filament_total` is **done** -
+  Rinkhals (the Kobra S1 jailbreak) records finished prints as cancelled
+  (kobrakai, 2026-10-04: 0 `completed` in 127 jobs; 37 `cancelled` jobs at
+  100 % filament and 1.0x the slicer time). `history_status` keeps the
+  printer's word. Rows imported before this rule are fixed by a full import
+  (`POST /api/costing/import {"full":true}`). Imported rows are unassigned; the
   Prints view assigns them in bulk or by file name.
 - **The cap.** After a merge the ledger is sorted by `at` and cut to
   `LEDGER_MAX` = **10,000** rows, oldest first (`U1HUB_COSTING_LEDGER_MAX`
