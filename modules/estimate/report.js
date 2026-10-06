@@ -17,7 +17,7 @@ function rows(V, internal) {
   const P = V.print || {};
   const R = [["Model", "File", V.name], ["Model", "Size (mm)", ((V.model && V.model.size_mm) || []).join(" x ")], ["Model", "Quantity", V.qty],
              ["Print", "Material", V.material], ["Print", "Estimate source", V.source_label], ["Print", "Grams (each)", P.grams],
-             ["Print", "Print time (each)", hm(P.minutes)], ["Print", "Supports", P.supports_needed], ["Print", "Fits", (V.fits || []).join(", ") || "no printer"]];
+             ["Print", "Print time (each)", hm(P.minutes)], ["Print", "Supports", P.supports_needed], ["Print", "Fits", V.fits == null ? "size not measured" : (V.fits.join(", ") || "no printer")]];
   if (internal) {
     const c = V.cost || {};
     R.push(["Cost", "Material", c.material], ["Cost", "Machine", c.machine], ["Cost", "Electricity", c.energy], ["Cost", "Labour", c.labor && c.labor.cost],

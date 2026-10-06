@@ -25,7 +25,8 @@ async function startHub(dir, extraEnv) {
            U1HUB_COSTING_BACKFILL_BOOT_MS: "0", U1HUB_COSTING_IMPORT_BOOT_MS: "0", U1HUB_COSTING_IMPORT_MS: "0", U1HUB_ESTIMATE_CALIBRATE_BOOT_MS: "0",
            SME_HOME: path.join(dir, "sme-home"), U1HUB_PROFILE: "", ...(extraEnv || {}) } });
   CHILD.stdout.on("data", d => LOG += d); CHILD.stderr.on("data", d => LOG += d);
-  for (let i = 0; i < 100; i++) { try { const r = await fetch(HUB + "/api/config"); if (r.ok) return; } catch {} await sleep(150); }
+  // waits for the Hub to answer (observable state); a cold boot over /mnt/e measured 15 s on 2026-10-06
+  for (let i = 0; i < 400; i++) { try { const r = await fetch(HUB + "/api/config"); if (r.ok) return; } catch {} await sleep(150); }
   throw new Error("hub did not start:\n" + LOG.slice(-2000));
 }
 // ---- fixtures ----
@@ -235,6 +236,8 @@ async function main() {
     r = await up("bad.stl", Buffer.from("solid x\nendsolid x\n"));
     const bj = r.body && r.body.jobId ? await waitJob(r.body.jobId) : { error: "no job" };
     ok(/no triangles/i.test(bj.error || ""), "an empty STL ends its job with the reason", bj);
+    const vb = (await jget("/api/estimate/" + (r.body && r.body.id))).body || {};
+    ok(vb.print && vb.print.grams === null && vb.print.minutes === null && vb.recommended && vb.recommended.price === null && vb.files[0].error, "an estimate with nothing measurable shows blanks, never $0 / 0 g", vb.print && { print: vb.print, rec: vb.recommended });
     console.log("\n-- 3MF with slice info --");
     const tmf = ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from('<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><object id="1" type="model"><mesh><vertices>'
       + [[0,0,0],[20,0,0],[20,20,0],[0,20,0],[0,0,20],[20,0,20],[20,20,20],[0,20,20]].map(p => '<vertex x="' + p[0] + '" y="' + p[1] + '" z="' + p[2] + '"/>').join("")
@@ -262,6 +265,13 @@ async function main() {
     ok(r.status === 413, "over the cap -> 413", r.status);
     ok(fs.readdirSync(path.join(tmp, "estimates")).length === before, "the refused upload left no directory behind");
     ok(((await jget("/api/estimate/" + ID)).body || {}).saved === true, "the saved estimate survives a restart");
+    console.log("\n-- a 3MF too big to measure, with slice info (the live Dragon Dynasty 3MF: 48 MB, meshes past the 160 MB budget) --");
+    await stopHub(); await startHub(tmp, { U1HUB_ESTIMATE_MESH_MAX_MB: "0.0001" });
+    r = await up("box.3mf", tmf);
+    const jb = r.body && r.body.jobId ? await waitJob(r.body.jobId) : { error: "no job" };
+    v = (await jget("/api/estimate/" + (r.body && r.body.id))).body || {};
+    ok(!jb.error && v.files && /estimated from the file.s own slice/.test(v.files[0].warning || "") && !v.files[0].error && v.files[0].sliced.grams === 20, "the mesh is past the budget: a warning, not an error, and the slice info is kept", { jb, f: v.files && v.files[0] });
+    ok(v.source === "sliced" && !v.sources_available.includes("geometry") && v.print.grams === 20 && /file's slice/.test(v.source_label), "with no measurable mesh the estimate uses the file's own slice (20 g), and geometry is not offered", v.print && { src: v.source, avail: v.sources_available });
   } finally { await stopHub(); await moon.close(); }
   console.log("\n" + pass + " passed, " + fail + " failed" + (FALSIFY ? "  (U1HUB_ESTIMATE_FALSIFY=1: a red run is the expected result)" : ""));
   process.exit(fail ? 1 : 0);

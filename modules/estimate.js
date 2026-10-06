@@ -36,6 +36,10 @@ const PRUNE_MS = 30 * 24 * 3600 * 1000, PRUNE_EVERY_MS = 6 * 3600 * 1000, JOB_TT
 const CAL_BOOT_MS = process.env.U1HUB_ESTIMATE_CALIBRATE_BOOT_MS != null ? Number(process.env.U1HUB_ESTIMATE_CALIBRATE_BOOT_MS) : 60000;
 const CAL_EVERY_MS = 24 * 3600 * 1000, CAL_MAX_3MF = 60;
 const HEAD_BYTES = 8192, TAIL_BYTES = 524288;
+// mesh3mf's own budget (160 MB of mesh XML) unless overridden; past it a 3MF
+// with slice info is still estimated from that slice (the live Dragon Dynasty
+// 3MF is 48 MB zipped and past the budget unzipped).
+const MESH_MAX_BYTES = Number(process.env.U1HUB_ESTIMATE_MESH_MAX_MB) > 0 ? Number(process.env.U1HUB_ESTIMATE_MESH_MAX_MB) * 1048576 : undefined;
 // Build volumes (mm) by printer type, from the makers' spec pages (checked 2026-10-06):
 // https://www.snapmaker.com/en-US/snapmaker-u1 (270 x 270 x 270),
 // https://store.anycubic.com/products/kobra-s1 (250 x 250 x 250).
@@ -114,8 +118,12 @@ function register(ctx) {
       if (f.kind === "stl") f.facts = await STL.factsStl(await fsp.readFile(fp), f.name);
       else {
         const z = await zipOpen(fp);
-        try { f.facts = await facts3mf(z); f.sliced = await SL.slicedFrom(z); } finally { await z.close().catch(() => {}); }
-        if (!f.facts || f.facts.ok === false) throw new Error((f.facts && f.facts.reason) || "no printable mesh in the 3MF");
+        try { f.facts = await facts3mf(z, MESH_MAX_BYTES ? { maxBytes: MESH_MAX_BYTES } : undefined); f.sliced = await SL.slicedFrom(z); } finally { await z.close().catch(() => {}); }
+        if (!f.facts || f.facts.ok === false) {
+          const why = (f.facts && f.facts.reason) || "no printable mesh in the 3MF";
+          if (!f.sliced) throw new Error(why);
+          f.warning = why + " - estimated from the file's own slice";
+        }
       }
       job.phase = "match";
       const names = [f.name];
@@ -127,7 +135,8 @@ function register(ctx) {
           names.push(...await MATCH.sameFileNames(size, hash, items, it => sha1File(path.join(idx.folder, it.rel))));
         }
       } catch {}
-      const height = f.facts.tallest ? f.facts.tallest.height_mm : f.facts.height_mm;
+      const measured = f.facts && f.facts.ok !== false;
+      const height = !measured ? null : (f.facts.tallest ? f.facts.tallest.height_mm : f.facts.height_mm);
       const ledger = use("costing.prints", () => [])() || [];
       const library = await libraryList();
       const seen = new Set((est.candidates || []).map(c => c.key));
@@ -147,17 +156,17 @@ function register(ctx) {
   // ---- the numbers ----
   async function compute(est) {
     const I = { ...DEFAULT_INPUTS, ...(est.inputs || {}) };
-    const files = (est.files || []).filter(f => f.facts && f.facts.ok !== false && !f.error);
+    const usable = (est.files || []).filter(f => !f.error && ((f.facts && f.facts.ok !== false) || f.sliced));
+    const files = usable.filter(f => f.facts && f.facts.ok !== false);   // measured meshes
     const size = [0, 0, 0];
     let volume = 0, painted = 0, filaments = 0, tallest = null, plates = 0;
     for (const f of files) {
       (f.facts.size_mm || []).forEach((v, i) => { size[i] = Math.max(size[i], v); });
       volume += f.facts.volume_cm3 || 0;
       painted = Math.max(painted, (f.facts.paint && f.facts.paint.colors) || 0);
-      filaments = Math.max(filaments, f.sliced ? f.sliced.filaments.length : 0);
-      plates += f.sliced ? f.sliced.plates : 1;
       if (f.facts.tallest && (!tallest || f.facts.tallest.height_mm > tallest.height_mm)) tallest = f.facts.tallest;
     }
+    for (const f of usable) { filaments = Math.max(filaments, f.sliced ? f.sliced.filaments.length : 0); plates += f.sliced ? f.sliced.plates : 1; }
     const colours = num(I.colours) || Math.max(painted, filaments, 1);
     const mode = colours > 1 ? "multi" : "single";
     const k = CALS.k && CALS.k[mode] && CALS.k[mode].k ? CALS.k[mode].k : 1;
@@ -167,22 +176,24 @@ function register(ctx) {
     const geoGrams = r2(geo.reduce((a, g) => a + g.grams, 0));
     const fit = CAL.fitFor(CALS.fits, (GEO.PRESETS[I.preset] || GEO.PRESETS.standard).family, mode);
     const band = Math.round((fit.err || 0) * 100);
-    const sources = ["geometry"];
-    const allSliced = files.length > 0 && files.every(f => f.sliced);
-    if (allSliced) sources.push("sliced");
+    const sources = [];
+    if (usable.length && files.length === usable.length) sources.push("geometry");
+    if (usable.length && usable.every(f => f.sliced)) sources.push("sliced");
     const cands = est.candidates || [];
     if (cands.length) sources.push("printed");
-    let source = sources.includes(est.source) ? est.source : "geometry";
-    let grams = geoGrams, minutes = CAL.minutesFrom(geoGrams, fit), band_pct = band, failure_rate = null, label = "geometry ±" + band + " %" + (fit.source === "fallback" ? " (time: fallback fit)" : "");
+    // The chosen source when it is still available, else the first measurable one.
+    let source = sources.includes(est.source) ? est.source : (sources.find(x => x !== "printed") || "none");
+    let grams = null, minutes = null, band_pct = null, failure_rate = null, label = "nothing measurable";
+    if (source === "geometry") { grams = geoGrams; minutes = CAL.minutesFrom(geoGrams, fit); band_pct = band; label = "geometry ±" + band + " %" + (fit.source === "fallback" ? " (time: fallback fit)" : ""); }
     let designer_minutes = null;
     if (source === "sliced") {
-      grams = r2(files.reduce((a, f) => a + f.sliced.grams, 0));
-      designer_minutes = files.reduce((a, f) => a + (f.sliced.designer_minutes || 0), 0) || null;
-      if (files.every(f => f.sliced.source === "plate-gcode")) { minutes = files.reduce((a, f) => a + (f.sliced.minutes || 0), 0); band_pct = 0; label = "exact (sliced 3MF)"; }
-      else { minutes = CAL.minutesFrom(grams, fit); label = "grams from the file's slice, time estimated ±" + band + " %"; }
+      grams = r2(usable.reduce((a, f) => a + f.sliced.grams, 0));
+      designer_minutes = usable.reduce((a, f) => a + (f.sliced.designer_minutes || 0), 0) || null;
+      if (usable.every(f => f.sliced.source === "plate-gcode")) { minutes = usable.reduce((a, f) => a + (f.sliced.minutes || 0), 0); band_pct = 0; label = "exact (sliced 3MF)"; }
+      else { minutes = CAL.minutesFrom(grams, fit); band_pct = band; label = "grams from the file's slice, time estimated ±" + band + " %"; }
     } else if (source === "printed") {
       const c = cands.find(x => x.key === est.candidate_key) || cands[0];
-      grams = c.grams != null ? c.grams : geoGrams;
+      grams = c.grams != null ? c.grams : (files.length ? geoGrams : null);
       minutes = c.actual_minutes != null ? c.actual_minutes : (c.slicer_minutes != null ? c.slicer_minutes : CAL.minutesFrom(grams, fit));
       band_pct = c.actual_minutes != null ? 0 : band;
       failure_rate = c.success_rate;
@@ -201,7 +212,7 @@ function register(ctx) {
       inputs: I, source, sources_available: sources, source_label: label,
       print: { grams, minutes, plates: plates || files.length, supports_needed, supports_g: r2(geo.reduce((a, g) => a + g.supports_g, 0)), colours, band_pct, designer_minutes,
                brim: !!(tallest && tallest.aspect > 3), multiace: colours > 4 },
-      model: { size_mm: size, volume_cm3: r2(volume) }, fits: fits.map(f => f.name), fits_unchecked, schedule, printer_id: pid,
+      model: { size_mm: files.length ? size : null, volume_cm3: files.length ? r2(volume) : null, measured: files.length === usable.length && usable.length > 0 }, fits: files.length ? fits.map(f => f.name) : null, fits_unchecked, schedule, printer_id: pid,
       cost: price.cost, pricing: price.pricing, recommended: price.recommended, blanks: price.blanks,
       fit: { key: fit.key, source: fit.source, n: fit.n }, calibration_k: k
     };
