@@ -28,10 +28,39 @@ async function startHub(dir, extraEnv) {
   for (let i = 0; i < 100; i++) { try { const r = await fetch(HUB + "/api/config"); if (r.ok) return; } catch {} await sleep(150); }
   throw new Error("hub did not start:\n" + LOG.slice(-2000));
 }
+// ---- fixtures ----
+// 12 triangles of an axis-aligned cube [0,s]^3, wound outward (inward when flip)
+function cubeTris(s, flip) {
+  const v = [[0,0,0],[s,0,0],[s,s,0],[0,s,0],[0,0,s],[s,0,s],[s,s,s],[0,s,s]];
+  const f = [[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]];
+  return f.map(t => (flip ? [t[0], t[2], t[1]] : t).map(i => v[i]));
+}
+function binStl(tris) { const b = Buffer.alloc(84 + tris.length * 50); b.writeUInt32LE(tris.length, 80); tris.forEach((t, i) => { let o = 84 + i * 50 + 12; for (const p of t) for (const c of p) { b.writeFloatLE(c, o); o += 4; } }); return b; }
+function asciiStl(tris) { return Buffer.from("solid t\n" + tris.map(t => " facet normal 0 0 0\n  outer loop\n" + t.map(p => "   vertex " + p.join(" ") + "\n").join("") + "  endloop\n endfacet\n").join("") + "endsolid t\n"); }
+
 async function stopHub() { if (CHILD) { const c = CHILD; CHILD = null; await new Promise(r => { c.once("exit", r); c.kill(); }); } }
 
 async function main() {
   // ---- pure units ----
+  const STL = require("../modules/estimate/stl.js");
+  {
+    console.log("\n-- STL --");
+    const fb = await STL.factsStl(binStl(cubeTris(20)));
+    const want = FALSIFY ? 8.001 : 8;
+    ok(fb.ok && fb.volume_cm3 === want && fb.area_cm2 === 24 && fb.size_mm.join() === "20,20,20" && fb.triangles === 12, "binary 20 mm cube: 8.000 cm3, 24.0 cm2, 20x20x20, 12 triangles" + (FALSIFY ? " [FALSIFIED]" : ""), fb);
+    const fa = await STL.factsStl(asciiStl(cubeTris(20)));
+    ok(fa.volume_cm3 === 8 && fa.area_cm2 === 24, "ASCII cube measures the same", fa);
+    const fi = await STL.factsStl(binStl(cubeTris(20, true)));
+    ok(fi.volume_cm3 === 8, "an inward-wound cube still reports +8 cm3 (abs)", fi.volume_cm3);
+    ok(fb.overhang.steep_pct === 0 && fb.overhang.flat_unsupported_pct === 0 && fb.overhang.bed_contact_cm2 === 4, "the cube's bottom is bed contact (4 cm2), nothing overhangs", fb.overhang);
+    const lifted = cubeTris(20).map(t => t.map(p => [p[0], p[1], p[2] + 10]));
+    const fl = await STL.factsStl(binStl(lifted.concat(cubeTris(5))));
+    ok(fl.overhang.flat_unsupported_pct > 0, "a part floating above the bed shows an unsupported underside", fl.overhang);
+    let e = null; try { STL.parseStl(binStl(cubeTris(20)).subarray(0, 300)); } catch (x) { e = x; }
+    ok(e && /truncated/i.test(e.message), "a truncated binary STL is refused with a reason", e && e.message);
+    e = null; try { STL.parseStl(Buffer.from("solid empty\nendsolid empty\n")); } catch (x) { e = x; }
+    ok(e && /no triangles/i.test(e.message), "an STL with no triangles is refused", e && e.message);
+  }
 
   // ---- the booted Hub ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-"));
