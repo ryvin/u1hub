@@ -143,6 +143,30 @@ async function main() {
     const same = await MATCH.sameFileNames(100, "h1", items, async it => hashes[it.rel]);
     ok(JSON.stringify(same) === JSON.stringify(["Same"]), "same file: only the equal-size item with the same hash (a different hash or a different size is not)", same);
   }
+  const PRICE = require("../modules/estimate/price.js");
+  const COST = require("../modules/costing.js");
+  {
+    console.log("\n-- pricing --");
+    const R = { kwh_rate: 0.16, cost_per_g: 0.02, markup_pct: 100, overhead_pct: 10, labor_rate: 30, failure_pct: 5,
+                printers: { "0": { purchase: 1099, life_hours: 5000, maint_per_hour: 0.10, avg_watts: 250 } } };
+    const base = { grams: 100, minutes: 120, qty: 1, printer_id: 0, type: "u1", material: "PLA", labor_minutes: 10, rush: 1, name: "x.stl" };
+    const est = PRICE.priceEstimate(base, R, { sell_per_g: 0.12, cost_per_g: 0.02 });
+    const row = { id: "est", printer_id: 0, type: "u1", outcome: "done", est_minutes: 120, est_source: "estimate", pieces: 1, counted: true, material: { grams: 100, source: "slicer", grams_source: "estimate", material: "PLA" } };
+    const direct = COST.projectSummary({ items: [{ kind: "labor", minutes: 10 }] }, [row], R);
+    ok(est.cost.cost === direct.cost && est.cost.cost != null, "the estimate's cost IS costing's projectSummary for the same row", { est: est.cost.cost, direct: direct.cost });
+    const mk = est.pricing.methods.find(m => m.key === "markup");
+    ok(mk.price === Math.round(direct.cost * 2 * 100) / 100, "markup 100 % doubles the cost", mk);
+    ok(est.recommended.price === Math.max(mk.price, 12), "recommended = max(per-gram floor 100 g x $0.12 = 12.00, markup)", est.recommended);
+    const rush = PRICE.priceEstimate({ ...base, rush: 1.5 }, R, { sell_per_g: 0.12, cost_per_g: 0.02 });
+    ok(rush.recommended.price === Math.round(est.recommended.price * 1.5 * 100) / 100, "rush 1.5x multiplies the recommended price", rush.recommended);
+    const q = PRICE.priceEstimate({ ...base, qty: 10, labor_minutes: 0 }, R, { sell_per_g: 0.12 });
+    ok(q.cost.pieces === 10 && q.cost.grams === 1000, "quantity 10 = ten pieces, 1000 g", { pieces: q.cost.pieces, grams: q.cost.grams });
+    const fr = PRICE.priceEstimate({ ...base, labor_minutes: 0, failure_rate: 0.5 }, R, {});
+    ok(fr.cost.failure === Math.round(fr.cost.direct * 0.5 * 100) / 100, "a candidate's 50 % success rate becomes a 50 % failure allowance", fr.cost);
+    const bare = PRICE.priceEstimate({ ...base, labor_minutes: 0 }, {}, {});
+    const bm = bare.pricing ? bare.pricing.methods.find(m => m.key === "markup") : null;
+    ok(bare.blanks.length > 0 && (!bm || (bm.price === null && /Settings/.test(bm.note))), "no rates: blanks named, markup says 'set a markup % in Settings'", bare);
+  }
 
   // ---- the booted Hub ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-"));
