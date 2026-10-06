@@ -122,6 +122,31 @@ data → defaults + wide band, said on the page.
 Plus the full harness, a Playwright pass over the real tab, and a live check: upload the Dragon Dynasty model
 and confirm it finds the 2026-10-05 print.
 
+## 7a. Plan-time findings (measured 2026-10-06; these override §4 where they differ)
+
+- **Time model.** A linear grams→minutes fit is useless on this library (single-colour median error 43 %,
+  multi-colour wrecked by one outlier). A trimmed log-log fit `minutes = a · grams^b` per **profile family**
+  (from `; print_settings_id`: hueforge / flexi / display / standard) × colour mode does well where the
+  profile is known: flexi-multi n 10, 6 %; hueforge-multi n 45, 24 %; standard-multi n 231, 29 %;
+  standard-single n 110, 33 % (median abs error; scratchpad `fit3.js` over 400 library gcodes). Height
+  adds nothing (34 % / 30 %). The preset picked on the page selects the family. These fits are the
+  built-in defaults; calibration refits from the live library.
+- **Slice info in project 3MFs is common** (MakerWorld / bl2u1 output: `Metadata/slice_info.config`
+  `<plate>` with `prediction` s, `weight` g, per-`<filament>` `used_g`, `color`, `type`,
+  `support_used`, `printer_model_id`). Its time is the designer's slicer on THEIR printer (bl2u1 rewrites
+  `printer_model_id` but not `prediction`), so: **grams from slice info (per filament), time from our fit
+  on those grams**, labelled "grams from the file's slice". Embedded `Metadata/plate_N.gcode` (a real
+  sliced 3MF) is rare in this library (none in the first 600 files) but still read when present (exact).
+- **Geometry grams calibration** uses 3MFs that carry slice-info `weight`: mesh facts → predicted grams vs
+  `weight` → one scalar `k` per colour mode (median ratio) and its error band.
+- **multiACE swap time** is not added to a geometry or slice-info estimate (the swap count depends on the
+  engine's plan); the page says "more than 4 colours: multiACE, check the swap count on the printer card".
+- **Quantity breaks** are costing's own (`BREAKS` = 1 / 10 / 50), not 1/5/10/25.
+- **Quote vs actual** is shown in the saved-estimates list (quoted vs the linked project's costing total),
+  not added to the Projects tab.
+- **Upload transport**: one raw-body POST per file (`Content-Type: application/octet-stream`,
+  `X-File-Name`), streamed to disk with a byte cap. The Hub has no multipart parser and gains no dependency.
+
 ## 8. Out of scope (Phase 1)
 Real slicing (Phase 2); customer-facing public link / emailing; per-object part splitting beyond what the
 3MF already defines; automatic plate arrangement for quantity (quantity scales numbers; copies-per-plate is an
