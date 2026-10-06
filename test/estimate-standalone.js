@@ -38,6 +38,14 @@ function cubeTris(s, flip) {
 function binStl(tris) { const b = Buffer.alloc(84 + tris.length * 50); b.writeUInt32LE(tris.length, 80); tris.forEach((t, i) => { let o = 84 + i * 50 + 12; for (const p of t) for (const c of p) { b.writeFloatLE(c, o); o += 4; } }); return b; }
 function asciiStl(tris) { return Buffer.from("solid t\n" + tris.map(t => " facet normal 0 0 0\n  outer loop\n" + t.map(p => "   vertex " + p.join(" ") + "\n").join("") + "  endloop\n endfacet\n").join("") + "endsolid t\n"); }
 
+const ZIP = require("../modules/slicing.js");
+// zIndex: the { entries, content(e) } shape models.js zipOpen returns, from an in-memory zip.
+const zIndex = buf => { const z = ZIP.zipRead(buf); const entries = Array.isArray(z) ? z : z.entries; return { entries, content: async e => ZIP.zipEntryContent(e) }; };
+const SI2 = '<?xml version="1.0"?><config><plate><metadata key="index" value="1"/><metadata key="printer_model_id" value="Snapmaker U1"/><metadata key="prediction" value="10557"/><metadata key="weight" value="17.17"/><metadata key="support_used" value="false"/>'
+  + '<filament id="1" type="PLA" color="#000000" used_m="3.68" used_g="10.98"/><filament id="2" type="PLA" color="#494949" used_m="1.16" used_g="3.47"/></plate>'
+  + '<plate><metadata key="index" value="2"/><metadata key="prediction" value="600"/><metadata key="weight" value="2.83"/><metadata key="support_used" value="true"/><filament id="1" type="PLA" color="#000000" used_m="0.9" used_g="2.83"/></plate></config>';
+const GC = "; HEADER_BLOCK_START\n; max_z_height: 12.00\n; HEADER_BLOCK_END\nG1 X1\n; filament used [g] = 4.50\n; total filament used [g] = 4.50\n; estimated printing time (normal mode) = 1h 2m 3s\n; CONFIG_BLOCK_START\n; filament_type = PLA\n; filament_colour = #FF0000\n; CONFIG_BLOCK_END\n";
+
 async function stopHub() { if (CHILD) { const c = CHILD; CHILD = null; await new Promise(r => { c.once("exit", r); c.kill(); }); } }
 
 async function main() {
@@ -79,6 +87,19 @@ async function main() {
     ok(sup.supports_needed === "yes" && sup.supports_g === 0.45 && sup.supports_included === true && sup.grams === 4.06, "10 % overhang -> supports 'yes', +0.45 g (hand), included in auto", sup);
     ok(GEO.gramsFrom(over, { preset: "standard", material: "PLA", supports: "off" }).grams === 3.61, "supports off -> model grams only");
     ok(Object.keys(GEO.PRESETS).join() === "standard,strong,hueforge,flexi", "four presets", Object.keys(GEO.PRESETS));
+  }
+  const SL = require("../modules/estimate/sliced.js");
+  {
+    console.log("\n-- slice info --");
+    const z = zIndex(ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from("<model/>")), ZIP.makeEntry("Metadata/slice_info.config", Buffer.from(SI2))]));
+    const s = await SL.slicedFrom(z);
+    ok(s && s.source === "slice-info" && s.plates === 2 && s.grams === 20 && s.designer_minutes === 186 && s.minutes === null, "two plates summed: 17.17 + 2.83 = 20.00 g, designer time (10557 + 600) s = 186 min, no exact time", s);
+    ok(s && s.filaments.length === 2 && s.filaments[0].grams === 13.81 && s.filaments[0].color === "#000000" && s.support_used === true, "filament 1 summed across plates (10.98 + 2.83), supports used on a plate", s && s.filaments);
+    ok(await SL.slicedFrom(zIndex(ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from("<model/>"))]))) === null, "no slice info -> null");
+    const zp = zIndex(ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from("<model/>")), ZIP.makeEntry("Metadata/plate_1.gcode", Buffer.from(GC)), ZIP.makeEntry("Metadata/slice_info.config", Buffer.from(SI2))]));
+    const sp = await SL.slicedFrom(zp);
+    // parser.estMinutes("1h 2m 3s") = 63 (it rounds the seconds up; measured 2026-10-06)
+    ok(sp && sp.source === "plate-gcode" && sp.grams === 4.5 && sp.minutes === 63 && sp.plates === 1, "embedded plate gcode wins: exact 4.50 g, 63 min (parser rounds 1h 2m 3s up)", sp);
   }
 
   // ---- the booted Hub ----
