@@ -269,7 +269,8 @@ function costOf(print, rates) {
     energy = { kwh: r3(kwh), cost: rateCost(kwh), source: sug ? "suggested" : "watts", watts: watts.v, watts_source: watts.src, rate_source: rate.src };
   }
   const blanks = [];
-  if (emptyDeduction) material.deduction_empty = true;
+  // its "partial" came from the head misses, which no longer describe the price
+  if (emptyDeduction) { material.deduction_empty = true; material.partial = p.outcome != null ? p.outcome !== "done" : material.partial; }
   if (material.cost == null) blanks.push(material.source === "deduction" || material.source === "rolls" ? "material (a loaded roll has no price)" : (grams == null ? "material (no grams)" : "material (no rate)"));
   if (!machine) blanks.push(hours == null ? "machine (no time)" : "machine (no printer rates)");
   if (!energy) blanks.push(hours == null ? "energy (no time)" : "energy (no watts)");

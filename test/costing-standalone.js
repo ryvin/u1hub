@@ -112,7 +112,7 @@ function pureChecks() {
   // nothing priced - showed a blank material cost although the flat rate / slicer cost was there.
   const Empty = { id: "E", printer_id: 0, outcome: "done", seconds: 1800, material: { grams: 15.86, cost: null, source: "deduction", deducted_g: 0, partial: true, slicer_cost: 0.5, misses: ["T1: no spool recorded in that head"] } };
   c = C.costOf(Empty, R);
-  ok(c.material.cost === 0.32 && c.material.source === "flat" && c.material.deduction_empty === true, "a deduction that took 0 g and priced nothing falls back to the flat $/g (15.86 g x $0.02 = 0.32), flagged deduction_empty", c.material);
+  ok(c.material.cost === 0.32 && c.material.source === "flat" && c.material.deduction_empty === true && c.material.partial === false, "a deduction that took 0 g and priced nothing falls back to the flat $/g (15.86 g x $0.02 = 0.32), flagged deduction_empty, and a finished print is not partial for it", c.material);
   c = C.costOf(Empty, {});
   ok(c.material.cost === 0.5 && c.material.source === "slicer", "...and to the slicer's cost when no flat rate is set", c.material);
   c = C.costOf({ ...Empty, material: { ...Empty.material, deducted_g: 12 } }, R);
