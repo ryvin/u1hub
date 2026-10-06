@@ -61,6 +61,25 @@ async function main() {
     e = null; try { STL.parseStl(Buffer.from("solid empty\nendsolid empty\n")); } catch (x) { e = x; }
     ok(e && /no triangles/i.test(e.message), "an STL with no triangles is refused", e && e.message);
   }
+  const GEO = require("../modules/estimate/geometry.js");
+  {
+    console.log("\n-- geometry grams --");
+    const cube = await STL.factsStl(binStl(cubeTris(20)));
+    // By hand: shell = 24.0 cm2 x (2 x 0.42 mm = 0.084 cm) = 2.016 cm3; interior 8 - 2.016 = 5.984 x 15 % = 0.8976;
+    // 2.9136 cm3 x 1.24 g/cm3 = 3.6129 -> 3.61 g. No overhang -> supports "no", 0 g.
+    const g = GEO.gramsFrom(cube, { preset: "standard", material: "PLA" });
+    ok(g.grams === 3.61 && g.supports_needed === "no" && g.supports_g === 0 && g.density === 1.24, "20 mm cube, Standard, PLA: 3.61 g (hand), no supports", g);
+    ok(GEO.gramsFrom(cube, { preset: "standard", infill: 1, material: "PLA" }).grams === 9.92, "100 % infill = the solid: 8 cm3 x 1.24 = 9.92 g");
+    const petg = GEO.gramsFrom(cube, { preset: "standard", material: "PETG" });
+    ok(petg.density !== 1.24 && petg.grams > g.grams, "PETG uses its own density", petg);
+    ok(GEO.gramsFrom(cube, { preset: "standard", material: "PLA", k: 1.5 }).grams === 5.42, "calibration k scales the model grams: 2.9136 x 1.5 x 1.24 = 5.42");
+    const over = { ...cube, overhang: { ...cube.overhang, steep_pct: 8, flat_unsupported_pct: 2 } };
+    const sup = GEO.gramsFrom(over, { preset: "standard", material: "PLA" });
+    // supports: 10 % of 24.0 cm2 = 2.4 cm2 x (20 mm / 2 = 1.0 cm) x 0.15 = 0.36 cm3 x 1.24 = 0.4464 -> 0.45 g; 3.61 + 0.45 = 4.06
+    ok(sup.supports_needed === "yes" && sup.supports_g === 0.45 && sup.supports_included === true && sup.grams === 4.06, "10 % overhang -> supports 'yes', +0.45 g (hand), included in auto", sup);
+    ok(GEO.gramsFrom(over, { preset: "standard", material: "PLA", supports: "off" }).grams === 3.61, "supports off -> model grams only");
+    ok(Object.keys(GEO.PRESETS).join() === "standard,strong,hueforge,flexi", "four presets", Object.keys(GEO.PRESETS));
+  }
 
   // ---- the booted Hub ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-"));
