@@ -115,3 +115,9 @@ sme/knowledge.md.bak
 # Fork (ryvin/u1hub) multiace module state: what was sent through the
 # printer's multiACE preflight (plan, swaps, purge estimate). Never commit.
 multiace.json
+
+# Fork (ryvin/u1hub) estimate module state: saved estimates, the calibration
+# fits and the uploaded models. Never commit.
+estimates.json
+estimate-calibration.json
+estimates/

@@ -90,7 +90,8 @@ const CLIENT_TABLE = {
   costing: "/modules/costing-ui.js",     // fork (ryvin/u1hub): Projects tab, job-card project dropdown, Settings rates
   "library-colors": "/modules/library-colors-ui.js",  // fork (ryvin/u1hub): palette dots + "printable on" filter on the library list
   sme: "/modules/sme-ui.js",             // fork (ryvin/u1hub): SME tab, ✦ SME badges on 3MF cards / print rows / the job card, Settings block (after models + costing: it decorates their DOM)
-  multiace: "/modules/multiace-ui.js"    // fork (ryvin/u1hub): ACE loadout strip + "Print via multiACE" block on multiACE printer cards, Settings block (no tab)
+  multiace: "/modules/multiace-ui.js",   // fork (ryvin/u1hub): ACE loadout strip + "Print via multiACE" block on multiACE printer cards, Settings block (no tab)
+  estimate: "/modules/estimate-ui.js"    // fork (ryvin/u1hub): Estimate tab (upload STL/3MF -> estimate, price, reports)
   // (named -ui deliberately: the server module is modules/dispatch.js, and two
   //  same-named files in different folders is a foot-gun during deploys)
 };

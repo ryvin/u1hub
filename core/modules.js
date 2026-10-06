@@ -66,6 +66,7 @@ const MODULE_TABLE = {
   // it uses costing.prints and models.open/index/info at call time.
   sme: require("../modules/sme.js"),
   multiace: require("../modules/multiace.js"),   // fork (ryvin/u1hub): "Print via multiACE" through the printer's own preflight API; provides multiace.jobinfo (costing reads it at call time) and multiace.loadout (sme)
+  estimate: require("../modules/estimate.js"),   // fork (ryvin/u1hub): Estimate tab (upload STL/3MF -> grams, time, cost, price, printed-before, reports); AFTER costing, models and multiace (uses their exports / provides at call time)
   // Last on purpose: it owns no data anyone else reads, and its only side
   // effect is one outbound HTTPS GET that must never delay a registration
   // above it.
