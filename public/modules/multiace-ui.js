@@ -44,7 +44,7 @@
     return Math.sqrt((2 + rm / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rm) / 256) * db * db);
   }
   const mins = s => { const m = Math.round((s || 0) / 60); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + String(m % 60).padStart(2, "0") + " min"; };
-  const TIER = { exact_hex: "exact", name_exact: "by name", name_base: "by name", name_canon: "by name", fuzzy: "close", fallback: "fallback", duplicate: "shares a slot", no_slot: "no slot", planned: "proposed", copy: "copy" };
+  const TIER = { exact_hex: "exact", name_exact: "by name", name_base: "by name", name_canon: "by name", fuzzy: "close", fallback: "fallback", duplicate: "shares a slot", no_slot: "no slot", planned: "proposed", copy: "copy", manual: "picked" };
   const PLAN = { slicer: "As sliced", optimize: "Optimize", layer: "Layer" };
   const PLAN_HINT = { slicer: "prints with the spools exactly where they are", optimize: "fewest swaps, mid-layer swaps allowed; a proposed loadout", layer: "swaps only at layer changes; a proposed loadout" };
 
@@ -90,6 +90,7 @@
       ".macetier.warn{color:var(--busy,#f0c33c); border-color:color-mix(in srgb, var(--busy,#f0c33c) 40%, var(--line));}",
       ".macetier.bad{color:var(--bad); border-color:color-mix(in srgb, var(--bad) 40%, var(--line));}",
       ".macede{color:var(--ink-faint);}",
+      ".macepick{font:inherit; font-size:11px; padding:2px 4px; border-radius:5px; border:1px solid var(--line); background:var(--panel-2); color:var(--ink); max-width:190px;}",
       ".macemoves{font-size:12px; color:var(--ink-dim); line-height:1.55; padding:8px 10px; border:1px dashed color-mix(in srgb, var(--busy,#f0c33c) 50%, var(--line)); border-radius:var(--r-sm,6px);}",
       ".macemoves b{color:var(--ink);}",
       ".macemoves .msw{display:inline-block; width:11px; height:11px; border-radius:3px; border:1px solid rgba(255,255,255,.25); vertical-align:-1px; margin-right:3px;}",
@@ -163,15 +164,28 @@
     const mats = [...new Set((lo.live_slots || []).map(s => s.material).filter(Boolean))];
     return '<div class="macegrid">' + rows + '</div><div class="macecap">' + (lo.live_slots || []).length + ' slots across ' + n + ' ACE' + (n === 1 ? "" : "s") + (mats.length ? ' · ' + esc(mats.join(", ")) : "") + (lo.airprint_detection ? ' · <span style="color:var(--bad)">Air Print Detection ON</span>' : "") + '</div>';
   }
-  function rowsHtml(st, mode) {
-    const rows = (st.report.rows || {})[mode] || [];
+  // The rows a plan prints with: the picked ones for "as sliced" once the
+  // person has chosen a slot for any colour, else the engine's.
+  const rowsOf = (st, mode) => (mode === "slicer" && st.pickRows) ? st.pickRows : ((st.report.rows || {})[mode] || []);
+  const hasPicks = st => !!(st.picks && Object.keys(st.picks).length);
+  // As sliced only: a slot picker per colour, listing the loaded slots of the
+  // same material. A pick is sent to the engine as part of the full remap.
+  function slotPicker(pid, st, r) {
+    const live = (st.report.live_slots || []).filter(s => !r.material || !s.material || String(s.material).toLowerCase() === String(r.material).toLowerCase());
+    const cur = r.ace != null ? r.ace * 4 + r.slot : -1;
+    return '<select class="macepick" data-mace-pick="' + r.t + '" data-pid="' + pid + '" title="Print P' + (r.t + 1) + ' from another loaded slot (same material only). Moves nothing: the engine feeds that slot instead.">' +
+      live.map(s => { const v = s.ace * 4 + s.slot; return '<option value="' + v + '"' + (v === cur ? " selected" : "") + '>ACE ' + s.ace + ' · slot ' + s.slot + ' · ' + esc(s.color) + '</option>'; }).join("") + '</select>';
+  }
+  function rowsHtml(pid, st, mode) {
+    const rows = rowsOf(st, mode);
     if (!rows.length) return "";
+    const pick = mode === "slicer" && st.phase === "report";
     return '<div class="macetbl">' + rows.map(r => {
-      const cls = r.tier === "exact_hex" ? "good" : (/^name_|fuzzy|planned/.test(r.tier) ? "" : (r.tier === "fallback" || r.tier === "duplicate" ? "warn" : "bad"));
+      const cls = r.tier === "exact_hex" ? "good" : (/^name_|fuzzy|planned|manual/.test(r.tier) ? "" : (r.tier === "fallback" || r.tier === "duplicate" ? "warn" : "bad"));
       return '<div class="macetr"><span class="fsw" style="background:' + esc(r.hex || "#3a3f49") + '"></span><span class="macet" title="P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '">P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '</span><span class="macearrow">→</span>' +
-        (r.slot_hex ? '<span class="fsw" style="background:' + esc(r.slot_hex) + '"></span><span>ACE ' + r.ace + ' · slot ' + r.slot + '</span>' : '<span class="fsw none"></span><span>no slot</span>') +
+        (r.slot_hex ? '<span class="fsw" style="background:' + esc(r.slot_hex) + '"></span>' + (pick ? slotPicker(pid, st, r) : '<span>ACE ' + r.ace + ' · slot ' + r.slot + '</span>') : '<span class="fsw none"></span><span>no slot</span>') +
         '<span class="macetier ' + cls + '">' + esc(TIER[r.tier] || r.tier) + '</span>' + (r.dE != null ? '<span class="macede" title="CIEDE2000 between the file colour and the slot colour (advisory; the tier is the engine\'s verdict)">ΔE ' + r.dE.toFixed(1) + '</span>' : "") + '</div>';
-    }).join("") + "</div>";
+    }).join("") + (pick && hasPicks(st) ? '<div class="macecap">slots picked by hand · <a href="#" data-mace="unpick" data-pid="' + pid + '" style="color:inherit">use the engine\'s match</a></div>' : "") + "</div>";
   }
   function movesHtml(moves, slicerSwaps, planSwaps) {
     if (!moves || !moves.length) return "";
@@ -182,8 +196,11 @@
   function estHtml(st, mode) {
     const e = (st.report.estimates || {})[mode];
     if (!e || !e.feasible) return '<div class="maceest">not feasible' + (e && e.reason ? ": " + esc(e.reason) : "") + "</div>";
+    const basis = e.basis === "loaded"
+      ? ' · counted from what the heads hold now' + (e.engine_swaps != null && e.engine_swaps !== e.swaps ? ' (the engine says ' + e.engine_swaps + ': it assumes every head starts on ACE 0)' : "")
+      : (e.sim_swaps !== e.swaps ? ' · Hub walk counts ' + e.sim_swaps : "");
     return '<div class="maceest"><b>' + e.swaps + '</b> swap' + (e.swaps === 1 ? "" : "s") + ' ≈ <b>+' + mins(e.est_added_sec) + '</b> · purge top-up ≈ <b>' + e.purge_g + ' g</b> (' + e.purge_mm + ' mm' +
-      (e.pairs_known || e.pairs_default ? '; ' + e.pairs_known + ' pair' + (e.pairs_known === 1 ? "" : "s") + ' from the flush matrix, ' + e.pairs_default + ' engine default' : "") + ') · ' + e.swap_seconds + ' s per swap' + (e.sim_swaps !== e.swaps ? ' · Hub walk counts ' + e.sim_swaps : "") + '</div>';
+      (e.pairs_known || e.pairs_default ? '; ' + e.pairs_known + ' pair' + (e.pairs_known === 1 ? "" : "s") + ' from the flush matrix, ' + e.pairs_default + ' engine default' : "") + ') · ' + e.swap_seconds + ' s per swap' + basis + '</div>';
   }
   function jobHtml(pid, st, fe, fits) {
     const pi = printerInfo(pid) || {}, lo = (LOADOUT.get(pid) || {}).d;
@@ -203,9 +220,10 @@
     const missing = rep.missing_materials || [];
     let h = '<div class="macemsg">' + head + ' · ' + (rep.slicer_colors || []).length + ' colour' + ((rep.slicer_colors || []).length === 1 ? "" : "s") + ' matched' + (rep.nozzles_mixed ? ' · <span style="color:var(--bad)">mixed nozzles</span>' : "") + '</div>';
     if (missing.length) h += '<div class="macemsg err">No loaded slot holds ' + esc(missing.join(", ")) + ' - load it, then check again.</div>';
-    h += '<div class="maceplans">' + ["slicer", "optimize", "layer"].map(m => { const p = plans[m]; const ok = p && p.feasible; return '<button class="maceplan' + (m === mode ? " on" : "") + '" data-mace="plan" data-pid="' + pid + '" data-plan="' + m + '"' + (ok ? "" : " disabled") + ' title="' + esc(PLAN_HINT[m] + (ok ? "" : (p && p.reason ? " - " + p.reason : " - not feasible"))) + '">' + PLAN[m] + (ok ? ' · ' + p.swaps + ' swap' + (p.swaps === 1 ? "" : "s") : "") + '</button>'; }).join("") + '</div>';
+    h += '<div class="maceplans">' + ["slicer", "optimize", "layer"].map(m => { const p = plans[m]; const ok = p && p.feasible; const n = ok ? ((est[m] && est[m].feasible) ? est[m].swaps : p.swaps) : 0; return '<button class="maceplan' + (m === mode ? " on" : "") + '" data-mace="plan" data-pid="' + pid + '" data-plan="' + m + '"' + (ok ? "" : " disabled") + ' title="' + esc(PLAN_HINT[m] + (ok ? "" : (p && p.reason ? " - " + p.reason : " - not feasible"))) + '">' + PLAN[m] + (ok ? ' · ' + n + ' swap' + (n === 1 ? "" : "s") : "") + '</button>'; }).join("") + '</div>';
     h += estHtml(st, mode);
-    h += rowsHtml(st, mode);
+    h += rowsHtml(pid, st, mode);
+    if (st.pickErr) h += '<div class="macemsg err">' + esc(st.pickErr) + '</div>';
     const moves = (st.moves || rep.moves || {})[mode] || [];
     h += movesHtml(moves, plans.slicer && plans.slicer.feasible ? plans.slicer.swaps : null, plans[mode] ? plans[mode].swaps : null);
     if (st.stale) h += '<div class="macecap">the loadout changed since this check; the as-sliced plan is stale - run the check again before printing it</div>';
@@ -284,12 +302,37 @@
     st.plan = plans[dp] && plans[dp].feasible ? dp : (["optimize", "layer", "slicer"].find(m => plans[m] && plans[m].feasible) || "slicer");
     st.phase = "report"; rerender(pid);
   }
-  async function recheck(pid) {
+  // Re-read the loadout and the heads; with picks, re-plan the as-sliced rows
+  // around them. A refused pick (empty slot, other material) keeps the last
+  // good picks and shows why.
+  async function recheck(pid, picks) {
     const st = stateFor(pid, window.SELECTED); if (!st.report) return;
-    const r = await jpost("/api/multiace/recheck", { token: st.report.token });
-    if (!r.ok) { st.phase = "error"; st.msg = (r.d && r.d.error) || "re-check failed"; rerender(pid); return; }
+    const want = picks !== undefined ? picks : (st.picks || {});
+    // The newest selection wins: picks are recorded before the request, and
+    // an answer to an older request is dropped when it lands late.
+    const prev = st.picks || {};
+    st.picks = want;
+    const seq = st.seq = (st.seq || 0) + 1;
+    const r = await jpost("/api/multiace/recheck", { token: st.report.token, remap: want });
+    if (seq !== st.seq) return;
+    if (!r.ok) {
+      st.picks = prev;
+      if (r.status === 400 && r.d && r.d.remap_errors) { st.pickErr = r.d.error; rerender(pid); return; }
+      st.phase = "error"; st.msg = (r.d && r.d.error) || "re-check failed"; rerender(pid); return;
+    }
+    st.pickErr = null;
+    st.picks = want;
+    st.pickRows = Object.keys(want).length && r.d.rows ? r.d.rows.slicer : null;
     st.moves = r.d.moves; st.stale = !!r.d.stale_slicer; st.report.live_slots = r.d.live_slots;
+    if (r.d.estimates) st.report.estimates = r.d.estimates;
     LOADOUT.delete(pid); rerender(pid);
+  }
+  function pick(pid, t, v) {
+    const st = stateFor(pid, window.SELECTED); if (!st.report) return;
+    const engine = ((st.report.rows || {}).slicer || []).find(r => r.t === t);
+    const next = { ...(st.picks || {}) };
+    if (engine && engine.ace != null && engine.ace * 4 + engine.slot === v) delete next[String(t)]; else next[String(t)] = v;
+    recheck(pid, next);
   }
   async function inbox(pid) {
     const file = window.SELECTED; if (!file) return;
@@ -305,7 +348,7 @@
   }
   function confirmDialog(pid, st) {
     return new Promise(resolve => {
-      const fe = fleetOf(pid) || {}, mode = st.plan, rep = st.report, e = (rep.estimates || {})[mode] || {}, rows = (rep.rows || {})[mode] || [];
+      const fe = fleetOf(pid) || {}, mode = st.plan, rep = st.report, e = (rep.estimates || {})[mode] || {}, rows = rowsOf(st, mode);
       const lo = (LOADOUT.get(pid) || {}).d || {};
       let m = document.getElementById("macemodal");
       if (!m) { m = document.createElement("div"); m.id = "macemodal"; m.className = "modal macemodal"; document.body.appendChild(m); }
@@ -326,7 +369,9 @@
     if (!(await confirmDialog(pid, st))) return;
     const mode = st.plan;
     st.phase = "printing"; st.msg = "Sending the identity extruder map…"; st.pct = 5; rerender(pid);
-    const r = await jpost("/api/multiace/print", { printer: pid, token: st.report.token, mode });
+    const body = { printer: pid, token: st.report.token, mode };
+    if (mode === "slicer" && hasPicks(st)) body.remap = st.picks;
+    const r = await jpost("/api/multiace/print", body);
     if (!r.ok) {
       if (r.d && r.d.needsMoves) { st.phase = "report"; st.moves = { ...(st.moves || st.report.moves || {}), [mode]: r.d.moves }; rerender(pid); return; }
       st.phase = "error"; st.msg = (r.d && r.d.error) || ("HTTP " + r.status); rerender(pid); return;
@@ -354,6 +399,11 @@
     else if (act === "reset") { JOB.delete(key(pid, window.SELECTED)); rerender(pid); }
     else if (act === "force") { FORCED.add(pid); rerender(pid); }
     else if (act === "unforce") { FORCED.delete(pid); JOB.delete(key(pid, window.SELECTED)); rerender(pid); }
+    else if (act === "unpick") recheck(pid, {});
+  }
+  function onChange(e) {
+    const t = e.target.closest("[data-mace-pick]"); if (!t) return;
+    pick(Number(t.dataset.pid), Number(t.dataset.macePick), Number(t.value));
   }
 
   // ---- job card line ---------------------------------------------------------------------
@@ -409,7 +459,7 @@
     style();
     buildSettings();
     const fleet = document.getElementById("fleet");
-    if (fleet) { new MutationObserver(() => decorate()).observe(fleet, { childList: true }); fleet.addEventListener("click", onClick); }
+    if (fleet) { new MutationObserver(() => decorate()).observe(fleet, { childList: true }); fleet.addEventListener("click", onClick); fleet.addEventListener("change", onChange); }
     const jt = document.getElementById("jt");
     if (jt) new MutationObserver(() => { document.querySelectorAll(".mace").forEach(b => b.remove()); document.querySelectorAll(".macefootnote").forEach(b => b.remove()); decorate(); }).observe(jt, { childList: true, characterData: true, subtree: true });
     loadInfo(false);

@@ -50,7 +50,20 @@ labelling what it filled:
 
 1. **The deduction** (`filament.deducted`, the rolls that were loaded): grams
    and price, `source: "deduction"`. Needs the file in the library and spools
-   recorded in the heads.
+   recorded in the heads. A deduction that took **0 g and priced nothing** (no
+   spool recorded in any head) carries no price, so the row is priced by the
+   steps below and flagged `deduction_empty` (2026-10-06: five live rows had
+   shown a blank material cost for this reason). A deduction that did take
+   grams from a roll with no price stays blank, never the flat rate in
+   disguise.
+   **A multiACE print** (row.multiace) is priced colour by colour instead:
+   each colour's grams at the price of the roll the shelf matches for it
+   (`resources.priceFor`, the rollup's own colour matcher), `source: "rolls"`,
+   only when every colour with grams found a priced roll. Its colours are not
+   its heads, so the head-by-head deduction is kept on the row as
+   `material.deduction_ignored` and never prices it. Without priced rolls it
+   falls through to the flat rate / slicer cost like any other row, and
+   `material.heads` still says which ACE slot each colour printed from.
 2. **The library gcode** (head+tail parse): grams, slicer time estimate, the
    slicer's own cost. `grams_source: "slicer"`, `est_source: "slicer"`.
 3. **The printer's own metadata**: `GET <printer>/server/files/metadata?filename=…`
@@ -402,6 +415,12 @@ One emit of a record that already exists is the smallest honest hook. If an
 upstream release moves `deductFor`, the line goes wherever `store.save()` now
 is; with the line missing the module still works, with material falling back
 to the flat rate and saying so.
+
+And **one `ctx.provide("resources.priceFor", …)` line** at the end of
+`register()` (2026-10-06): a multiACE print's colours priced from the roll the
+shelf matches, through resources' own `matchSpool` and `readShelf`, so the
+colour-matching rule (ΔE ceiling, colour map, orphan handling) stays in one
+place. Missing, multiACE rows simply keep the flat / slicer price.
 
 ## Roadmap
 

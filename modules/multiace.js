@@ -170,13 +170,18 @@ function purgeTopupMm(matrix, from, to) {
 const purgeGrams = (mm, density) => r2(mm * FILAMENT_MM3_PER_MM * (num(density) > 0 ? density : DENSITY_DEFAULT) / 1000);
 
 // Walk the toolchange sequence the way preflight_core._real_swap_count does
-// (every head starts on ACE 0's same-numbered slot; a toolchange whose slot
-// differs from what the head holds is a swap) and sum the purge top-up of
-// each swap: the pair (previous colour on that head -> this colour) when
-// known, else the engine default. mapping rows: { t, slot:{ace,slot} }.
-function simulateSwaps(events, mapping, matrix) {
+// and sum the purge top-up of each swap: the pair (previous colour on that
+// head -> this colour) when known, else the engine default. A toolchange whose
+// slot differs from what the head holds is a swap. mapping rows: { t, slot:{ace,slot} }.
+// `start` ({ head: "ace,slot" }, from startFromHeadSource) is what each head
+// is fed from right now. Without it every head is taken to start on ACE 0's
+// same-numbered slot, which is what the engine's own count assumes - and why
+// it over-counts when the heads already hold the job's spools (davinci,
+// history 000131: the engine said 5 as-sliced swaps; 1 happened, the other
+// toolchanges logged "Swap: HEAD n already on ACE 1 / Slot n - skipping").
+function simulateSwaps(events, mapping, matrix, start) {
   const byT = new Map((mapping || []).filter(m => m && m.slot).map(m => [m.t, m.slot]));
-  const cur = { 0: "0,0", 1: "0,1", 2: "0,2", 3: "0,3" }, held = {};
+  const cur = { 0: "0,0", 1: "0,1", 2: "0,2", 3: "0,3", ...(start || {}) }, held = {};
   let swaps = 0, purge_mm = 0, known = 0, defaulted = 0;
   const pairs = [];
   for (const t of events || []) {
@@ -194,14 +199,33 @@ function simulateSwaps(events, mapping, matrix) {
   }
   return { swaps, purge_mm, pairs, known, defaulted };
 }
-// One plan's numbers. Time uses the ENGINE's swap count (its layout search is
-// the truth); purge uses the Hub's walk, whose own count is reported beside it.
-function estimatePlan(plan, events, matrix, swapSeconds, density) {
+// The `ace` object's head_source ({ "0": { ace_index, slot, ... }, ... }) ->
+// { head: "ace,slot" } for simulateSwaps; null when it names no head. A head
+// it leaves out is fed by nothing ("none"), so its first use counts as a swap.
+function startFromHeadSource(hs) {
+  if (!hs || typeof hs !== "object") return null;
+  const out = {};
+  let any = false;
+  for (let h = 0; h < 4; h++) {
+    const src = hs[h] != null ? hs[h] : hs[String(h)];
+    const a = src ? num(src.ace_index) : null, sl = src ? num(src.slot) : null;
+    if (a != null && sl != null && Number.isInteger(a) && Number.isInteger(sl)) { out[h] = a + "," + sl; any = true; }
+    else out[h] = "none";
+  }
+  return any ? out : null;
+}
+// One plan's numbers. With the heads' live sources (`start`) the swap count is
+// the Hub's walk from what is loaded (basis "loaded"); without them it is the
+// engine's own count (basis "engine"), which assumes ACE 0. Purge always comes
+// from the Hub's walk. engine_swaps keeps the engine's figure either way.
+function estimatePlan(plan, events, matrix, swapSeconds, density, start) {
   if (!plan || !plan.feasible) return { feasible: false, swaps: 0, sim_swaps: 0, est_added_sec: 0, purge_mm: 0, purge_g: 0, pairs_known: 0, pairs_default: 0, reason: (plan && plan.reason) || "not feasible" };
-  const sim = simulateSwaps(events, plan.mapping, matrix);
-  const swaps = Number.isInteger(plan.swaps) ? plan.swaps : sim.swaps;
+  const sim = simulateSwaps(events, plan.mapping, matrix, start);
+  const engine = Number.isInteger(plan.swaps) ? plan.swaps : null;
+  const loaded = !!start;
+  const swaps = loaded ? sim.swaps : (engine != null ? engine : sim.swaps);
   const sec = num(swapSeconds) > 0 ? swapSeconds : DEFAULTS.swap_seconds;
-  return { feasible: true, swaps, sim_swaps: sim.swaps, tool_changes: plan.tool_changes || 0, est_added_sec: swaps * sec,
+  return { feasible: true, swaps, sim_swaps: sim.swaps, engine_swaps: engine, basis: loaded ? "loaded" : "engine", tool_changes: plan.tool_changes || 0, est_added_sec: swaps * sec,
            purge_mm: sim.purge_mm, purge_g: purgeGrams(sim.purge_mm, density), pairs_known: sim.known, pairs_default: sim.defaulted, swap_seconds: sec };
 }
 
@@ -241,28 +265,74 @@ function movesFor(report, mode, liveSlots) {
 }
 
 // ---- pure: the enriched report the card renders --------------------------------------------
+function rowsFor(report, mapping) {
+  return (mapping || []).map(m => {
+    const c = (report.slicer_colors || []).find(x => x.t === m.t) || {};
+    const slotHex = m.slot ? hexOf(m.slot.color) : "";
+    return { t: m.t, hex: hexOf(c.hex), name: c.name || "", material: c.material || "", tier: m.tier,
+             ace: m.slot ? m.slot.ace : null, slot: m.slot ? m.slot.slot : null, slot_hex: slotHex, slot_material: m.slot ? m.slot.material : "",
+             dE: slotHex && c.hex ? r2(deltaE2000(c.hex, slotHex)) : null };
+  });
+}
+// opts: { matrix, swap_seconds, density, start } - start from startFromHeadSource.
 function enrichReport(report, o) {
   const opts = o || {};
   const events = Array.isArray(report.events) ? report.events : [];
   const estimates = {}, moves = {}, rows = {};
   for (const mode of PLANS) {
     const plan = (report.plans || {})[mode];
-    estimates[mode] = estimatePlan(plan, events, opts.matrix, opts.swap_seconds, opts.density);
+    estimates[mode] = estimatePlan(plan, events, opts.matrix, opts.swap_seconds, opts.density, opts.start);
     moves[mode] = movesFor(report, mode);
-    rows[mode] = !plan ? [] : (plan.mapping || []).map(m => {
-      const c = (report.slicer_colors || []).find(x => x.t === m.t) || {};
-      const slotHex = m.slot ? hexOf(m.slot.color) : "";
-      return { t: m.t, hex: hexOf(c.hex), name: c.name || "", material: c.material || "", tier: m.tier,
-               ace: m.slot ? m.slot.ace : null, slot: m.slot ? m.slot.slot : null, slot_hex: slotHex, slot_material: m.slot ? m.slot.material : "",
-               dE: slotHex && c.hex ? r2(deltaE2000(c.hex, slotHex)) : null };
-    });
+    rows[mode] = !plan ? [] : rowsFor(report, plan.mapping);
   }
   const colors = report.slicer_colors || [];
   const needed = [...new Set(colors.map(c => lc(c.material)).filter(Boolean))];
   return { ...report, estimates, moves, rows,
            hub: { swap_seconds: estimates.slicer.swap_seconds || opts.swap_seconds || DEFAULTS.swap_seconds, density: opts.density || DENSITY_DEFAULT,
                   matrix_n: opts.matrix ? opts.matrix.length : 0, colours: colors.length, materials: needed, events: events.length,
-                  slots: (report.live_slots || []).length, aces: report.num_aces || 0 } };
+                  slots: (report.live_slots || []).length, aces: report.num_aces || 0, start: opts.start || null } };
+}
+
+// ---- pure: a hand-picked slot per colour for the as-sliced plan ------------------------------
+// overrides: { slicerT: ace*4+slot } from the card. The engine takes `remap`
+// as a FULL replacement of its own colour matching (preflight_core.py: with a
+// remap_override it never calls match_colors_to_slots), so the Hub sends every
+// colour's slot: the override where there is one, the engine's match elsewhere.
+// -> { mapping, remap, errors[] }; mapping rows carry tier "manual" when picked.
+function applyRemap(report, overrides, liveSlots) {
+  const base = ((report && report.plans && report.plans.slicer) || {}).mapping || [];
+  const live = liveSlots || (report && report.live_slots) || [];
+  const colours = new Map(((report && report.slicer_colors) || []).map(c => [c.t, c]));
+  const errors = [], mapping = [], remap = {};
+  const ov = overrides && typeof overrides === "object" ? overrides : {};
+  for (const k of Object.keys(ov)) {
+    const t = Number(k);
+    if (!Number.isInteger(t) || !base.some(m => m && m.t === t)) errors.push("P" + (Number.isInteger(t) ? t + 1 : k) + " is not a colour of this file");
+  }
+  for (const m of base) {
+    if (!m) continue;
+    let slot = m.slot, tier = m.tier;
+    if (Object.prototype.hasOwnProperty.call(ov, String(m.t))) {
+      const v = Number(ov[String(m.t)]);
+      if (!Number.isInteger(v) || v < 0 || v > 15) { errors.push("P" + (m.t + 1) + ": slot index must be 0-15"); continue; }
+      const want = { ace: Math.floor(v / 4), slot: v % 4 };
+      const there = live.find(s => s.ace === want.ace && s.slot === want.slot);
+      const c = colours.get(m.t) || {};
+      if (!there) { errors.push("P" + (m.t + 1) + ": ACE " + want.ace + " slot " + want.slot + " is empty or unlabelled"); continue; }
+      if (c.material && there.material && lc(c.material) !== lc(there.material)) { errors.push("P" + (m.t + 1) + " is " + c.material + ", ACE " + want.ace + " slot " + want.slot + " holds " + there.material); continue; }
+      slot = { ace: there.ace, slot: there.slot, material: there.material, color: there.color };
+      tier = "manual";
+    } else if (slot) {
+      // Not picked, but it goes out in the full map all the same and the engine
+      // will not re-match it: the slot must still hold what it held at check
+      // time (a spool changed since then is a 400, re-check first).
+      const there = live.find(s => s.ace === slot.ace && s.slot === slot.slot);
+      if (!slotHolds(there, slot.color, slot.material)) { errors.push("P" + (m.t + 1) + ": ACE " + slot.ace + " slot " + slot.slot + " no longer holds " + (slot.material || "") + " " + hexOf(slot.color) + " - re-check the loadout"); continue; }
+    }
+    mapping.push({ ...m, slot, tier });
+    if (slot) remap[String(m.t)] = slot.ace * 4 + slot.slot;
+  }
+  return { mapping, remap, errors };
 }
 
 // ---- pure: the gate and the refusal matrix --------------------------------------------------
@@ -547,7 +617,7 @@ function register(ctx) {
           return;
         }
         if (r.status !== 200 || !r.body || !r.body.token) throw new Error(detail);
-        const report = enrichReport(r.body, { matrix: facts.matrix, swap_seconds: conf().swap_seconds, density: facts.density });
+        const report = enrichReport(r.body, { matrix: facts.matrix, swap_seconds: conf().swap_seconds, density: facts.density, start: startFromHeadSource(s.head_source) });
         REPORTS.set(report.token, { idx, file: f.name, fp: f.fp, name: f.name, slug: f.slug, report, facts, at: Date.now() });
         job.result = { report, facts: { size: facts.size, est_minutes: facts.est_minutes, density: facts.density, matrix_n: facts.matrix ? facts.matrix.length : 0, used: facts.usedCount, types: facts.usedTypes }, link: base + "/multiace/", default_plan: conf().default_plan };
         job.phase = "done"; job.done = true;
@@ -558,16 +628,32 @@ function register(ctx) {
   });
 
   // Re-read the live loadout for a cached report (after the person moved
-  // spools) and recompute the moves. The as-sliced plan was matched against
-  // the slots at upload time, so it is flagged stale when they changed.
+  // spools) and recompute the moves and the estimates from what the heads hold
+  // now. The as-sliced plan was matched against the slots at upload time, so
+  // it is flagged stale when they changed. `remap` ({slicerT: ace*4+slot}, the
+  // card's slot picker) re-plans the as-sliced rows and estimate around the
+  // picked slots; a pick that names an empty slot or another material is 400.
   ctx.app.post("/api/multiace/recheck", async (req, res) => {
-    const rec = REPORTS.get(String((req.body || {}).token || "")); if (!rec) return bad(res, 404, "No such preflight (run the check again)");
+    const b = req.body || {};
+    const rec = REPORTS.get(String(b.token || "")); if (!rec) return bad(res, 404, "No such preflight (run the check again)");
     const s = await snapshot(rec.idx, true);
     if (!s.multiace) return bad(res, 409, "the printer no longer answers as multiACE");
     const before = JSON.stringify((rec.report.live_slots || []).map(x => [x.ace, x.slot, lc(x.material), hexOf(x.color)]));
     const after = JSON.stringify((s.live_slots || []).map(x => [x.ace, x.slot, lc(x.material), hexOf(x.color)]));
     const moves = {}; for (const m of PLANS) moves[m] = movesFor(rec.report, m, s.live_slots);
-    res.json({ token: rec.report.token, live_slots: s.live_slots, moves, stale_slicer: before !== after, reasons: checks(s, null) });
+    const start = startFromHeadSource(s.head_source), events = rec.report.events || [];
+    const est = p => estimatePlan(p, events, rec.facts.matrix, conf().swap_seconds, rec.facts.density, start);
+    const estimates = {}; for (const m of PLANS) estimates[m] = est((rec.report.plans || {})[m]);
+    let rows = null, remap = null;
+    if (b.remap && typeof b.remap === "object" && Object.keys(b.remap).length) {
+      const ar = applyRemap(rec.report, b.remap, s.live_slots);
+      if (ar.errors.length) return bad(res, 400, ar.errors.join("; "), { remap_errors: ar.errors });
+      // engine_swaps is the engine's count for ITS match, not for the picked one
+      estimates.slicer = { ...est({ ...(rec.report.plans || {}).slicer, mapping: ar.mapping }), engine_swaps: null };
+      rows = { slicer: rowsFor(rec.report, ar.mapping) };
+      remap = ar.remap;
+    }
+    res.json({ token: rec.report.token, live_slots: s.live_slots, moves, estimates, rows, remap, start, stale_slicer: before !== after, reasons: checks(s, null) });
   });
 
   // Always a start (the engine uploads with print=true). -> { jobId }; the
@@ -581,10 +667,10 @@ function register(ctx) {
     const mode = PLANS.includes(b.mode) ? b.mode : null; if (!mode) return bad(res, 400, "mode must be one of " + PLANS.join(", "));
     const p = printers()[idx], report = rec.report, plan = (report.plans || {})[mode];
     if (!plan || !plan.feasible) return bad(res, 400, "the " + mode + " plan is not feasible" + (plan && plan.reason ? ": " + plan.reason : ""));
-    let remap = null;
-    if (mode === "slicer" && b.remap && typeof b.remap === "object") {
-      remap = {};
-      for (const [k, v] of Object.entries(b.remap)) { const t = Number(k), s = Number(v); if (!Number.isInteger(t) || !Number.isInteger(s) || t < 0 || t > 15 || s < 0 || s > 15) return bad(res, 400, "remap must be {slicerT: ace*4+slot}"); remap[String(t)] = s; }
+    let picks = null;
+    if (mode === "slicer" && b.remap && typeof b.remap === "object" && Object.keys(b.remap).length) {
+      picks = {};
+      for (const [k, v] of Object.entries(b.remap)) { const t = Number(k), s = Number(v); if (!Number.isInteger(t) || !Number.isInteger(s) || t < 0 || t > 15 || s < 0 || s > 15) return bad(res, 400, "remap must be {slicerT: ace*4+slot}"); picks[String(t)] = s; }
     }
     const s = await snapshot(idx, true);
     if (!s.multiace) return bad(res, 409, p.name + " no longer answers as multiACE");
@@ -592,13 +678,26 @@ function register(ctx) {
     if (reasons.length) return res.status(409).json({ error: reasons.map(r => r.text).join("; "), reasons });
     const moves = movesFor(report, mode, s.live_slots);
     if (moves.length) return res.status(409).json({ error: "the " + mode + " plan needs " + moves.length + " spool move" + (moves.length === 1 ? "" : "s") + " first (move the spool, then update its slot label in multiACE / FilamentHub, then re-check)", needsMoves: true, moves });
-    const est = (report.estimates || {})[mode] || estimatePlan(plan, report.events, rec.facts.matrix, conf().swap_seconds, rec.facts.density);
-    const heads = [...new Set((plan.mapping || []).filter(m => m && m.slot).map(m => Number(m.slot.slot)))].sort((a, c) => a - c);
+    // The engine replaces its own matching with `remap` wholesale, so a pick
+    // goes out as the FULL as-sliced map (applyRemap); no pick sends none.
+    let mapping = plan.mapping || [], remap = null;
+    if (picks) {
+      const ar = applyRemap(report, picks, s.live_slots);
+      if (ar.errors.length) return bad(res, 400, ar.errors.join("; "), { remap_errors: ar.errors });
+      mapping = ar.mapping; remap = ar.remap;
+    }
+    // Estimated against what the heads hold NOW, not at check time.
+    const est = estimatePlan({ ...plan, mapping }, report.events, rec.facts.matrix, conf().swap_seconds, rec.facts.density, startFromHeadSource(s.head_source));
+    const heads = [...new Set(mapping.filter(m => m && m.slot).map(m => Number(m.slot.slot)))].sort((a, c) => a - c);
+    // What each colour printed from, with the file's grams, for the costing row.
+    const pal = new Map((rec.facts.palette || []).map(x => [x.i, x]));
+    const colours = mapping.filter(m => m && m.slot).map(m => { const c = (report.slicer_colors || []).find(x => x.t === m.t) || {}, pg = pal.get(m.t) || {};
+      return { t: m.t, hex: hexOf(c.hex), material: c.material || m.slot.material || "", ace: m.slot.ace, slot: m.slot.slot, slot_hex: hexOf(m.slot.color), grams: num(pg.grams) }; });
     const jobId = newJobId();
     const job = { kind: "print", printer: idx, file: rec.name, mode, phase: "identity", sent: 0, total: 0, done: false, error: null, result: null, engine: null, ts: Date.now() };
     JOBS.set(jobId, job);
     const sent = { id: jobId, printer_id: idx, printer: p.name, file: rec.name, type: rec.slug, plan: mode, swaps: est.swaps, tool_changes: est.tool_changes || 0, est_added_sec: est.est_added_sec,
-                   purge_mm: est.purge_mm, purge_g: est.purge_g, swap_seconds: est.swap_seconds, heads, remap: remap ? Object.keys(remap).length : 0, identity_map: conf().identity_map, ts: Date.now(), started: false, engine_job: null, error: null };
+                   purge_mm: est.purge_mm, purge_g: est.purge_g, swap_seconds: est.swap_seconds, swaps_basis: est.basis, engine_swaps: est.engine_swaps, heads, colours, remap: picks ? Object.keys(picks).length : 0, identity_map: conf().identity_map, ts: Date.now(), started: false, engine_job: null, error: null };
     S.sent.push(sent); if (S.sent.length > SENT_MAX) S.sent.splice(0, S.sent.length - SENT_MAX);
     save();
     res.json({ jobId, mode, swaps: est.swaps, est_added_sec: est.est_added_sec, purge_g: est.purge_g, heads });
@@ -668,5 +767,5 @@ function register(ctx) {
   ctx.hublog("info", "multiace (" + FORK + " fork module) armed: swap_seconds " + conf().swap_seconds + ", default plan " + conf().default_plan + "; printers probe on first use");
 }
 
-module.exports = { register, gate, checks, parseFlushMatrix, purgeTopupMm, purgeGrams, simulateSwaps, estimatePlan, deltaE2000, deltaE2000Lab, hexToLab, slotHolds, movesFor, enrichReport, fileFacts,
+module.exports = { register, gate, checks, parseFlushMatrix, purgeTopupMm, purgeGrams, simulateSwaps, startFromHeadSource, estimatePlan, applyRemap, rowsFor, deltaE2000, deltaE2000Lab, hexToLab, slotHolds, movesFor, enrichReport, fileFacts,
                    DEFAULTS, PLANS, FILAMENT_MM3_PER_MM, PURGE_TOPUP_FRAC, PURGE_MIN_MM, PURGE_MAX_MM, ENGINE_DEFAULT_PURGE_MM, SLOT_MATCH_DE };

@@ -161,6 +161,39 @@ function gcode(o) {
     ok(MA.estimatePlan({ feasible: false, reason: ">4 colors in some layer" }, EVENTS, M, 150, 1.24).feasible === false, "an infeasible plan estimates nothing");
     const noM = MA.estimatePlan({ feasible: true, swaps: 5, mapping }, EVENTS, null, 150, null);
     ok(noM.purge_mm === 400 && noM.purge_g === 1.19, "no flush matrix: every swap at the 80 mm engine default, PLA density assumed", noM);
+    // Live gate 2026-10-06, davinci history 000131 (the pink copy): the engine's as-sliced report and
+    // the heads' sources at that time. The engine counted 5 swaps (it starts every head on ACE 0);
+    // klippy.log shows ONE swap (head 0, ACE 1 slot 0 -> ACE 0 slot 0) and "already on ... skipping" for the rest.
+    {
+      const sl = (ace, n, color) => ({ ace, slot: n, material: "PLA", color });
+      const realMap = [{ t: 0, slot: sl(1, 2, "#000000") }, { t: 1, slot: sl(1, 0, "#f55a7c") }, { t: 2, slot: sl(1, 1, "#631313") }, { t: 3, slot: sl(0, 0, "#fc8200") }, { t: 4, slot: sl(1, 3, "#ffffff") }];
+      const realEv = [0, 1, 2, 3, 4];
+      const start = MA.startFromHeadSource({ 0: { ace_index: 1, slot: 0 }, 1: { ace_index: 1, slot: 1 }, 2: { ace_index: 1, slot: 2 }, 3: { ace_index: 1, slot: 3, type: "PLA" } });
+      ok(JSON.stringify(start) === JSON.stringify({ 0: "1,0", 1: "1,1", 2: "1,2", 3: "1,3" }), "head_source -> each head's live 'ace,slot'", start);
+      ok(MA.simulateSwaps(realEv, realMap, null).swaps === 5, "no start state: the walk assumes ACE 0, as the engine does (5)");
+      const w = MA.simulateSwaps(realEv, realMap, null, start);
+      ok(w.swaps === 1 && w.pairs[0].head === 0 && w.pairs[0].ace === 0 && w.pairs[0].to === 3, "from the loaded heads: 1 swap, head 0 to ACE 0 for orange - what davinci did", w.pairs);
+      const e1 = MA.estimatePlan({ feasible: true, swaps: 5, mapping: realMap }, realEv, null, 192, 1.24, start);
+      ok(e1.swaps === 1 && e1.engine_swaps === 5 && e1.basis === "loaded" && e1.est_added_sec === 192, "estimate from the loaded heads: 1 swap x 192 s, the engine's 5 kept beside it", e1);
+      const e0 = MA.estimatePlan({ feasible: true, swaps: 5, mapping: realMap }, realEv, null, 192, 1.24);
+      ok(e0.swaps === 5 && e0.basis === "engine" && e0.est_added_sec === 960, "no head sources: the engine's count stands", e0);
+      ok(MA.startFromHeadSource(null) === null && MA.startFromHeadSource({}) === null && MA.startFromHeadSource({ 0: { color: "FFFFFF" } }) === null, "no usable head source -> null (engine basis)");
+      const part = MA.startFromHeadSource({ 2: { ace_index: 0, slot: 2 } });
+      ok(part && part[2] === "0,2" && part[0] === "none", "a head with no source is 'none', so its first use counts as a swap", part);
+      ok(MA.simulateSwaps([0], [{ t: 0, slot: sl(0, 0, "#000000") }], null, part).swaps === 1, "...and it does");
+      // the slot picker: applyRemap
+      const daLive = [sl(0, 0, "#fc8200"), sl(0, 1, "#f5d800"), sl(0, 2, "#0f6b2e"), { ace: 0, slot: 3, material: "PETG", color: "#1436c8" }, sl(1, 0, "#f55a7c"), sl(1, 1, "#631313"), sl(1, 2, "#000000"), sl(1, 3, "#ffffff")];
+      const realRep = { slicer_colors: [0, 1, 2, 3, 4].map(t => ({ t, hex: realMap[t].slot.color, material: "PLA" })), live_slots: daLive, plans: { slicer: { feasible: true, swaps: 5, mapping: realMap } } };
+      const ar = MA.applyRemap(realRep, { 1: 1 }, daLive);
+      ok(ar.errors.length === 0 && ar.mapping[1].slot.ace === 0 && ar.mapping[1].slot.slot === 1 && ar.mapping[1].tier === "manual" && ar.mapping[0].slot.slot === 2, "pick ACE 0 slot 1 for P2: that row is 'manual', the rest keep the engine's match", ar.mapping.map(m => [m.t, m.slot.ace, m.slot.slot, m.tier]));
+      ok(JSON.stringify(ar.remap) === JSON.stringify({ 0: 6, 1: 1, 2: 5, 3: 0, 4: 7 }), "the remap sent is the FULL map {T: ace*4+slot} (the engine replaces its matching wholesale)", ar.remap);
+      ok(MA.applyRemap(realRep, { 0: 3 }, daLive).errors.some(e => /PETG/.test(e)), "a pick of another material is an error that names both");
+      const changed = daLive.map(x => x.ace === 1 && x.slot === 2 ? { ...x, material: "PETG" } : x);
+      ok(MA.applyRemap(realRep, { 1: 1 }, changed).errors.some(e => /P1: ACE 1 slot 2 no longer holds/.test(e)), "a colour NOT picked whose slot changed since the check is an error too (the full map would send it there unchecked)", MA.applyRemap(realRep, { 1: 1 }, changed).errors);
+      ok(MA.applyRemap(realRep, { 0: 12 }, daLive).errors.some(e => /empty or unlabelled/.test(e)), "a pick of a slot nobody labelled is an error");
+      ok(MA.applyRemap(realRep, { 9: 1 }, daLive).errors.some(e => /not a colour/.test(e)) && MA.applyRemap(realRep, { 1: 16 }, daLive).errors.length === 1, "an unknown colour or an index past 15 is an error");
+      ok(MA.estimatePlan({ feasible: true, swaps: 5, mapping: ar.mapping }, realEv, null, 192, 1.24, start).swaps === 3, "with P2 moved to ACE 0 slot 1 the walk counts 3 swaps from the loaded heads (P2 on, P3 back, P4 to ACE 0)");
+    }
     // moves
     const live = [slot(0, 0, "#fc8200"), slot(0, 1, "#ffb282"), slot(0, 2, "#0f6b2e"), slot(0, 3, "#1436c8"), slot(1, 0, "#f55a7c"), slot(1, 1, "#631313"), slot(1, 2, "#000000"), slot(1, 3, "#ffffff")];
     const planned = [{ t: 0, slot: { ace: 0, slot: 0, material: "PLA", color: "#000000" }, tier: "planned" }, { t: 3, slot: { ace: 1, slot: 0, material: "PLA", color: "#ffffff" }, tier: "planned" }, { t: 1, slot: { ace: 0, slot: 1, material: "PLA", color: "#ff0000" }, tier: "planned" }];
@@ -213,6 +246,11 @@ function gcode(o) {
 
   try {
     writeConfig(tmp, gdir, [portA, portB], null);
+    // One priced roll per fixture colour (no slots.json: no head records a spool, as on davinci),
+    // so costing can price a multiACE print colour by colour from the shelf.
+    const ROLLS = [["-201", "000000", 20], ["-202", "FF0000", 25], ["-203", "FFFF00", 30], ["-204", "FFFFFF", 22], ["-205", "FF8000", 28]];
+    fs.writeFileSync(path.join(tmp, "spools.json"), JSON.stringify({ tags: {}, local: [], spools: Object.fromEntries(ROLLS.map(([id, hex]) => [id, { id: Number(id), brand: "TestCo", material: "PLA", material_variant: "PLA", color_name: hex, hex, lab: null, color_source: "user" }])) }));
+    fs.writeFileSync(path.join(tmp, "resources.json"), JSON.stringify({ inv: Object.fromEntries(ROLLS.map(([id, , price]) => [id, { remaining_g: 900, net_weight_g: 1000, cost_per_roll: price }])), color_map: {}, settings: { assume_empty_when_unset: false, match_de_max: 7 } }));
     await startHub(tmp);
     const check = async () => ((await jpost("/api/fleet-events/check", {})).body || {}).emitted || [];
     const fleetState = async id => { const f = (await jget("/api/fleet")).body || []; const p = f.find(x => x.id === id); return p ? p.state : "absent"; };
@@ -260,7 +298,12 @@ function gcode(o) {
     ma.state.manual = false;
 
     console.log("\n-- preflight: the report becomes the card's model --");
+    // First with no head_source, so the estimates take the engine's own counts (basis "engine");
+    // the loaded-heads basis is checked right after, with the mock's head_source back.
+    const HS = moonA.state.ace.head_source;
+    delete moonA.state.ace.head_source;
     let pf = await preflight(FILE, 0);
+    moonA.state.ace.head_source = HS;
     ok(pf.status === 200 && pf.body.jobId && pf.body.size > 0 && pf.body.link === "http://127.0.0.1:" + portA + "/multiace/", "POST /api/multiace/preflight -> a job id, the file size and the printer's multiACE link", pf.body);
     ok(pf.job.done && !pf.job.error && pf.job.result && pf.job.result.report && pf.job.result.default_plan === "optimize", "the job finishes with a report and the default plan", pf.job && { phase: pf.job.phase, error: pf.job.error });
     ok(ma.state.preflights.length === 1 && ma.state.preflights[0].filename === FILE && ma.state.preflights[0].size === fs.statSync(path.join(gdir, FILE)).size, "the ORIGINAL file reached the engine, byte count intact", ma.state.preflights[0]);
@@ -271,12 +314,25 @@ function gcode(o) {
     ok(rows.length === 5 && rows[0].tier === "exact_hex" && rows[0].ace === 1 && rows[0].slot === 2 && rows[0].dE === 0 && rows[3].tier === "exact_hex" && rows[3].ace === 1 && rows[3].slot === 3, "as sliced: black -> ACE 1 slot 2 (exact, dE 0), white -> ACE 1 slot 3 (exact)", rows.map(x => [x.t, x.tier, x.ace, x.slot, x.dE]));
     ok(rows[1].tier === "fallback" && rows[1].ace === 0 && rows[1].slot === 0 && rows[1].dE > 20, "red has no match: same-material fallback onto ACE 0 slot 0 (orange), dE says so", rows[1]);
     const E = rep.estimates;
+    ok(E.slicer.basis === "engine" && E.optimize.basis === "engine" && E.slicer.engine_swaps === 5, "no head_source: every estimate is on the engine's basis", E.slicer);
     ok(E.slicer.swaps === 5 && E.slicer.est_added_sec === 750 && E.slicer.purge_mm === 438 && E.slicer.purge_g === 1.31 && E.slicer.sim_swaps === 5, "as sliced: 5 swaps, +750 s, 438 mm / 1.31 g purge (the hand-computed walk)", E.slicer);
     ok(E.optimize.swaps === 2 && E.optimize.est_added_sec === 300 && E.layer.swaps === 3 && E.layer.est_added_sec === 450, "optimize 2 swaps -> +300 s, layer 3 swaps -> +450 s (plan switching math)", { o: E.optimize, l: E.layer });
-    ok(E.optimize.purge_mm > 0 && E.optimize.purge_mm < E.slicer.purge_mm, "fewer swaps, less purge", { o: E.optimize.purge_mm, s: E.slicer.purge_mm });
+    ok(E.optimize.purge_mm > 0 && E.optimize.purge_mm < E.slicer.purge_mm, "from ACE 0 (no head_source): fewer swaps, less purge", { o: E.optimize.purge_mm, s: E.slicer.purge_mm });
     ok(rep.moves.slicer.length === 0 && rep.moves.optimize.length >= 3 && rep.moves.optimize.every(m => m.to && Number.isInteger(m.to.ace) && Number.isInteger(m.to.slot) && /^#[0-9a-f]{6}$/.test(m.hex)), "as sliced needs no moves; optimize lists the spool moves it needs (suggested, never made)", rep.moves.optimize);
     ok(rep.rows.optimize.every(x => x.tier === "planned") && rep.hub.matrix_n === 5 && rep.hub.swap_seconds === 150 && rep.hub.density === 1.24, "proposed rows are tier 'planned'; the Hub block records the matrix size, swap seconds and density", rep.hub);
     ok(ma.state.live_slots.every(s => s.color !== "#ff0000") && JSON.stringify(moonA.state.ace.head_source).includes("F55A7C"), "nothing on the printer changed: slots and head wiring as before");
+
+    console.log("\n-- estimates from what the heads hold (head_source: every head on ACE 1) --");
+    r = await jpost("/api/multiace/recheck", { token: TOKEN });
+    {
+      const L = r.body.estimates;
+      // Hand walk, events 0,1,4,2,3,0,4 from heads on ACE 1 slots 0-3. As sliced (T0 1,2 / T1 0,0 / T2 0,1 / T3 1,3 /
+      // T4 0,2): T0 stays, T1 swap, T4 swap, T2 swap, T3 stays, T0 swap, T4 swap = 5. Optimize/layer (T0 0,0 / T1 0,1 /
+      // T4 0,2 / T2 0,3 / T3 1,0): four first loads off ACE 1, then T3 and T0 on head 0 = 6 - the engine says 2 and 3
+      // because it starts every head on ACE 0.
+      ok(r.status === 200 && L.slicer.basis === "loaded" && L.slicer.swaps === 5 && L.optimize.swaps === 6 && L.optimize.engine_swaps === 2 && L.layer.swaps === 6 && L.layer.engine_swaps === 3 && L.optimize.est_added_sec === 900, "re-check: as sliced 5, optimize 6 (engine 2), layer 6 (engine 3) from the loaded heads", L && { s: L.slicer.swaps, o: L.optimize.swaps, l: L.layer.swaps });
+      ok(JSON.stringify(r.body.start) === JSON.stringify({ 0: "1,0", 1: "1,1", 2: "1,2", 3: "1,3" }), "the re-check returns the start state it used", r.body.start);
+    }
 
     console.log("\n-- settings change the estimates --");
     r = await jpost("/api/multiace/settings", { swap_seconds: 120, default_plan: "layer" });
@@ -285,7 +341,7 @@ function gcode(o) {
     r = await jpost("/api/multiace/settings", { swap_seconds: 5 });
     ok(r.status === 400, "swap_seconds outside 30-600 is refused");
     pf = await preflight(FILE, 0);
-    ok(pf.job.result.report.estimates.slicer.est_added_sec === 600 && pf.job.result.report.estimates.optimize.est_added_sec === 240 && pf.job.result.default_plan === "layer", "the next check estimates at 120 s per swap and names the new default plan", pf.job.result.report.estimates.slicer);
+    ok(pf.job.result.report.estimates.slicer.est_added_sec === 600 && pf.job.result.report.estimates.optimize.est_added_sec === 720 && pf.job.result.default_plan === "layer", "the next check estimates at 120 s per swap (as sliced 5 x 120; optimize from the loaded heads 6 x 120) and names the new default plan", pf.job.result.report.estimates.slicer);
     await jpost("/api/multiace/settings", { swap_seconds: 150, default_plan: "optimize" });
 
     console.log("\n-- refusal matrix --");
@@ -350,10 +406,23 @@ function gcode(o) {
     ok(await waitState(0, "complete") === "complete", "fleet reports complete");
     ev = await check();
     ok(ev.some(e => e.type === "print.done" && e.filename === FILE), "print.done edge", ev.map(e => e.type));
-    r = await jget("/api/costing/prints?limit=10");
-    const row = (r.body && r.body.prints || []).find(x => x.file === FILE);
+    // costing writes the row asynchronously after print.done: wait for the row itself (rule 7), never a fixed sleep
+    let row = null;
+    for (let i = 0; i < 100 && !row; i++) {
+      r = await jget("/api/costing/prints?limit=10");
+      row = (r.body && r.body.prints || []).find(x => x.file === FILE && x.multiace) || null;
+      if (!row) await sleep(100);
+    }
     ok(!!row && row.multiace && row.multiace.plan === "slicer" && row.multiace.swaps === 5 && row.multiace.purge_g === 1.31 && row.multiace.est_added_sec === 750 && JSON.stringify(row.multiace.heads) === "[0,1,2,3]", "the ledger row says: via multiACE, as sliced, 5 swaps, 1.31 g purge", row && row.multiace);
     ok(!!row && row.seconds === 3600 && row.est_minutes === 194.5 && row.est_source === "slicer+multiace", "actual 3600 s kept; the estimate is the slicer's 182 min + 12.5 min of swaps, labelled", row && { s: row.seconds, e: row.est_minutes, src: row.est_source });
+    {
+      // By hand: 5.00 g of each colour at its roll's $/kg: 20, 25, 30, 22, 28 -> 0.10 + 0.13 + 0.15 + 0.11 + 0.14 = 0.63
+      // (each colour rounded to the cent first). The head-by-head deduction (no spool in any head) prices nothing.
+      const hd = row && row.material && row.material.heads || [];
+      ok(row && row.multiace.colours.length === 5 && row.multiace.colours.every(c => Number.isInteger(c.ace) && Number.isInteger(c.slot) && c.grams === 5), "the row lists each colour's ACE slot and grams", row && row.multiace.colours);
+      ok(row && row.material.source === "rolls" && row.material.cost === 0.63 && hd.length === 5 && hd.every(h => /^-20[1-5]$/.test(String(h.spool_id))), "material priced colour by colour from the matched rolls: $0.63", row && row.material);
+      ok(row && (!row.material.deduction_ignored || /colours are not heads/.test(row.material.deduction_ignored.why)) && row.material.source !== "deduction", "the head-based deduction never prices a multiACE row", row && row.material.deduction_ignored);
+    }
     moonA.state.printState = "standby"; moonA.state.printDuration = 0; moonA.state.filename = "";
     ok(await waitState(0, "standby") === "standby", "idle again");
     await check();
@@ -370,16 +439,36 @@ function gcode(o) {
     r = await jpost("/api/multiace/recheck", { token: TOKEN });
     ok(r.status === 200 && r.body.moves.optimize.length === 0 && r.body.stale_slicer === true && r.body.live_slots.length === live2.length, "re-check after the moves: optimize needs none, the as-sliced plan is flagged stale", r.body && { o: r.body.moves.optimize.length, stale: r.body.stale_slicer });
     r = await jpost("/api/multiace/print", { printer: 0, token: TOKEN, mode: "optimize" });
-    ok(r.status === 200 && r.body.swaps === 2 && r.body.est_added_sec === 300, "optimize starts: 2 swaps, +300 s", r.body);
+    ok(r.status === 200 && r.body.swaps === 6 && r.body.est_added_sec === 900, "optimize starts, estimated from the heads as they are at print time: 6 swaps (4 first loads off ACE 1 + the engine's 2), +900 s", r.body);
     pj = await pollJob(r.body.jobId);
     ok(pj.done && !pj.error && ma.state.prints.length === 2 && ma.state.prints[1].mode === "optimize" && !ma.state.prints[1].remap, "the engine got mode 'optimize' (it recomputes the layout itself; no remap)", ma.state.prints[1] && ma.state.prints[1].body);
     moonA.state.printState = "standby"; moonA.state.filename = "";
     ok(await waitState(0, "standby") === "standby", "idle again");
     r = await jpost("/api/multiace/print", { printer: 0, token: TOKEN, mode: "slicer", remap: { 1: 4, 2: "x" } });
     ok(r.status === 400, "a malformed remap is refused");
-    r = await jpost("/api/multiace/print", { printer: 0, token: TOKEN, mode: "slicer", remap: { 1: 4, 2: 1 } });
-    pj = await pollJob(r.body.jobId);
-    ok(pj.done && ma.state.prints.length === 3 && JSON.stringify(ma.state.prints[2].remap) === JSON.stringify({ 1: 4, 2: 1 }), "an as-sliced print with a manual remap passes it to the engine verbatim", ma.state.prints[2] && ma.state.prints[2].remap);
+    {
+      // the slot picker: the engine gets the FULL as-sliced map, picks applied (derived from the report, rule 7)
+      // a fresh check first: the slots were relabelled to the optimize layout above, so the old as-sliced match is stale (and is refused)
+      const pfP = await preflight(FILE, 0), repP = pfP.job.result.report, TOKP = repP.token;
+      const pick = { 1: 4, 2: 1 };
+      const want = {}; for (const m of repP.plans.slicer.mapping) want[String(m.t)] = m.slot.ace * 4 + m.slot.slot;
+      Object.assign(want, { 1: 4, 2: 1 });
+      r = await jpost("/api/multiace/recheck", { token: TOKP, remap: pick });
+      ok(r.status === 200 && r.body.rows.slicer.find(x => x.t === 1).tier === "manual" && r.body.rows.slicer.find(x => x.t === 1).ace === 1 && r.body.rows.slicer.find(x => x.t === 1).slot === 0 && JSON.stringify(r.body.remap) === JSON.stringify(want) && r.body.estimates.slicer.basis === "loaded", "re-check with a pick: the row turns 'manual', the full map and a fresh estimate come back", r.body && { rows: r.body.rows, remap: r.body.remap });
+      const keep = ma.state.live_slots.find(x => x.ace === 0 && x.slot === 1).material;
+      ma.state.live_slots.find(x => x.ace === 0 && x.slot === 1).material = "PETG";
+      r = await jpost("/api/multiace/print", { printer: 0, token: TOKP, mode: "slicer", remap: pick });
+      ok(r.status === 400 && /PETG/.test(r.body.error) && ma.state.prints.length === 2, "a pick of a slot holding another material is refused before anything is sent", r.body);
+      ma.state.live_slots.find(x => x.ace === 0 && x.slot === 1).material = keep;
+      r = await jpost("/api/multiace/print", { printer: 0, token: TOKP, mode: "slicer", remap: { 1: 14 } });
+      ok(r.status === 400 && /empty or unlabelled/.test(r.body.error), "a pick of an unlabelled slot is refused", r.body);
+      r = await jpost("/api/multiace/print", { printer: 0, token: TOKP, mode: "slicer", remap: pick });
+      pj = await pollJob(r.body.jobId);
+      ok(pj.done && ma.state.prints.length === 3 && JSON.stringify(ma.state.prints[2].remap) === JSON.stringify(want), "an as-sliced print with picks sends the engine the full map", ma.state.prints[2] && ma.state.prints[2].remap);
+      r = await jget("/api/multiace/sent");
+      const c1 = r.body.sent[0].colours.find(x => x.t === 1);
+      ok(r.body.sent[0].remap === 2 && c1 && c1.ace === 1 && c1.slot === 0 && c1.grams > 0 && r.body.sent[0].swaps_basis === "loaded", "the sent record lists each colour's slot and grams (for costing), and the swap basis", r.body.sent[0].colours);
+    }
     moonA.state.printState = "standby"; moonA.state.filename = "";
     ok(await waitState(0, "standby") === "standby", "idle again");
     r = await jpost("/api/multiace/print", { printer: 0, token: "0".repeat(32), mode: "slicer" });

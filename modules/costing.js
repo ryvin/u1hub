@@ -230,8 +230,14 @@ function costOf(print, rates) {
   const m = p.material || {};
   const grams = num(m.grams);
   const material = { grams, grams_source: grams != null ? (m.grams_source || m.source || null) : null, cost: null, source: null, partial: !!m.partial };
-  if (m.source === "deduction") {
-    material.source = "deduction";
+  // A deduction that took nothing off any roll and priced nothing (no spool
+  // recorded in any head) carries no price; the row is priced like one with no
+  // deduction at all rather than left blank.
+  // A roll that WAS deducted but has no price stays blank (never the flat rate
+  // in disguise); only an explicit 0 g deducted counts as empty.
+  const emptyDeduction = m.source === "deduction" && num(m.cost) == null && num(m.deducted_g) === 0;
+  if ((m.source === "deduction" && !emptyDeduction) || m.source === "rolls") {
+    material.source = m.source;
     material.cost = num(m.cost) != null ? r2(m.cost) : null;
     material.partial = !!m.partial || material.cost == null;
   } else if (grams != null) {
@@ -263,7 +269,8 @@ function costOf(print, rates) {
     energy = { kwh: r3(kwh), cost: rateCost(kwh), source: sug ? "suggested" : "watts", watts: watts.v, watts_source: watts.src, rate_source: rate.src };
   }
   const blanks = [];
-  if (material.cost == null) blanks.push(material.source === "deduction" ? "material (a loaded roll has no price)" : (grams == null ? "material (no grams)" : "material (no rate)"));
+  if (emptyDeduction) material.deduction_empty = true;
+  if (material.cost == null) blanks.push(material.source === "deduction" || material.source === "rolls" ? "material (a loaded roll has no price)" : (grams == null ? "material (no grams)" : "material (no rate)"));
   if (!machine) blanks.push(hours == null ? "machine (no time)" : "machine (no printer rates)");
   if (!energy) blanks.push(hours == null ? "energy (no time)" : "energy (no watts)");
   else if (energy.cost == null) blanks.push("energy (no $/kWh)");
@@ -584,7 +591,7 @@ function register(ctx) {
     row.material = row.material || { grams: null, cost: null, source: null, partial: row.outcome !== "done", heads: [] };
     if (row.material.grams == null && meta.grams != null) {
       const prog = num(row.material.progress);
-      Object.assign(row.material, { grams: r2(meta.grams * (prog != null ? prog : 1)), source: row.material.source === "deduction" ? "deduction" : "printer-meta", grams_source: "printer-meta",
+      Object.assign(row.material, { grams: r2(meta.grams * (prog != null ? prog : 1)), source: (row.material.source === "deduction" || row.material.source === "rolls") ? row.material.source : "printer-meta", grams_source: "printer-meta",
         material: meta.material || null, density: meta.density, density_assumed: !!meta.density_assumed });
       changed = true;
     }
@@ -604,7 +611,7 @@ function register(ctx) {
       const mat = row.material.material || (meta && meta.material) || materialOf(job.metadata && job.metadata.filament_type) || null;
       const conv = mmToGrams(job.filament_used, mat);
       if (conv) {
-        Object.assign(row.material, { grams: conv.grams, source: row.material.source === "deduction" ? "deduction" : "history", grams_source: "history",
+        Object.assign(row.material, { grams: conv.grams, source: (row.material.source === "deduction" || row.material.source === "rolls") ? row.material.source : "history", grams_source: "history",
           material: conv.material, density: conv.density, density_assumed: conv.assumed, filament_mm: r2(job.filament_used) });
         changed = true;
       }
@@ -647,12 +654,48 @@ function register(ctx) {
   const START = new Map();       // printer idx -> { file, at }
   const STASH = new Map();       // "idx:file" -> deduction rec that arrived before its row
   const pendKey = (slug, name) => String(slug || "u1") + ":" + String(name || "");
+  // A multiACE print's colours are not its heads: the head-by-head deduction
+  // (resources.js, T1-T4 against whatever spool each head records) names the
+  // wrong rolls for a >4-colour job, so it is kept on the row for the record
+  // and never prices it. priceColours below does that instead.
   function applyDeduction(row, rec) {
+    if (row.multiace) {
+      row.material = { ...(row.material || {}), deduction_ignored: { grams: num(rec.grams), cost: num(rec.cost), misses: rec.misses || [], why: "multiACE: colours are not heads" } };
+      row.deduction_at = rec.at;
+      return;
+    }
     row.material = { ...(row.material || {}), cost: num(rec.cost), source: "deduction",
       partial: !!rec.cost_partial || (rec.misses || []).length > 0 || num(rec.cost) == null || row.outcome !== "done",
       deducted_g: num(rec.grams), heads: (rec.entries || []).map(e => ({ head: e.head, spool_id: e.spool_id, color_name: e.color_name, grams: e.grams, cost: e.cost })),
       misses: rec.misses || [] };
     row.deduction_at = rec.at;
+  }
+  // Each colour of a multiACE print at the price of the roll the shelf
+  // matches for it (resources.priceFor: the rollup's own colour matcher). The
+  // row is priced from the rolls only when EVERY colour with grams found a
+  // priced roll; otherwise it keeps the flat / slicer price and the per-colour
+  // list says which colour had no price. Never a guessed number.
+  function priceColours(row) {
+    const cols = (row.multiace && row.multiace.colours) || [];
+    if (!cols.length) return;
+    const price = ctx.use("resources.priceFor");
+    const found = typeof price === "function" ? (price(cols.map(c => ({ hex: c.hex, material: c.material }))) || []) : [];
+    const heads = cols.map((c, i) => {
+      const p = found[i] || null;
+      const g = num(c.grams);
+      const cost = p && num(p.cost_per_g) != null && g != null ? r2(g * p.cost_per_g) : null;
+      return { t: c.t, hex: c.hex, material: c.material, ace: c.ace, slot: c.slot, grams: g, spool_id: p ? p.spool_id : null, spool: p ? p.name : null, cost };
+    });
+    // A colour whose grams are unknown cannot be priced, so it blocks the
+    // rolls price (null is not 0); a colour with 0 g is simply not used.
+    const counted = heads.filter(h => h.grams == null || h.grams > 0);
+    const priced = counted.filter(h => h.cost != null);
+    row.material = { ...row.material, heads };
+    if (counted.length && priced.length === counted.length) {
+      const share = row.outcome === "done" ? 1 : (num(row.material.progress) != null ? row.material.progress : null);
+      const cost = r2(priced.reduce((a, h) => a + h.cost, 0) * (share == null ? 1 : share));
+      row.material = { ...row.material, cost, source: "rolls", partial: row.outcome !== "done" };
+    }
   }
   function jobOf(idx, name) {
     const get = ctx.use("dispatch.jobs");
@@ -711,21 +754,23 @@ function register(ctx) {
     // A pending assignment is spent by the print that FINISHES; a cancelled
     // attempt lands in the project too but leaves the assignment for the retry.
     if (outcome === "done" && row.project_id) { delete P.pending[key]; saveP(); }
-    const stash = STASH.get(idx + ":" + name);
-    if (stash && Date.now() - stash.at < STASH_MS) { applyDeduction(row, stash.rec); STASH.delete(idx + ":" + name); }
     // Fork module multiace: a print started through the printer's multiACE
     // preflight carries the plan, its swap count and the Hub's purge-top-up
     // estimate on the row (additive; absent when the module is off or the
     // print went the stock way). The estimated swap time joins est_minutes
     // because that is the fallback when no actual duration exists; actual
-    // seconds already contain the swaps.
+    // seconds already contain the swaps. Attached BEFORE any deduction, which
+    // applyDeduction then keeps out of the price (see there).
     try {
       const mj = ctx.use("multiace.jobinfo"), mi = mj ? mj(idx, name) : null;
       if (mi) {
-        row.multiace = { plan: mi.plan, swaps: mi.swaps, est_added_sec: mi.est_added_sec, purge_mm: mi.purge_mm, purge_g: mi.purge_g, heads: mi.heads || [], sent_at: mi.ts };
+        row.multiace = { plan: mi.plan, swaps: mi.swaps, swaps_basis: mi.swaps_basis || null, est_added_sec: mi.est_added_sec, purge_mm: mi.purge_mm, purge_g: mi.purge_g, heads: mi.heads || [], colours: Array.isArray(mi.colours) ? mi.colours : [], sent_at: mi.ts };
         if (num(row.est_minutes) > 0 && num(mi.est_added_sec) > 0) { row.est_minutes = r2(row.est_minutes + mi.est_added_sec / 60); row.est_source = (row.est_source || "slicer") + "+multiace"; }
+        priceColours(row);
       }
-    } catch {}
+    } catch (e) { ctx.hublog("warn", "costing: multiACE pricing for " + name + " - " + e.message); }
+    const stash = STASH.get(idx + ":" + name);
+    if (stash && Date.now() - stash.at < STASH_MS) { applyDeduction(row, stash.rec); STASH.delete(idx + ":" + name); }
     L.prints.push(row);
     if (L.prints.length > LEDGER_MAX) L.prints.splice(0, L.prints.length - LEDGER_MAX);
     saveL();

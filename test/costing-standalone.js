@@ -108,6 +108,17 @@ function pureChecks() {
   c = C.costOf(Cu, R);
   ok(c.material.cost === null && c.material.partial === true && c.material.source === "deduction", "KNOWN-BAD unpriced roll: material cost is null and partial, never the flat rate in disguise", c.material);
   ok(c.blanks.some(b => /roll has no price/.test(b)) && c.direct === r2(c.machine.cost + c.energy.cost), "…and the blank is named; direct sums only what is known", c);
+  // Live 2026-10-06: five rows (snapdragon 4, davinci 1) whose deduction found no spool in any head - 0 g taken,
+  // nothing priced - showed a blank material cost although the flat rate / slicer cost was there.
+  const Empty = { id: "E", printer_id: 0, outcome: "done", seconds: 1800, material: { grams: 15.86, cost: null, source: "deduction", deducted_g: 0, partial: true, slicer_cost: 0.5, misses: ["T1: no spool recorded in that head"] } };
+  c = C.costOf(Empty, R);
+  ok(c.material.cost === 0.32 && c.material.source === "flat" && c.material.deduction_empty === true, "a deduction that took 0 g and priced nothing falls back to the flat $/g (15.86 g x $0.02 = 0.32), flagged deduction_empty", c.material);
+  c = C.costOf(Empty, {});
+  ok(c.material.cost === 0.5 && c.material.source === "slicer", "...and to the slicer's cost when no flat rate is set", c.material);
+  c = C.costOf({ ...Empty, material: { ...Empty.material, deducted_g: 12 } }, R);
+  ok(c.material.cost === null && c.material.source === "deduction", "a deduction that DID take grams but has no price stays blank (the rule above)", c.material);
+  c = C.costOf({ id: "M", printer_id: 0, outcome: "done", seconds: 1800, material: { grams: 15.86, cost: 0.41, source: "rolls", partial: false } }, R);
+  ok(c.material.cost === 0.41 && c.material.source === "rolls" && c.material.partial === false, "a multiACE row priced colour by colour from the matched rolls keeps that price", c.material);
   c = C.costOf({ ...B, printer_id: 1 }, R);
   ok(c.energy === null && c.blanks.some(b => /energy \(no watts\)/.test(b)), "KNOWN-BAD no watts for the printer: energy is null, not zero", c);
   ok(c.machine && c.machine.basis === "depreciation" && c.machine.per_hour === 0.22, "…depreciation alone when no maintenance reserve is set", c.machine);

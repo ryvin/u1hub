@@ -29,8 +29,15 @@ The three plans mean different things, and the card says so:
 
 - **As sliced** (`slicer`): the engine's tier-major match of each file colour onto the
   slots that are loaded (`exact_hex`, `name_*`, `fuzzy`, then same-material `fallback`,
-  `duplicate`, `no_slot`). Prints with the spools where they are. A row can be reassigned
-  (`remap`) and goes to the engine verbatim.
+  `duplicate`, `no_slot`). Prints with the spools where they are. On the card each row has
+  a **slot picker** (loaded slots of the same material only): a pick re-plans the rows and
+  the estimate (`/recheck` with `remap`, tier `manual`, shown as "picked"), and Print sends
+  `remap`. The engine takes `remap` as a **full replacement** of its own matching
+  (davinci's `/api/preflight/pysrc`, `preflight_core`: with `remap_override` it never calls
+  `match_colors_to_slots`; `{T: ace*4+slot}`, identity entries dropped), so the Hub sends
+  every colour's slot: the pick where there is one, the engine's match elsewhere. A pick
+  of an empty / unlabelled slot or of another material is refused (400) before anything is
+  sent. This replaces editing the gcode's colour lines by hand (the 2026-10-05 pink copy).
 - **Optimize** / **Layer**: a *proposed loadout*. In multi mode the engine's rewrite for
   these modes derives the slot from the head assignment alone (`ace = per-head counter,
   slot = head`, `preflight_core.rewrite_pipeline`) and never consults the live slots.
@@ -62,8 +69,14 @@ in Settings (on by default); the suite proves the commands land before the print
 
 ### Estimates (Hub-side, labelled as estimates)
 
-- **Added time** = the engine's swap count × `swap_seconds` (Settings, default 150 s,
-  allowed 30–600; upstream's README says a swap takes "up to 3 minutes").
+- **Added time** = swaps × `swap_seconds` (Settings, default 150 s, allowed 30–600;
+  davinci measured 192 s on 2026-10-06 and is set to that). The swap count is the Hub's
+  walk **from what each head holds now** (`ace.head_source`, `basis: "loaded"`): the
+  engine's own count starts every head on ACE 0, so it over-counts when the heads already
+  hold the job's spools and under-counts a proposed plan's first loads (davinci, history
+  000131: engine 5, real 1, the rest logged "already on ACE 1 / Slot n - skipping").
+  With no `head_source` the engine's count stands (`basis: "engine"`); `engine_swaps`
+  is kept beside it either way. Check, re-check and print each re-read the heads.
 - **Purge top-up**: the engine stamps `ACE_SET_PURGE LENGTH=mm` before each swap with
   `mm = clamp(0.45 × flush_matrix[from][to] / 2.405, 40, 150)` from the file's own
   `flush_volumes_matrix` (raw mm³, `flush_multiplier` inherited upward only), on top of
@@ -94,7 +107,10 @@ A print started through this route is recorded in `multiace.json` (plan, swaps,
 published as `multiace.jobinfo(printer, file)`. `modules/costing.js` copies it onto the
 ledger row as `row.multiace` and, because `est_minutes` is the fallback when no actual
 duration exists, adds the estimated swap time to it (`est_source: "slicer+multiace"`).
-Actual seconds already contain the swaps. Purge grams are recorded, not priced: the
+Actual seconds already contain the swaps. The send record also lists every colour's
+ACE slot and grams (`colours`), so costing prices the print colour by colour from the
+matched rolls when they have prices (docs/costing.md, fallback chain step 1) and ignores
+the head-by-head deduction, whose heads are not this print's colours. Purge grams are recorded, not priced: the
 slicer's per-slot grams already include wipe-tower purge (`parser.js`), and a top-up
 priced twice would be worse than one shown once.
 
@@ -109,8 +125,8 @@ with their plan, swaps and purge estimate.
 - `POST /api/multiace/settings {swap_seconds, default_plan, identity_map}`
 - `GET /api/multiace/loadout?printer=N[&refresh=1]` → live slots, head_ctx, head_source, Air Print, manual; 404 for a non-multiACE printer
 - `POST /api/multiace/preflight {file, printer, type}` → `{ jobId, size, link }`; the job's `result` is `{ report, facts, link, default_plan }` or `{ tooBig, detail, inbox, link }`
-- `POST /api/multiace/recheck {token}` → `{ live_slots, moves, stale_slicer }`
-- `POST /api/multiace/print {printer, token, mode, remap?, bed_mesh?, camera?, flow_cal?}` → `{ jobId, swaps, est_added_sec, purge_g, heads }`; 409 `needsMoves` with the list
+- `POST /api/multiace/recheck {token, remap?}` → `{ live_slots, moves, estimates, rows, remap, start, stale_slicer }`; `remap` = the picks `{T: ace*4+slot}`, answered with the re-planned as-sliced `rows.slicer`, its estimate and the full map; 400 `remap_errors` for a bad pick
+- `POST /api/multiace/print {printer, token, mode, remap?, bed_mesh?, camera?, flow_cal?}` → `{ jobId, swaps, est_added_sec, purge_g, heads }`; `remap` (as sliced only) = the picks, sent to the engine as the full map; 409 `needsMoves` with the list
 - `POST /api/multiace/inbox {file, printer, type}` → `{ jobId, link }`
 - `GET /api/multiace/job?job=` → `{ phase, sent, total, done, error, result, engine:{stage, percent} }`
 - `GET /api/multiace/sent` → the last 100 records

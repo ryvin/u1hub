@@ -976,6 +976,8 @@ function register(ctx) {
   });
 
   ctx.provide("resources.rollup", q => compute(q || {}));
+  // fork (ryvin/u1hub): modules/costing.js prices a multiACE print's colours from the roll the shelf matches (same matcher as the rollup); cost_per_g null when that roll has no price
+  ctx.provide("resources.priceFor", list => { const shelf = readShelf(ctx.baseDir, store, null); return (list || []).map(c => { const sp = matchSpool(normHex(c.hex), String(c.material || ""), shelf, store.state.color_map || {}, (store.state.settings || {}).match_de_max).spool; return !sp ? null : { spool_id: sp.id, name: [sp.brand, sp.material_variant || sp.material, sp.color_name].filter(Boolean).join(" "), cost_per_g: sp.cost_per_roll != null ? sp.cost_per_roll / (sp.net_weight_g > 0 ? sp.net_weight_g : 1000) : null }; }); });
 }
 
 module.exports = { register, buyLink, asinOf, isAmazonUrl, affiliateConf, DEFAULT_AMAZON_TAG,
