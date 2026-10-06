@@ -101,6 +101,23 @@ async function main() {
     // parser.estMinutes("1h 2m 3s") = 63 (it rounds the seconds up; measured 2026-10-06)
     ok(sp && sp.source === "plate-gcode" && sp.grams === 4.5 && sp.minutes === 63 && sp.plates === 1, "embedded plate gcode wins: exact 4.50 g, 63 min (parser rounds 1h 2m 3s up)", sp);
   }
+  const CAL = require("../modules/estimate/calibrate.js");
+  {
+    console.log("\n-- time model / calibration --");
+    const pts = [5, 10, 20, 40, 80, 160, 320].map(g => [g, 5 * Math.pow(g, 0.8)]);
+    const f = CAL.fitPower(pts);
+    ok(f && Math.abs(f.a - 5) < 1e-6 && Math.abs(f.b - 0.8) < 1e-6 && f.err < 1e-9 && f.n === 7, "log-log fit recovers minutes = 5 g^0.8", f);
+    ok(CAL.fitPower([[10, 2000]].concat(pts)).n === 7, "a point outside 0.3-30 min/g is trimmed before fitting");
+    ok(CAL.familyOf("0.20 Standard @Snapmaker U1 - HueForge") === "hueforge" && CAL.familyOf("... - Flexi-tuned") === "flexi" && CAL.familyOf("DisplayBoxes") === "display" && CAL.familyOf("") === "standard", "profile families from print_settings_id");
+    const ff = CAL.fitFor({}, "flexi", "single");
+    ok(ff.source === "fallback" && ff.a === CAL.DEFAULT_FITS["standard-single"].a, "an unknown family/mode falls back to standard of the same mode, labelled", ff);
+    ok(CAL.fitFor({}, "hueforge", "multi").source === "default", "a measured default is used when no live fit exists");
+    ok(CAL.fitFor({ "standard-single": { a: 9, b: 0.5, n: 19, err: 0.1 } }, "standard", "single").source === "default", "a live fit with n < 20 is not trusted");
+    ok(CAL.fitFor({ "standard-single": { a: 9, b: 0.5, n: 20, err: 0.1 } }, "standard", "single").a === 9, "a live fit with n >= 20 is used");
+    ok(CAL.minutesFrom(100, { a: 5, b: 0.8 }) === Math.round(5 * Math.pow(100, 0.8)), "minutesFrom applies the fit");
+    const kk = CAL.fitK([[10, 12], [20, 24], [5, 6], [40, 48]]);
+    ok(kk && kk.k === 1.2 && kk.err === 0 && kk.n === 4, "grams k = median(actual/predicted) = 1.2", kk);
+  }
 
   // ---- the booted Hub ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-"));
