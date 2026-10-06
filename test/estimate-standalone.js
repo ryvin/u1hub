@@ -167,6 +167,27 @@ async function main() {
     const bm = bare.pricing ? bare.pricing.methods.find(m => m.key === "markup") : null;
     ok(bare.blanks.length > 0 && (!bm || (bm.price === null && /Settings/.test(bm.note))), "no rates: blanks named, markup says 'set a markup % in Settings'", bare);
   }
+  const REP = require("../modules/estimate/report.js");
+  {
+    console.log("\n-- reports --");
+    const V = { name: "=cmd|' /C calc'!A0 <b>.stl", created: Date.UTC(2026, 9, 6), source_label: "geometry ±33 %", qty: 2, material: "PLA", preset: "standard",
+                print: { grams: 7.22, minutes: 25, plates: 1, supports_needed: "no", colours: 1, band_pct: 33 }, model: { size_mm: [20, 20, 20], volume_cm3: 8 },
+                cost: { cost: 1.5, material: 0.14, machine: 0.1, energy: 0.02, labor: { cost: 1, minutes: 2 }, failure: 0.01, overhead: 0.2, blanks: [] },
+                pricing: { methods: [{ key: "markup", label: "Cost + markup", price: 3, per_piece: 1.5, gross: 3.3, note: "100% on cost" }], breaks: [{ qty: 1, each: 3 }, { qty: 10, each: 2.5 }] },
+                recommended: { price: 3, each: 1.5, method: "markup", rush: 1 }, fits: ["snapdragon"], valid_days: 14 };
+    const q = REP.html(V, "quote"), i = REP.html(V, "internal");
+    ok(!/<b>\.stl/.test(q) && q.includes("&lt;b&gt;") && !/<script/i.test(q), "names are escaped, no scripts");
+    ok(!/Overhead|Machine|Electricity/.test(q) && /Overhead/.test(i) && /Machine/.test(i), "the quote hides internal cost layers; the internal view shows them");
+    ok(/\$3\.00/.test(q) && /valid for 14 days/i.test(q), "the quote shows the price and how long it is valid");
+    const c = REP.csv(V);
+    ok(c.split("\r\n")[0] === "section,item,value" && c.includes("'=cmd"), "CSV header, and a formula-looking cell is neutralised with a leading quote", c.slice(0, 300));
+    const zx = zIndex(REP.xlsx(V)), names = zx.entries.map(e => e.name);
+    ok(["[Content_Types].xml", "xl/workbook.xml", "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"].every(n => names.includes(n)), "XLSX holds the workbook and two sheets", names);
+    const part = async n => (await zx.content(zx.entries.find(e => e.name === n))).toString();
+    ok(/name="Quote"/.test(await part("xl/workbook.xml")) && /name="Breakdown"/.test(await part("xl/workbook.xml")), "sheets are named Quote and Breakdown");
+    const s1 = await part("xl/worksheets/sheet1.xml");
+    ok(s1.includes("&apos;=cmd") && !/Overhead/.test(s1) && /Overhead/.test(await part("xl/worksheets/sheet2.xml")), "XLSX: the formula cell is neutralised; the Quote sheet hides internals, Breakdown has them");
+  }
 
   // ---- the booted Hub ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-"));
