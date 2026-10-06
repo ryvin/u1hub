@@ -148,6 +148,38 @@ run (`U1HUB_MULTIACE_FALSIFY=1` flips the busy refusal) going red, the sibling f
 suites, the full harness, `scripts/check-core.js`, `scripts/check-index-js.js`, and a
 Playwright pass over the card flow on a throwaway Hub with the mocks.
 
+**Live gate, davinci, 2026-10-05/06** (multiACE web 1.00.1b, 2 ACEs; evidence: the
+Hub's `/api/multiace/job` results, Moonraker history job `000131`, and
+`klippylogs/klippy.log` read over `/server/files/logs/`):
+
+- **Preflight (item 1):** a 22,198,593-byte 5-colour Snapmaker-Orca file
+  (`Dragon Dynasty_Front_100x400_PLA_3h1m.gcode`) went through
+  `/multiace/api/preflight` with HTTP 200 and a token. The report carried `plans`,
+  `mapping[].tier` (`name_exact`, `exact_hex`, `fallback`), `events`, `nozzles`
+  and `nozzles_mixed`, the shape the mock follows. The file was 22 MB, so the
+  413/inbox path was not needed at this size (item 2, partly).
+- **Colour override without remap:** the card has no remap control, so to send a
+  silver slot to the loaded pink, the owner's copy
+  `…_3h1m_pink.gcode` changed only the three header colour lines
+  (`extruder_colour`, `filament_colour`, `filament_multi_colors`) from
+  `#A6A6A6` to `#F55A7C`. The re-check mapped T1 `exact_hex` to ACE 2 slot 1.
+- **First real print (item 3), owner-started, As sliced:** completed. The identity
+  map was accepted. The engine uploaded under the original name: the costing row
+  for history job `000131` carries `row.multiace`, outcome `done`, 11,416 s
+  actual.
+- **Measured swaps:** only **one** physical swap happened (log
+  `multiace_event swap_imminent` 03:09:58.056 → `swap_done` 03:13:09.910, **192 s**).
+  The other tool changes logged `Swap: HEAD n already on ACE 1 / Slot n -
+  skipping`, because davinci's heads were already loaded from ACE 2. The
+  as-sliced estimate said 5 swaps and +750 s. The estimator counts the initial
+  head loads as swaps and so over-counts when the heads already hold the right
+  spools. `swap_seconds` was set to 192 from this measurement.
+- **Wall time vs print time:** 302 min total vs 190 min printing. The gap is the
+  file's own slicer pause at layer 16 (`;PAUSE_PRINT` → `M600`, line 756,662;
+  klippy `current_line_gcode=M600`, resumed 05:07:23), not multiACE.
+- **Seen, recovered:** `ACE 1 comms lost (v1 reader comms lost) - reconnecting` at
+  05:14:01, six minutes before the end. The print finished normally.
+
 **Still UNVERIFIED (needs the real printer, idle, and the owner's hand):**
 
 1. The first real preflight: `POST http://192.168.1.136/multiace/api/preflight` with a
