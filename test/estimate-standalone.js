@@ -194,6 +194,9 @@ async function main() {
   const gdir = path.join(tmp, "gcode"); fs.mkdirSync(gdir);
   const moon = createMock("u1"); const port = await moon.listen(0);
   fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: gdir, port: PORT, printers: [{ name: "U1-mock", url: "http://127.0.0.1:" + port }] }, null, 2));
+  // one earlier print of a cube, and its gcode in the library, so "printed before" has something to find
+  fs.writeFileSync(path.join(tmp, "prints.json"), JSON.stringify({ prints: [{ id: "p1", at: 1, printer_id: 0, printer: "U1-mock", type: "u1", file: "cube_PLA_10m.gcode", outcome: "done", seconds: 600, seconds_source: "actual", material: { grams: 4, source: "slicer", grams_source: "slicer" }, counted: true, pieces: 1 }] }));
+  fs.writeFileSync(path.join(gdir, "cube_PLA_10m.gcode"), "; HEADER_BLOCK_START\n; max_z_height: 20.00\n; HEADER_BLOCK_END\nG1 X1\n; filament used [g] = 4.00\n; total filament used [g] = 4.00\n; estimated printing time (normal mode) = 10m 0s\n; CONFIG_BLOCK_START\n; filament_type = PLA\n; filament_colour = #FF0000\n; print_settings_id = 0.20 Standard\n; CONFIG_BLOCK_END\n");
   try {
     await startHub(tmp);
     console.log("\n-- the module boots --");
@@ -204,6 +207,61 @@ async function main() {
     const info = await jget("/api/estimate/info");
     ok(info.status === 200 && info.body && info.body.fork === "ryvin/u1hub" && info.body.max_mb === 200, "GET /api/estimate/info: fork, 200 MB cap", info.body);
     // ---- booted sections ----
+    const up = async (name, buf, id) => { const r = await fetch(HUB + "/api/estimate/upload" + (id ? "?id=" + id : ""), { method: "POST", headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(name) }, body: buf }); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; };
+    const waitJob = async j => { for (let i = 0; i < 400; i++) { const r = await jget("/api/estimate/job?job=" + j); if (r.body && r.body.done) return r.body; await sleep(50); } return { error: "timeout" }; };
+    console.log("\n-- upload -> estimate --");
+    let r = await up("cube.stl", binStl(cubeTris(20)));
+    ok(r.status === 200 && r.body && r.body.id && r.body.jobId, "upload an STL -> estimate id and job", r.body);
+    const ID = r.body && r.body.id;
+    const j1 = r.body && r.body.jobId ? await waitJob(r.body.jobId) : { error: "no job" };
+    ok(!j1.error, "analysis job finishes", j1);
+    let v = (await jget("/api/estimate/" + ID)).body || {};
+    ok(v.files && v.files.length === 1 && v.files[0].facts.volume_cm3 === 8 && v.print.grams === 3.61 && v.source === "geometry" && /geometry/.test(v.source_label), "the cube estimate: 3.61 g from geometry, labelled", v.print);
+    ok(v.print && v.print.minutes === Math.round(4.81 * Math.pow(3.61, 0.836)) && v.print.band_pct === 33, "time from the standard-single default fit, with its ±33 % band", v.print);
+    ok(Array.isArray(v.fits) && v.fits.includes("U1-mock"), "a 20 mm cube fits the U1", v.fits);
+    ok(ID && fs.readdirSync(path.join(tmp, "estimates", ID)).every(n => !/cube/.test(n)), "files are stored by id, never by the uploaded name", ID && fs.readdirSync(path.join(tmp, "estimates", ID)));
+    ok(v.candidates && v.candidates.length === 1 && v.candidates[0].kind === "printed" && v.candidates[0].size_check === "same" && v.candidates[0].actual_minutes === 10 && v.sources_available.includes("printed"), "printed before: the cube family, 20 mm in the gcode too, actual 10 min", v.candidates);
+    r = await jpost("/api/estimate/" + ID + "/source", { source: "printed", key: v.candidates && v.candidates[0] && v.candidates[0].key });
+    ok(r.status === 200 && r.body.source === "printed" && r.body.print.minutes === 10 && r.body.print.grams === 4 && /printed before/.test(r.body.source_label), "use the earlier print: 10 min, 4 g, labelled", r.body && r.body.print);
+    r = await jpost("/api/estimate/" + ID + "/source", { source: "geometry" });
+    r = await jpost("/api/estimate/" + ID + "/inputs", { qty: 4, infill: 1 });
+    ok(r.status === 200 && r.body.print.grams === 9.92 && r.body.inputs.qty === 4 && r.body.cost.grams === 39.68, "inputs recompute without a re-upload: solid 9.92 g each, qty 4 = 39.68 g", r.body && { print: r.body.print, cost_g: r.body.cost && r.body.cost.grams });
+    r = await jpost("/api/estimate/" + ID + "/inputs", { qty: 0 });
+    ok(r.status === 400 && /qty/.test(r.body.error), "a bad input is refused and named", r.body);
+    r = await jpost("/api/estimate/" + ID + "/source", { source: "sliced" });
+    ok(r.status === 400, "an STL has no slice info: source 'sliced' is refused", r.status);
+    r = await up("evil.exe", Buffer.from("MZ"));
+    ok(r.status === 400 && /stl|3mf/i.test(r.body.error), "a non-STL/3MF upload is refused", r.body);
+    r = await up("bad.stl", Buffer.from("solid x\nendsolid x\n"));
+    const bj = r.body && r.body.jobId ? await waitJob(r.body.jobId) : { error: "no job" };
+    ok(/no triangles/i.test(bj.error || ""), "an empty STL ends its job with the reason", bj);
+    console.log("\n-- 3MF with slice info --");
+    const tmf = ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from('<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><object id="1" type="model"><mesh><vertices>'
+      + [[0,0,0],[20,0,0],[20,20,0],[0,20,0],[0,0,20],[20,0,20],[20,20,20],[0,20,20]].map(p => '<vertex x="' + p[0] + '" y="' + p[1] + '" z="' + p[2] + '"/>').join("")
+      + '</vertices><triangles>' + [[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]].map(t => '<triangle v1="' + t[0] + '" v2="' + t[1] + '" v3="' + t[2] + '"/>').join("")
+      + '</triangles></mesh></object></resources><build><item objectid="1"/></build></model>')), ZIP.makeEntry("Metadata/slice_info.config", Buffer.from(SI2))]);
+    r = await up("box.3mf", tmf);
+    const j3 = r.body && r.body.jobId ? await waitJob(r.body.jobId) : { error: "no job" };
+    v = (await jget("/api/estimate/" + (r.body && r.body.id))).body || {};
+    ok(!j3.error && v.files && v.files[0].facts.volume_cm3 === 8 && v.files[0].sliced.grams === 20 && v.sources_available.includes("sliced"), "the 3MF is measured and its slice info read", { j3, f: v.files && v.files[0] });
+    r = await jpost("/api/estimate/" + v.id + "/source", { source: "sliced" });
+    ok(r.status === 200 && r.body.print.grams === 20 && /file's slice/.test(r.body.source_label) && r.body.print.minutes === Math.round(6.403 * Math.pow(20, 0.840)), "slice-info source: 20 g from the file, time from the standard-multi fit (2 filaments)", r.body && r.body.print);
+    console.log("\n-- save / list / reports --");
+    r = await jpost("/api/estimate/" + ID + "/save", { note: "test" });
+    ok(r.status === 200 && r.body.saved === true, "save");
+    r = await jget("/api/estimate");
+    ok(r.body && r.body.saved.some(s => s.id === ID), "the saved list carries it", r.body);
+    for (const [fmt, ct] of [["pdf", "text/html"], ["csv", "text/csv"], ["xlsx", "spreadsheetml"]]) {
+      const rr = await fetch(HUB + "/api/estimate/" + ID + "/report?format=" + fmt + "&view=internal");
+      ok(rr.ok && (rr.headers.get("content-type") || "").includes(ct) && new RegExp("estimate-" + ID).test(rr.headers.get("content-disposition") || ""), "report " + fmt + " (" + ct + ", named by id)", [rr.status, rr.headers.get("content-type"), rr.headers.get("content-disposition")]);
+    }
+    console.log("\n-- size cap / restart --");
+    await stopHub(); await startHub(tmp, { U1HUB_ESTIMATE_MAX_MB: "0.001" });
+    const before = fs.readdirSync(path.join(tmp, "estimates")).length;
+    r = await up("big.stl", Buffer.alloc(5000, 32));
+    ok(r.status === 413, "over the cap -> 413", r.status);
+    ok(fs.readdirSync(path.join(tmp, "estimates")).length === before, "the refused upload left no directory behind");
+    ok(((await jget("/api/estimate/" + ID)).body || {}).saved === true, "the saved estimate survives a restart");
   } finally { await stopHub(); await moon.close(); }
   console.log("\n" + pass + " passed, " + fail + " failed" + (FALSIFY ? "  (U1HUB_ESTIMATE_FALSIFY=1: a red run is the expected result)" : ""));
   process.exit(fail ? 1 : 0);
