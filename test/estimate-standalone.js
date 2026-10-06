@@ -118,6 +118,31 @@ async function main() {
     const kk = CAL.fitK([[10, 12], [20, 24], [5, 6], [40, 48]]);
     ok(kk && kk.k === 1.2 && kk.err === 0 && kk.n === 4, "grams k = median(actual/predicted) = 1.2", kk);
   }
+  const MATCH = require("../modules/estimate/match.js");
+  {
+    console.log("\n-- printed before? --");
+    const ledger = [
+      { file: "Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode", printer: "davinci", printer_id: 1, outcome: "done", seconds: 11416, at: 2000, material: { grams: 15.86 } },
+      { file: "Dragon Dynasty_Front_100x400_PLA_3h1m.gcode", printer: "davinci", printer_id: 1, outcome: "cancelled", seconds: 600, at: 1000, material: { grams: 2 } },
+      { file: "Dragon Egg_PLA_1h.gcode", printer: "snapdragon", printer_id: 0, outcome: "done", seconds: 3600, at: 1500, material: { grams: 20 } }
+    ];
+    const library = [{ name: "Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode", type: "u1", grams: 15.86, minutes: 182, max_z: 1.6 }];
+    ok(MATCH.famKey("Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode") === MATCH.famKey("Dragon Dynasty_Front_100x400.3mf") && MATCH.famKey("cube.stl") === MATCH.famKey("cube_PLA_10m.gcode") && MATCH.famKey("0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf") === "dragon dynasty", "famKey folds a colour suffix, the mesh extension and the MakerWorld/bl2u1 wrapper", [MATCH.famKey("Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode"), MATCH.famKey("cube.stl"), MATCH.famKey("0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf")]);
+    const c = MATCH.candidates({ name: "Dragon Dynasty_Front_100x400.3mf", height_mm: 1.6, ledger, library });
+    ok(c.length === 1 && c[0].times_printed === 2 && c[0].done === 1 && c[0].success_rate === 0.5 && c[0].actual_minutes === 190 && c[0].size_check === "same" && c[0].kind === "printed" && c[0].grams === 15.86 && c[0].match === "exact", "one family: printed twice, 1 done (50 %), actual 190 min (11416 s) from the done run, size matches", c);
+    ok(!c.some(x => /Egg/.test(x.file)), "'Dragon Egg' is a different family");
+    const cw = MATCH.candidates({ name: "0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf", height_mm: 1.6, ledger, library });
+    ok(cw.length === 1 && cw[0].match === "contains" && cw[0].times_printed === 2, "the MakerWorld-named 3MF finds the same family by containment ('dragon dynasty' in 'dragon dynasty front 100x400')", cw);
+    ok(MATCH.candidates({ name: "Dragon.stl", height_mm: 1.6, ledger, library }).length === 0, "a one-word name never matches by containment");
+    const c2 = MATCH.candidates({ name: "Dragon Dynasty_Front_100x400.3mf", height_mm: 40, ledger, library });
+    ok(c2[0].size_check === "different", "same name, 40 mm tall vs a 1.6 mm print -> 'different', never 'same'", c2[0]);
+    ok(MATCH.heightCheck(10, 10.15) === "same" && MATCH.heightCheck(10, 10.3) === "different" && MATCH.heightCheck(10, null) === "unchecked", "2 % height tolerance; no gcode height -> unchecked");
+    ok(MATCH.candidates({ name: "Totally New Thing.stl", height_mm: 5, ledger, library }).length === 0, "nothing in the family -> no candidates");
+    const items = [{ rel: "a/Same.3mf", name: "Same", size: 100 }, { rel: "b/Other.3mf", name: "Other", size: 100 }, { rel: "c/Big.3mf", name: "Big", size: 999 }];
+    const hashes = { "a/Same.3mf": "h1", "b/Other.3mf": "h2", "c/Big.3mf": "h1" };
+    const same = await MATCH.sameFileNames(100, "h1", items, async it => hashes[it.rel]);
+    ok(JSON.stringify(same) === JSON.stringify(["Same"]), "same file: only the equal-size item with the same hash (a different hash or a different size is not)", same);
+  }
 
   // ---- the booted Hub ----
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-"));
