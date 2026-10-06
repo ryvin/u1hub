@@ -125,7 +125,8 @@
     return '<div class="estcard"><h3>Print</h3><div class="estkv">'
       + '<span class="k">grams</span><span class="v">' + g(p.grams) + ' each</span>'
       + '<span class="k">time</span><span class="v">' + hm(p.minutes) + ' each</span>'
-      + '<span class="k">source</span><span class="v"><span class="estbadge' + (p.band_pct ? "" : " ok") + '">' + esc(v.source_label) + '</span></span>'
+      + '<span class="k">source</span><span class="v"><span class="estbadge' + (p.band_pct ? "" : " ok") + '">' + esc(v.source_label) + '</span>'
+      + ((v.sources_available || []).filter(x => x !== "printed").length > 1 ? ' ' + (v.sources_available || []).filter(x => x !== "printed" && x !== v.source).map(x => '<a href="#" data-est="src" data-src="' + esc(x) + '" style="font-size:11px; color:var(--ink-dim)">use ' + (x === "sliced" ? "the file's slice" : "geometry") + '</a>').join(" ") : "") + '</span>'
       + '<span class="k">supports</span><span class="v"><span class="estbadge ' + sup + '">' + esc(p.supports_needed) + '</span>' + (p.supports_g ? ' ≈ ' + g(p.supports_g) : "") + '</span>'
       + '<span class="k">plates</span><span class="v">' + esc(p.plates) + '</span>'
       + (p.designer_minutes ? '<span class="k">designer</span><span class="v">' + hm(p.designer_minutes) + ' on their slicer (their printer)</span>' : "")
@@ -233,8 +234,9 @@
     if (act === "open") return load(t.dataset.id);
     if (act === "del") { await jsend("/api/estimate/" + encodeURIComponent(t.dataset.id), undefined, "DELETE"); if (CUR && CUR.id === t.dataset.id) { CUR = null; render(); } return paintSaved(); }
     if (!CUR) return;
-    if (act === "use" || act === "geo") {
-      const r = await jsend("/api/estimate/" + encodeURIComponent(CUR.id) + "/source", act === "use" ? { source: "printed", key: t.dataset.key } : { source: (CUR.sources_available || []).find(x => x !== "printed") || "geometry" });
+    if (act === "use" || act === "geo" || act === "src") {
+      const back = (CUR.sources_available || []).includes("sliced") ? "sliced" : ((CUR.sources_available || []).find(x => x !== "printed") || "geometry");
+      const r = await jsend("/api/estimate/" + encodeURIComponent(CUR.id) + "/source", act === "use" ? { source: "printed", key: t.dataset.key } : { source: act === "src" ? t.dataset.src : back });
       if (r.ok) { CUR = r.d; render(); } else msg((r.d && r.d.error) || "could not switch");
       return;
     }

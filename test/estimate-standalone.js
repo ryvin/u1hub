@@ -61,6 +61,17 @@ async function main() {
     ok(fa.volume_cm3 === 8 && fa.area_cm2 === 24, "ASCII cube measures the same", fa);
     const fi = await STL.factsStl(binStl(cubeTris(20, true)));
     ok(fi.volume_cm3 === 8, "an inward-wound cube still reports +8 cm3 (abs)", fi.volume_cm3);
+    // Final review Important 7: inward normals turned the top into an "unsupported underside".
+    ok(fi.overhang.flat_unsupported_pct === 0 && fi.overhang.steep_pct === 0 && fi.overhang.bed_contact_cm2 === 4, "an inward-wound cube is re-wound: no false overhang, bottom on the bed", fi.overhang);
+    // Final review Important 3: a mesh with no volume is not a model.
+    let ez = null; try { await STL.factsStl(binStl([[[0, 0, 0], [10, 0, 0], [0, 10, 0]]])); } catch (x) { ez = x; }
+    ok(ez && /closed solid/i.test(ez.message), "a flat / open mesh (volume 0) is refused, never priced at 0 g", ez && ez.message);
+    // Final review Important 5: a 200 MB STL must not freeze the Hub; the parser yields to the event loop.
+    const bigTris = []; for (let i = 0; i < 25000; i++) bigTris.push(...cubeTris(1).map(t => t.map(p => [p[0] + (i % 100) * 2, p[1] + Math.floor(i / 100) * 2, p[2]])));
+    const bigBuf = binStl(bigTris);
+    let ticked = false; setImmediate(() => { ticked = true; });
+    const parsed = await STL.parseStlAsync(bigBuf);
+    ok(ticked && parsed.tris.length === bigTris.length * 3, "parseStlAsync on " + bigTris.length + " triangles lets other work run while it parses", { ticked, n: parsed.tris.length });
     ok(fb.overhang.steep_pct === 0 && fb.overhang.flat_unsupported_pct === 0 && fb.overhang.bed_contact_cm2 === 4, "the cube's bottom is bed contact (4 cm2), nothing overhangs", fb.overhang);
     const lifted = cubeTris(20).map(t => t.map(p => [p[0], p[1], p[2] + 10]));
     const fl = await STL.factsStl(binStl(lifted.concat(cubeTris(5))));
@@ -101,6 +112,32 @@ async function main() {
     const sp = await SL.slicedFrom(zp);
     // parser.estMinutes("1h 2m 3s") = 63 (it rounds the seconds up; measured 2026-10-06)
     ok(sp && sp.source === "plate-gcode" && sp.grams === 4.5 && sp.minutes === 63 && sp.plates === 1, "embedded plate gcode wins: exact 4.50 g, 63 min (parser rounds 1h 2m 3s up)", sp);
+    // Final review Important 3: a plate gcode whose totals do not parse is not an "exact" 0 g.
+    const GCBAD = "; HEADER_BLOCK_START\n; HEADER_BLOCK_END\nG1 X1\nG1 X2\n";
+    const sb = await SL.slicedFrom(zIndex(ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from("<model/>")), ZIP.makeEntry("Metadata/plate_1.gcode", Buffer.from(GCBAD)), ZIP.makeEntry("Metadata/slice_info.config", Buffer.from(SI2))])));
+    ok(sb && sb.source === "slice-info" && sb.grams === 20, "an unparseable plate gcode falls back to the slice info, never 'exact 0 g'", sb);
+    ok(await SL.slicedFrom(zIndex(ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from("<model/>")), ZIP.makeEntry("Metadata/plate_1.gcode", Buffer.from(GCBAD))]))) === null, "...and with no slice info either: no slice at all");
+  }
+  const ZC = require("../modules/estimate/zipcap.js");
+  {
+    console.log("\n-- capped 3MF reads (final review Important 5) --");
+    const zdir = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-zipcap-"));
+    // a 60 MB plate gcode that deflates to a few KB (a zip bomb in miniature), its totals at the very end
+    const filler = Buffer.alloc(60 * 1048576, 0x20);
+    const big = Buffer.concat([Buffer.from("; HEADER_BLOCK_START\n; HEADER_BLOCK_END\n"), filler, Buffer.from(GC.slice(GC.indexOf("G1 X1")))]);
+    const zf = path.join(zdir, "bomb.3mf");
+    fs.writeFileSync(zf, ZIP.zipWrite([ZIP.makeEntry("3D/3dmodel.model", Buffer.from("<model/>")), ZIP.makeEntry("Metadata/plate_1.gcode", big)]));
+    ok(fs.statSync(zf).size < 1048576, "the fixture is small on disk", fs.statSync(zf).size);
+    const z = await ZC.openCapped(zf, { cap: 8 * 1048576 });
+    try {
+      const pe = z.entries.find(e => /plate_1/.test(e.name));
+      let ce = null; try { await z.content(pe); } catch (x) { ce = x; }
+      ok(ce && /over the .* limit/.test(ce.message), "content() refuses an entry that inflates past the cap", ce && ce.message);
+      const tail = await z.tail(pe, 4096);
+      ok(tail.length === 4096 && tail.toString().includes("total filament used [g] = 4.50"), "tail() streams the entry and keeps only its last bytes", tail.length);
+      const s = await SL.slicedFrom(z);
+      ok(s && s.source === "plate-gcode" && s.grams === 4.5 && s.minutes === 63, "slicedFrom reads a huge plate gcode from its tail: exact 4.50 g, 63 min", s);
+    } finally { await z.close(); fs.rmSync(zdir, { recursive: true, force: true }); }
   }
   const CAL = require("../modules/estimate/calibrate.js");
   {
@@ -130,13 +167,26 @@ async function main() {
     const library = [{ name: "Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode", type: "u1", grams: 15.86, minutes: 182, max_z: 1.6 }];
     ok(MATCH.famKey("Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode") === MATCH.famKey("Dragon Dynasty_Front_100x400.3mf") && MATCH.famKey("cube.stl") === MATCH.famKey("cube_PLA_10m.gcode") && MATCH.famKey("0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf") === "dragon dynasty", "famKey folds a colour suffix, the mesh extension and the MakerWorld/bl2u1 wrapper", [MATCH.famKey("Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode"), MATCH.famKey("cube.stl"), MATCH.famKey("0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf")]);
     const c = MATCH.candidates({ name: "Dragon Dynasty_Front_100x400.3mf", height_mm: 1.6, ledger, library });
-    ok(c.length === 1 && c[0].times_printed === 2 && c[0].done === 1 && c[0].success_rate === 0.5 && c[0].actual_minutes === 190 && c[0].size_check === "same" && c[0].kind === "printed" && c[0].grams === 15.86 && c[0].match === "exact", "one family: printed twice, 1 done (50 %), actual 190 min (11416 s) from the done run, size matches", c);
+    // One candidate per FILE in the family (final review: numbers and the size check must come from the same gcode).
+    ok(c.length === 2 && c[0].file === "Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode" && c[0].times_printed === 1 && c[0].done === 1 && c[0].success_rate === 1 && c[0].actual_minutes === 190 && c[0].size_check === "same" && c[0].kind === "printed" && c[0].grams === 15.86 && c[0].match === "exact"
+       && c[1].file === "Dragon Dynasty_Front_100x400_PLA_3h1m.gcode" && c[1].done === 0 && c[1].actual_minutes === null && c[1].size_check === "unchecked", "one candidate per file: the pink file (done, 190 min, same size) ranks above the cancelled original (no gcode height -> unchecked)", c);
     ok(!c.some(x => /Egg/.test(x.file)), "'Dragon Egg' is a different family");
     const cw = MATCH.candidates({ name: "0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf", height_mm: 1.6, ledger, library });
-    ok(cw.length === 1 && cw[0].match === "contains" && cw[0].times_printed === 2, "the MakerWorld-named 3MF finds the same family by containment ('dragon dynasty' in 'dragon dynasty front 100x400')", cw);
+    ok(cw.length === 2 && cw[0].match === "contains" && cw[0].file === "Dragon Dynasty_Front_100x400_PLA_3h1m_pink.gcode", "the MakerWorld-named 3MF finds the same family by containment ('dragon dynasty' in 'dragon dynasty front 100x400')", cw);
     ok(MATCH.candidates({ name: "Dragon.stl", height_mm: 1.6, ledger, library }).length === 0, "a one-word name never matches by containment");
     const c2 = MATCH.candidates({ name: "Dragon Dynasty_Front_100x400.3mf", height_mm: 40, ledger, library });
-    ok(c2[0].size_check === "different", "same name, 40 mm tall vs a 1.6 mm print -> 'different', never 'same'", c2[0]);
+    ok(c2.find(x => /pink/.test(x.file)).size_check === "different", "same name, 40 mm tall vs a 1.6 mm print -> 'different', never 'same'", c2);
+    // Final review Important 1: a plate of 24 is not one piece.
+    const ce = MATCH.candidates({ name: "Baby Elephant.stl", height_mm: 30, ledger: [{ file: "Baby Elephant x24.gcode", printer: "snapdragon", printer_id: 0, outcome: "done", seconds: 36000, pieces: 24, at: 1, material: { grams: 480 } }],
+                                 library: [{ name: "Baby Elephant x24.gcode", type: "u1", grams: 480, minutes: 600, max_z: 30 }] });
+    ok(ce.length === 1 && ce[0].grams === 20 && ce[0].actual_minutes === 25 && ce[0].pieces_per_plate === 24 && ce[0].slicer_minutes === 25, "a 24-piece plate: 480 g / 24 = 20 g and 600 min / 24 = 25 min per piece", ce);
+    // Final review Important 1: plate 1's size check never vouches for plate 2's numbers.
+    const cp = MATCH.candidates({ name: "Dragon plate 1.3mf", height_mm: 120, ledger: [
+        { file: "Dragon plate 1.gcode", printer: "davinci", printer_id: 1, outcome: "done", seconds: 36000, at: 1, material: { grams: 100 } },
+        { file: "Dragon plate 2.gcode", printer: "davinci", printer_id: 1, outcome: "done", seconds: 3600, at: 2, material: { grams: 30 } }],
+      library: [{ name: "Dragon plate 1.gcode", type: "u1", grams: 100, minutes: 600, max_z: 120 }, { name: "Dragon plate 2.gcode", type: "u1", grams: 30, minutes: 60, max_z: 40 }] });
+    const pSame = cp.find(x => x.size_check === "same");
+    ok(cp.length === 2 && pSame && pSame.file === "Dragon plate 1.gcode" && pSame.grams === 100 && pSame.actual_minutes === 600 && cp[0] === pSame, "plates are separate candidates; the 'same size' one carries its own grams and minutes and ranks first", cp);
     ok(MATCH.heightCheck(10, 10.15) === "same" && MATCH.heightCheck(10, 10.3) === "different" && MATCH.heightCheck(10, null) === "unchecked", "2 % height tolerance; no gcode height -> unchecked");
     ok(MATCH.candidates({ name: "Totally New Thing.stl", height_mm: 5, ledger, library }).length === 0, "nothing in the family -> no candidates");
     const items = [{ rel: "a/Same.3mf", name: "Same", size: 100 }, { rel: "b/Other.3mf", name: "Other", size: 100 }, { rel: "c/Big.3mf", name: "Big", size: 999 }];
@@ -167,6 +217,9 @@ async function main() {
     const bare = PRICE.priceEstimate({ ...base, labor_minutes: 0 }, {}, {});
     const bm = bare.pricing ? bare.pricing.methods.find(m => m.key === "markup") : null;
     ok(bare.blanks.length > 0 && (!bm || (bm.price === null && /Settings/.test(bm.note))), "no rates: blanks named, markup says 'set a markup % in Settings'", bare);
+    // Final review Important 3: 0 g is not a price.
+    const zero = PRICE.priceEstimate({ ...base, grams: 0, labor_minutes: 0 }, R, { sell_per_g: 0.12 });
+    ok(zero.recommended.price === null && zero.blanks.some(b => /no grams/.test(b)), "0 g -> no recommended price, and the blank says why", zero.recommended);
   }
   const REP = require("../modules/estimate/report.js");
   {
@@ -199,7 +252,7 @@ async function main() {
   fs.writeFileSync(path.join(tmp, "prints.json"), JSON.stringify({ prints: [{ id: "p1", at: 1, printer_id: 0, printer: "U1-mock", type: "u1", file: "cube_PLA_10m.gcode", outcome: "done", seconds: 600, seconds_source: "actual", material: { grams: 4, source: "slicer", grams_source: "slicer" }, counted: true, pieces: 1 }] }));
   fs.writeFileSync(path.join(gdir, "cube_PLA_10m.gcode"), "; HEADER_BLOCK_START\n; max_z_height: 20.00\n; HEADER_BLOCK_END\nG1 X1\n; filament used [g] = 4.00\n; total filament used [g] = 4.00\n; estimated printing time (normal mode) = 10m 0s\n; CONFIG_BLOCK_START\n; filament_type = PLA\n; filament_colour = #FF0000\n; print_settings_id = 0.20 Standard\n; CONFIG_BLOCK_END\n");
   try {
-    await startHub(tmp);
+    await startHub(tmp, { U1HUB_ESTIMATE_LIB_TTL_MS: "0" });
     console.log("\n-- the module boots --");
     const cfg = (await jget("/api/config")).body || {};
     ok(cfg.features && cfg.features.estimate === true, "estimate ships on", cfg.features);
@@ -247,11 +300,21 @@ async function main() {
     const j3 = r.body && r.body.jobId ? await waitJob(r.body.jobId) : { error: "no job" };
     v = (await jget("/api/estimate/" + (r.body && r.body.id))).body || {};
     ok(!j3.error && v.files && v.files[0].facts.volume_cm3 === 8 && v.files[0].sliced.grams === 20 && v.sources_available.includes("sliced"), "the 3MF is measured and its slice info read", { j3, f: v.files && v.files[0] });
+    // Final review Important 2: a file's own slice is the default when every file has one (it beats a geometry guess).
+    ok(v.source === "sliced" && v.print.grams === 20, "a 3MF with slice info opens on its own slice, not on geometry", { src: v.source, g: v.print && v.print.grams });
+    const lib = ((await jget("/api/estimate/info")).body || {}).library || {};
+    ok(lib.files === 1 && lib.reads === 1, "the library gcode was read once across two analyses (facts cached by size + mtime; TTL 0 here)", lib);
     r = await jpost("/api/estimate/" + v.id + "/source", { source: "sliced" });
     ok(r.status === 200 && r.body.print.grams === 20 && /file's slice/.test(r.body.source_label) && r.body.print.minutes === Math.round(6.403 * Math.pow(20, 0.840)), "slice-info source: 20 g from the file, time from the standard-multi fit (2 filaments)", r.body && r.body.print);
     console.log("\n-- save / list / reports --");
     r = await jpost("/api/estimate/" + ID + "/save", { note: "test" });
     ok(r.status === 200 && r.body.saved === true, "save");
+    // Final review Important 4: ids are own keys only; __proto__ / constructor are no estimate.
+    for (const bad of ["__proto__", "constructor", "toString"]) {
+      const rr = await jpost("/api/estimate/" + bad + "/save", { project_id: "p1" });
+      ok(rr.status === 404, "POST /api/estimate/" + bad + "/save -> 404", rr.status);
+    }
+    ok((await fetch(HUB + "/api/estimate/constructor", { method: "DELETE" })).status === 404, "DELETE /api/estimate/constructor -> 404, not 500");
     r = await jget("/api/estimate");
     ok(r.body && r.body.saved.some(s => s.id === ID), "the saved list carries it", r.body);
     for (const [fmt, ct] of [["pdf", "text/html"], ["csv", "text/csv"], ["xlsx", "spreadsheetml"]]) {

@@ -20,8 +20,10 @@ function priceEstimate(e, rates, marginRates) {
   const cands = p ? p.methods.filter(x => (x.key === "markup" || x.key === "per_gram") && x.price != null) : [];
   const best = cands.sort((a, b) => b.price - a.price)[0] || null;
   const rush = Number(e.rush) > 0 ? Number(e.rush) : 1;
-  const price = best ? r2(best.price * rush) : null;
-  return { cost: s, pricing: p, recommended: { price, each: price != null ? r2(price / qty) : null, method: best ? best.key : null, rush },
-           blanks: (s.blanks || []).concat(p ? [] : ["no cost to price (set rates in Settings)"]) };
+  // 0 g (an unmeasured or empty model) is not a price, whatever the rates say.
+  const priced = Number(e.grams) > 0;
+  const price = best && priced ? r2(best.price * rush) : null;
+  return { cost: s, pricing: p, recommended: { price, each: price != null ? r2(price / qty) : null, method: best && priced ? best.key : null, rush },
+           blanks: (s.blanks || []).concat(p ? [] : ["no cost to price (set rates in Settings)"]).concat(priced ? [] : ["no grams: nothing to price"]) };
 }
 module.exports = { priceEstimate };

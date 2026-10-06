@@ -10,6 +10,7 @@
 // trusted. Pure. Fork module estimate (ryvin/u1hub).
 "use strict";
 const { familyName } = require("../../sme/core/family.js");
+const { qtyFromName } = require("../margin.js");
 const HEIGHT_TOL = 0.02;
 const COLOUR_WORDS = new Set(["pink", "red", "blue", "green", "black", "white", "silver", "grey", "gray", "gold", "orange", "yellow", "purple", "clear"]);
 const num = v => { const n = Number(v); return v === "" || v == null || !Number.isFinite(n) ? null : n; };
@@ -33,37 +34,48 @@ function heightCheck(model, gcode) {
   if (!(num(model) > 0) || !(num(gcode) > 0)) return "unchecked";
   return Math.abs(model - gcode) / Math.max(model, gcode) <= HEIGHT_TOL ? "same" : "different";
 }
-function candidateOf(key, match, runs, libs, height) {
+const r2 = x => Math.round(x * 100) / 100;
+// One FILE of the family: its own runs and its own library entry, so the
+// size check and the numbers always come from the same gcode (final review:
+// plate 1's height must never vouch for plate 2's grams). Every number is per
+// PIECE: a run's `pieces`, else the file name's "x24" (margin.qtyFromName).
+function candidateOf(file, match, runs, lib, height) {
   const byAt = (a, b) => (b.at || 0) - (a.at || 0);
+  const piecesOf = r => num(r.pieces) > 0 ? num(r.pieces) : (qtyFromName(file) || 1);
   const done = runs.filter(r => r.outcome === "done");
-  const secs = done.map(r => num(r.seconds)).filter(v => v > 0);
-  const lib = libs.find(l => num(l.max_z) > 0) || libs[0] || null;
+  const secsEach = done.map(r => num(r.seconds) > 0 ? num(r.seconds) / piecesOf(r) : null).filter(v => v > 0);
   const last = runs.slice().sort(byAt)[0] || null, lastDone = done.slice().sort(byAt)[0] || null;
+  const libPieces = qtyFromName(file) || 1;
   const maxZ = lib ? num(lib.max_z) : null;
-  const gDone = lastDone && lastDone.material ? num(lastDone.material.grams) : null;
+  const gDone = lastDone && lastDone.material && num(lastDone.material.grams) > 0 ? num(lastDone.material.grams) / piecesOf(lastDone) : null;
   return {
-    key, match, file: (lastDone || last || {}).file || (lib && lib.name), printer: last ? last.printer : null, printer_id: last ? last.printer_id : null, type: lib ? lib.type : null,
+    key: file, family: famKey(file), match, file, printer: last ? last.printer : null, printer_id: last ? last.printer_id : null, type: lib ? lib.type : null,
+    pieces_per_plate: lastDone ? piecesOf(lastDone) : libPieces,
     times_printed: runs.length, done: done.length, success_rate: runs.length ? Math.round(done.length / runs.length * 100) / 100 : null,
-    last_at: last ? last.at : null, actual_minutes: secs.length ? Math.round(secs.reduce((a, b) => a + b, 0) / secs.length / 60) : null,
-    grams: gDone != null ? gDone : (lib ? num(lib.grams) : null), slicer_minutes: lib ? num(lib.minutes) : null,
+    last_at: last ? last.at : null, actual_minutes: secsEach.length ? Math.round(secsEach.reduce((a, b) => a + b, 0) / secsEach.length / 60) : null,
+    grams: gDone != null ? r2(gDone) : (lib && num(lib.grams) > 0 ? r2(num(lib.grams) / libPieces) : null),
+    slicer_minutes: lib && num(lib.minutes) > 0 ? Math.round(num(lib.minutes) / libPieces) : null,
     max_z: maxZ, size_check: heightCheck(height, maxZ), kind: runs.length ? "printed" : "library"
   };
 }
+const SIZE_RANK = { same: 0, unchecked: 1, different: 2 };
 // o: { name, height_mm, ledger: [costing rows], library: [{ name, type, grams, minutes, max_z }], limit }
 function candidates(o) {
   const me = famKey(o.name);
   if (!me) return [];
-  const groups = new Map();   // file key -> { match, runs, libs }
+  const files = new Map();   // file name -> { match, runs, lib }
   const add = (fileName, kind, item) => {
-    const k = famKey(fileName), rel = relation(me, k);
+    const rel = relation(me, famKey(fileName));
     if (!rel) return;
-    const g = groups.get(k) || { match: rel, runs: [], libs: [] };
-    g[kind].push(item); groups.set(k, g);
+    const g = files.get(fileName) || { match: rel, runs: [], lib: null };
+    if (kind === "run") g.runs.push(item); else g.lib = g.lib || item;
+    files.set(fileName, g);
   };
-  for (const r of o.ledger || []) if (r && r.file) add(r.file, "runs", r);
-  for (const l of o.library || []) if (l && l.name) add(l.name, "libs", l);
-  return [...groups.entries()].map(([k, g]) => candidateOf(k, g.match, g.runs, g.libs, o.height_mm))
-    .sort((a, b) => (a.match === "exact" ? 0 : 1) - (b.match === "exact" ? 0 : 1) || b.times_printed - a.times_printed)
+  for (const r of o.ledger || []) if (r && r.file) add(r.file, "run", r);
+  for (const l of o.library || []) if (l && l.name) add(l.name, "lib", l);
+  return [...files.entries()].map(([f, g]) => candidateOf(f, g.match, g.runs, g.lib, o.height_mm))
+    .sort((a, b) => (a.match === "exact" ? 0 : 1) - (b.match === "exact" ? 0 : 1) || SIZE_RANK[a.size_check] - SIZE_RANK[b.size_check]
+      || b.done - a.done || b.times_printed - a.times_printed || (b.last_at || 0) - (a.last_at || 0))
     .slice(0, o.limit || 5);
 }
 // Library 3MFs that are byte-for-byte the upload: equal size first (cheap),

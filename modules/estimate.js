@@ -28,11 +28,15 @@ const { facts3mf } = require("./mesh3mf.js");
 const { zipOpen } = require("./models.js");
 const { parseGcodeMap, estMinutes } = require("../parser.js");
 const STL = require("./estimate/stl.js"), GEO = require("./estimate/geometry.js"), SL = require("./estimate/sliced.js");
+const ZC = require("./estimate/zipcap.js");
 const CAL = require("./estimate/calibrate.js"), MATCH = require("./estimate/match.js"), PRICE = require("./estimate/price.js"), REP = require("./estimate/report.js");
 
 const FORK = "ryvin/u1hub";
 const MAX_MB = Math.max(0.001, Number(process.env.U1HUB_ESTIMATE_MAX_MB) || 200);
-const PRUNE_MS = 30 * 24 * 3600 * 1000, PRUNE_EVERY_MS = 6 * 3600 * 1000, JOB_TTL_MS = 10 * 60 * 1000, LIB_TTL_MS = 5 * 60 * 1000, VALID_DAYS = 14;
+const PRUNE_MS = 30 * 24 * 3600 * 1000, PRUNE_EVERY_MS = 6 * 3600 * 1000, JOB_TTL_MS = 10 * 60 * 1000, VALID_DAYS = 14;
+const LIB_TTL_MS = process.env.U1HUB_ESTIMATE_LIB_TTL_MS != null ? Math.max(0, Number(process.env.U1HUB_ESTIMATE_LIB_TTL_MS) || 0) : 5 * 60 * 1000;
+// One zip entry of an uploaded 3MF may inflate to at most this (mesh XML; a plate gcode is streamed instead).
+const ENTRY_MAX_BYTES = 256 * 1048576;
 const CAL_BOOT_MS = process.env.U1HUB_ESTIMATE_CALIBRATE_BOOT_MS != null ? Number(process.env.U1HUB_ESTIMATE_CALIBRATE_BOOT_MS) : 60000;
 const CAL_EVERY_MS = 24 * 3600 * 1000, CAL_MAX_3MF = 60;
 const HEAD_BYTES = 8192, TAIL_BYTES = 524288;
@@ -78,8 +82,9 @@ function sha1File(fp) {
 function register(ctx) {
   const STATE = path.join(ctx.baseDir, "estimates.json"), CALF = path.join(ctx.baseDir, "estimate-calibration.json");
   const DIR = path.join(ctx.baseDir, "estimates");
-  let S = { estimates: {} };
-  try { const j = JSON.parse(fs.readFileSync(STATE, "utf8")); if (j && j.estimates) S = j; } catch {}
+  // Prototype-free, and looked up by own keys only: "__proto__" or "constructor" is no estimate (final review).
+  let S = { estimates: Object.create(null) };
+  try { const j = JSON.parse(fs.readFileSync(STATE, "utf8")); if (j && j.estimates) S = { ...j, estimates: Object.assign(Object.create(null), j.estimates) }; } catch {}
   let CALS = { fits: {}, k: null, at: null };
   try { const j = JSON.parse(fs.readFileSync(CALF, "utf8")); if (j && j.fits) CALS = j; } catch {}
   const JOBS = new Map();
@@ -90,20 +95,37 @@ function register(ctx) {
   const use = (key, dflt) => { const fn = ctx.use(key); return typeof fn === "function" ? fn : dflt; };
 
   // ---- the library's gcode, for matching and calibration (cached) ----
+  // A gcode's facts are read once per (size, mtime): a rescan only stats, and
+  // only a new or changed file costs the 8 KB + 512 KB read (final review: the
+  // library is ~530 files on a share; re-reading all of them per upload was
+  // ~275 MB). LIB_STATS.reads counts the reads (GET /api/estimate/info).
   let LIB = { at: 0, list: [] }, libBusy = null;
+  const FACTS = new Map();   // "slug/name" -> { size, mtime, facts }
+  const LIB_STATS = { files: 0, reads: 0 };
   async function libraryList() {
     if (Date.now() - LIB.at < LIB_TTL_MS) return LIB.list;
     if (libBusy) return libBusy;
     libBusy = (async () => {
-      const out = [];
+      const out = [], seen = new Set();
       for (const t of ctx.types || []) {
         let dir; try { dir = ctx.gcodeFolderFor(t.slug); } catch { continue; }
         let names = []; try { names = (await fsp.readdir(dir)).filter(n => /\.gcode$/i.test(n)); } catch { continue; }
         for (const name of names) {
-          try { out.push({ name, type: t.slug, ...(await gcodeFacts(path.join(dir, name))) }); } catch {}
-          await tick();
+          const key = t.slug + "/" + name; seen.add(key);
+          try {
+            const st = await fsp.stat(path.join(dir, name));
+            let hit = FACTS.get(key);
+            if (!hit || hit.size !== st.size || hit.mtime !== st.mtimeMs) {
+              hit = { size: st.size, mtime: st.mtimeMs, facts: await gcodeFacts(path.join(dir, name)) };
+              FACTS.set(key, hit); LIB_STATS.reads++;
+              await tick();
+            }
+            out.push({ name, type: t.slug, ...hit.facts });
+          } catch {}
         }
       }
+      for (const k of [...FACTS.keys()]) if (!seen.has(k)) FACTS.delete(k);
+      LIB_STATS.files = out.length;
       LIB = { at: Date.now(), list: out };
       return out;
     })().finally(() => { libBusy = null; });
@@ -117,8 +139,13 @@ function register(ctx) {
       job.phase = "measure";
       if (f.kind === "stl") f.facts = await STL.factsStl(await fsp.readFile(fp), f.name);
       else {
-        const z = await zipOpen(fp);
-        try { f.facts = await facts3mf(z, MESH_MAX_BYTES ? { maxBytes: MESH_MAX_BYTES } : undefined); f.sliced = await SL.slicedFrom(z); } finally { await z.close().catch(() => {}); }
+        // An upload is untrusted: every entry is inflated asynchronously under a cap (estimate/zipcap.js).
+        const z = await ZC.openCapped(fp, { cap: ENTRY_MAX_BYTES });
+        try {
+          try { f.facts = await facts3mf(z, MESH_MAX_BYTES ? { maxBytes: MESH_MAX_BYTES } : undefined); } catch (e) { f.facts = { ok: false, reason: e.message }; }
+          if (f.facts && f.facts.ok !== false && !(f.facts.volume_cm3 > 0)) f.facts = { ok: false, reason: "not a closed solid (the mesh has no volume)" };
+          try { f.sliced = await SL.slicedFrom(z); } catch (e) { f.sliced = null; }
+        } finally { await z.close().catch(() => {}); }
         if (!f.facts || f.facts.ok === false) {
           const why = (f.facts && f.facts.reason) || "no printable mesh in the 3MF";
           if (!f.sliced) throw new Error(why);
@@ -182,7 +209,9 @@ function register(ctx) {
     const cands = est.candidates || [];
     if (cands.length) sources.push("printed");
     // The chosen source when it is still available, else the first measurable one.
-    let source = sources.includes(est.source) ? est.source : (sources.find(x => x !== "printed") || "none");
+    // The chosen source when it is still available; otherwise the file's own slice when every file has one
+    // (it beats a geometry guess), else geometry.
+    let source = sources.includes(est.source) ? est.source : (sources.includes("sliced") ? "sliced" : (sources.find(x => x !== "printed") || "none"));
     let grams = null, minutes = null, band_pct = null, failure_rate = null, label = "nothing measurable";
     if (source === "geometry") { grams = geoGrams; minutes = CAL.minutesFrom(geoGrams, fit); band_pct = band; label = "geometry ±" + band + " %" + (fit.source === "fallback" ? " (time: fallback fit)" : ""); }
     let designer_minutes = null;
@@ -241,11 +270,11 @@ function register(ctx) {
     }
     return { inputs: out };
   }
-  const get = id => S.estimates[String(id || "")] || null;
+  const get = id => { const k = String(id || ""); return Object.prototype.hasOwnProperty.call(S.estimates, k) ? S.estimates[k] : null; };
   const bad = (res, code, error, extra) => res.status(code).json({ error, ...(extra || {}) });
 
   // ---- routes (fixed paths before /:id) ----
-  ctx.app.get("/api/estimate/info", (req, res) => res.json({ enabled: true, fork: FORK, max_mb: MAX_MB, presets: Object.entries(GEO.PRESETS).map(([key, p]) => ({ key, label: p.label })), materials: MATERIALS,
+  ctx.app.get("/api/estimate/info", (req, res) => res.json({ enabled: true, fork: FORK, max_mb: MAX_MB, library: { ...LIB_STATS }, presets: Object.entries(GEO.PRESETS).map(([key, p]) => ({ key, label: p.label })), materials: MATERIALS,
     calibration: { at: CALS.at, fits: CALS.fits, k: CALS.k } }));
   ctx.app.get("/api/estimate/job", (req, res) => {
     pruneJobs();
@@ -280,7 +309,7 @@ function register(ctx) {
       ws.end(() => {
         finished = true;
         if (!bytes) { cleanup(); return bad(res, 400, "the file is empty"); }
-        const est = existing || { id, created: Date.now(), files: [], candidates: [], inputs: { ...DEFAULT_INPUTS }, source: "geometry", candidate_key: null, saved: false, project_id: null, client_id: null, note: "" };
+        const est = existing || { id, created: Date.now(), files: [], candidates: [], inputs: { ...DEFAULT_INPUTS }, source: null, candidate_key: null, saved: false, project_id: null, client_id: null, note: "" };
         S.estimates[id] = est;
         const f = { file_id, name, kind, bytes, facts: null, sliced: null, error: null };
         est.files.push(f);
@@ -382,7 +411,8 @@ function register(ctx) {
         if (n >= CAL_MAX_3MF) break;
         if (!/\.3mf$/i.test(it.rel || "")) continue;
         try {
-          const r = await open(it.rel, async z => ({ facts: await facts3mf(z), sliced: await SL.slicedFrom(z) }));
+          // Slice info first (a few KB); the mesh is measured only for a file that has it.
+          const r = await open(it.rel, async z => { const sl = await SL.slicedFrom(z); return sl && sl.source === "slice-info" ? { sliced: sl, facts: await facts3mf(z) } : { sliced: sl, facts: null }; });
           if (r.facts && r.facts.ok && r.sliced && r.sliced.source === "slice-info" && r.sliced.grams > 0) {
             n++;
             pairs[r.sliced.filaments.length > 1 ? "multi" : "single"].push([GEO.gramsFrom(r.facts, { preset: "standard" }).model_g, r.sliced.grams]);
