@@ -117,3 +117,12 @@ All gitignored. Env: `U1HUB_ESTIMATE_MAX_MB` (upload cap, default 200),
 - XLSX loaded in openpyxl (Quote and Breakdown sheets, values in place); not opened
   in Excel from here.
 - Playwright on a throwaway Hub (see docs/FORK.md "Live gates").
+- Final review (Opus): 0 critical, 7 important, all fixed with a test each, shown red
+  with the fix removed (per-piece / per-file matching, slice as default, 0 g never
+  priced, own-key ids, capped async 3MF reads + yielding STL parse, cached library
+  facts, re-wound inward meshes); suite 97/0 three times, harness 967/0.
+- Live on :4545 (image 412f034aa399, ryvin ada41c1), 2026-10-06: the real
+  `0.4NOZZLE_AMS_5COLORS_Dragon+Dynasty_U1.3mf` (48 MB) -> source "sliced", 17.17 g,
+  5 colours, multiACE note, time 70 min ±29 %; printed-before: the pink gcode, actual
+  190 min, 15.86 g; recommended $2.06 (per-gram floor); quote PDF / CSV / XLSX 200;
+  library scan 545 gcodes read once (cached by size + mtime). Test estimate deleted.
