@@ -73,6 +73,7 @@ const path = require("path");
 const { parseGcodeMap, estMinutes } = require("../parser.js");
 const { qtyFromName, csvCell } = require("./margin.js");
 const REPORT = require("./costing-report.js");    // report / reportCsv / reportHtml, pure
+const JOBS = require("./costing-jobs.js");        // every job's cost as CSV / XLSX, and the JSON export, pure
 
 // The ledger cap. 10,000 rows: three printers at five prints a day each is
 // ~5,500 rows a year, so this holds about two years of a busy farm, and at
@@ -1246,6 +1247,21 @@ function register(ctx) {
     if (q.group_by && !REPORT.GROUPINGS.includes(String(q.group_by))) return res.status(400).send("group_by must be one of " + REPORT.GROUPINGS.join(", "));
     res.set("Cache-Control", "no-cache");
     res.type("html").send(REPORT.reportHtml(reportFor(q)));
+  });
+  // Every job's cost (?from&to&tz_offset_min as the report) for a spreadsheet, and everything as JSON (costing-jobs.js).
+  const jobsFor = q => { const f = filtersOf(q); return JOBS.jobRows(L.prints, P.projects, P.clients, conf(), { from: f.from, to: f.to, tz_offset_min: num(q.tz_offset_min) || 0 }); };
+  const today = () => new Date().toISOString().slice(0, 10);
+  ctx.app.get("/api/costing/report/jobs.csv", (req, res) => {
+    res.type("text/csv; charset=utf-8").setHeader("Content-Disposition", 'attachment; filename="job-costs-' + today() + '.csv"');
+    res.send("﻿" + JOBS.jobsCsv(jobsFor(req.query || {})));
+  });
+  ctx.app.get("/api/costing/report/jobs.xlsx", (req, res) => {
+    res.type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet").setHeader("Content-Disposition", 'attachment; filename="job-costs-' + today() + '.xlsx"');
+    res.send(JOBS.jobsXlsx(jobsFor(req.query || {}), conf()));
+  });
+  ctx.app.get("/api/costing/export.json", (req, res) => {
+    res.setHeader("Content-Disposition", 'attachment; filename="costing-export-' + today() + '.json"');
+    res.type("application/json").send(JSON.stringify(JOBS.exportAll({ prints: L.prints, projects: P.projects, clients: P.clients, pending: P.pending, rates: conf(), now: Date.now() }), null, 2));
   });
   ctx.app.post("/api/costing/prints/assign", (req, res) => {
     const b = req.body || {}, row = L.prints.find(r => r.id === b.print_id);

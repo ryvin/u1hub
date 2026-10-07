@@ -6,7 +6,8 @@ the reasoning are there; this file is the feature as shipped).
 
 Server: `modules/costing.js` (the ledger, projects, import, routes) and
 `modules/costing-report.js` (the pure report, its CSV and its printable
-page). Client: `public/modules/costing-ui.js` (the **Projects** tab with its
+page) and `modules/costing-jobs.js` (every job's cost as CSV / XLSX, and the
+JSON export). Client: `public/modules/costing-ui.js` (the **Projects** tab with its
 three views Projects / Prints / Reports, a project dropdown on the job card,
 a Costing block in Settings). Suite: `test/costing-standalone.js` (part of
 `npm run test:standalone`). Feature flag `costing`, on by default, off in Lite.
@@ -325,6 +326,28 @@ library), the table with totals, **Export CSV** (`GET
 report** (`GET /api/costing/report/print?…`, server-rendered, every string
 escaped, no script, like the quote page).
 
+Three more buttons sit beside them (`modules/costing-jobs.js`, pure):
+
+- **Job costs (Excel)** (`GET /api/costing/report/jobs.xlsx?…`, the same
+  `from`/`to`): one row per job in the range, oldest first - date, printer,
+  type, file, project, client, outcome, counted, pieces, hours, grams,
+  material, and each cost line (material, machine, energy) with its source.
+  **Total** and **Per piece** are live formulas over the cost cells
+  (`=SUM(material, machine, energy)`, `=Total/pieces`), and a `TOTAL (counted)`
+  row sums every numeric column over the counted jobs only (`SUMIF` on the
+  `counted` column), so it equals the report's direct cost for the same range, so changing a cost or the pieces in the
+  spreadsheet recalculates. Cached values are written too, so a viewer that
+  doesn't recalculate still shows the numbers. A second sheet, **Rates**,
+  lists the rates the costs were computed with. A blank cost stays blank and
+  the `blanks` column says why. Text that looks like a formula (a file named
+  `=…`) is written with a leading `'`, so it is shown, never run.
+- **Job costs (CSV)** (`GET /api/costing/report/jobs.csv?…`): the same rows,
+  UTF-8 with a BOM.
+- **Export all (JSON)** (`GET /api/costing/export.json`): everything costing
+  holds - the rates, clients, projects (each with its summary), pending
+  assignments, and every ledger print with its computed `cost` - as one
+  attachment.
+
 ## The Prints view
 
 Every ledger row, newest first, paged server-side (`GET /api/costing/prints`
@@ -387,6 +410,9 @@ All under `/api/costing`; absent (404) when the feature is off.
 | GET | `/api/costing/report` | `?from&to&group_by=client\|project\|printer\|type\|month\|material\|outcome&tz_offset_min` | the report above plus `groupings[]`; 400 on an unknown grouping |
 | GET | `/api/costing/report.csv` | same | UTF-8 BOM + one line per group + `TOTAL` |
 | GET | `/api/costing/report/print` | same | the printable page, server-rendered, every string escaped, no script |
+| GET | `/api/costing/report/jobs.xlsx` | `?from&to&tz_offset_min` | one row per job; Total / Per piece formulas; `TOTAL` row; Rates sheet |
+| GET | `/api/costing/report/jobs.csv` | same | UTF-8 BOM + one line per job |
+| GET | `/api/costing/export.json` | | rates, clients, projects (+ summary), pending, every print with its cost |
 | POST | `/api/costing/pending` | `{ file, type, project_id \| null }` | the pending map |
 | GET | `/api/costing/projects/:id` | | `project, client, summary, pricing, prints[]` |
 | GET | `/api/costing/projects/:id.csv` | | UTF-8 BOM + one line per print and per item |

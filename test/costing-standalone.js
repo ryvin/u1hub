@@ -272,6 +272,36 @@ function pureChecks() {
   ok(tot.material === 5.64 && tot.machine === 1.12 && tot.energy === 0.14 && tot.direct === 6.9 && tot.failure_cost === 1.54 && tot.failure_share === 22.3, "totals direct: 5.64 + 1.12 + 0.14 = 6.90; failed 1.54 (22.3%)", tot);
   ok(tot.labor === 15 && tot.extras === 6.2 && tot.overhead === 2.77 && tot.cost === wantCost && tot.charged === 25 && tot.margin === -5.87 && tot.margin_pct === -23, "totals cost 29.41 + 1.10 + 0.36 = " + wantCost + "; charged 25; margin -5.87 (-23%)" + (FALSIFY ? " [FALSIFIED]" : ""), tot);
   ok(tot.coverage.time.actual_pct === 80 && tot.coverage.grams.actual_pct === 40 && tot.coverage.material.actual_pct === 20 && tot.coverage.machine.actual_pct === 80 && tot.coverage.energy.actual_pct === 80, "totals coverage: time 80%, grams 40%, material 20%, machine 80%, energy 80% actual", tot.coverage);
+  console.log("\n== PURE: every job's cost as a spreadsheet, and the JSON export ==");
+  const J = require("../modules/costing-jobs.js");
+  const jobs = J.jobRows(rows, projects, clients, RR, {});
+  const j1 = jobs.find(x => x.id === "r1"), j3 = jobs.find(x => x.id === "r3"), j6 = jobs.find(x => x.id === "r6");
+  ok(jobs.length === 6 && jobs[0].id === "r1" && jobs[5].id === "r6", "one row per job, oldest first", jobs.map(x => x.id));
+  ok(j1.material_cost === 2 && j1.machine_cost === 0.32 && j1.energy_cost === 0.04 && j1.total === 2.36 && j1.per_piece === 2.36 && j1.project === "Spring <order>" && j1.client === "Acme & Co" && j1.date === "2026-01-10 10:00",
+    "r1: material 2.00 + machine 0.32 + energy 0.04 = 2.36, its project and client by name", j1);
+  ok(j3.machine_cost === null && /machine/.test(j3.blanks) && j6.grams === null && j6.total === 0.36, "a blank stays blank (and says why); the error print costs its machine+energy", { j3, j6 });
+  ok(J.jobRows(rows, projects, clients, RR, { from: T("2026-02-01T00:00:00Z"), to: T("2026-03-01T00:00:00Z") }).map(x => x.id).join() === "r3,r4,r5", "the report's [from, to) range applies");
+  const jc = J.jobsCsv(jobs).split("\r\n").filter(Boolean);
+  ok(jc.length === 7 && jc[0].startsWith("date,printer,type,file,project,client,") && jc[1].includes('"Spring <order>"') === false && jc[1].includes("Spring <order>"), "jobs CSV: header + 6 lines", jc.slice(0, 2));
+  const ZIPR = require("../modules/slicing.js");
+  const xb = J.jobsXlsx(jobs, RR), xz = ZIPR.zipRead(xb), xe = Array.isArray(xz) ? xz : xz.entries;
+  const sheetXml = n => ZIPR.zipEntryContent(xe.find(e => e.name === n)).toString("utf8");
+  const s1 = sheetXml("xl/worksheets/sheet1.xml"), s2 = sheetXml("xl/worksheets/sheet2.xml");
+  const wantTotal = FALSIFY ? "<v>2.37</v>" : "<v>2.36</v>";
+  ok((s1.match(/<row /g) || []).length === 8 && s1.includes('<c r="T2"><f>IF(COUNT(O2,Q2,S2)=0,&quot;&quot;,SUM(O2,Q2,S2))</f>' + wantTotal + "</c>"), "xlsx Jobs sheet: header + 6 jobs + TOTAL; Total is a live formula over the cost cells (cached 2.36)" + (FALSIFY ? " [FALSIFIED]" : ""), s1.slice(0, 300));
+  ok(s1.includes("<f>SUMIF(H2:H7,&quot;yes&quot;,T2:T7)</f><v>" + C.report(rows, projects, clients, RR, {}).totals.direct + "</v>") && s1.includes("<f>IF(OR(T2=&quot;&quot;,I2=0),&quot;&quot;,T2/I2)</f>"),
+    "xlsx: per-piece is a formula; the TOTAL row sums the counted jobs only, equal to the report's direct total (6.90; uncounted r5 left out)", s1.slice(s1.lastIndexOf("<row "), s1.lastIndexOf("<row ") + 400));
+  ok(J.jobsCsv([{ ...j1, file: "=HYPERLINK(1)" }]).split("\r\n")[1].includes(",'=HYPERLINK(1),"), "KNOWN-BAD a formula-looking file name in the CSV gets a leading '");
+  const emptyX = ZIPR.zipRead(J.jobsXlsx([], RR)), emptyE = Array.isArray(emptyX) ? emptyX : emptyX.entries;
+  ok(!ZIPR.zipEntryContent(emptyE.find(e => e.name === "xl/worksheets/sheet1.xml")).toString("utf8").includes("<f>"), "xlsx with no jobs: header and a TOTAL label, no formula over an empty range");
+  ok(/cost_per_g/.test(s2) && /kwh_rate/.test(s2) && sheetXml("xl/workbook.xml").includes('fullCalcOnLoad="1"'), "xlsx Rates sheet lists the rates used; the workbook recalculates on open");
+  const hostile = J.jobsXlsx([{ ...j1, file: "=HYPERLINK(\"x\")" }], RR);
+  const hz = ZIPR.zipRead(hostile), he = Array.isArray(hz) ? hz : hz.entries;
+  const hs = ZIPR.zipEntryContent(he.find(e => e.name === "xl/worksheets/sheet1.xml")).toString("utf8");
+  ok(hs.includes('t="inlineStr"><is><t xml:space="preserve">=HYPERLINK(&quot;x&quot;)</t>') && !hs.includes("<f>HYPERLINK"), "KNOWN-BAD a formula-looking file name is stored as plain text (inline string, shown as typed), never a formula");
+  const ex = J.exportAll({ prints: rows, projects, clients, pending: { "u1/a.gcode": "pA" }, rates: RR, now: 1000 });
+  ok(ex.exported_at === new Date(1000).toISOString() && ex.prints.length === 6 && ex.prints.find(p => p.id === "r1").cost.direct === 2.36 && ex.projects.find(p => p.id === "pA").summary && ex.clients.length === 1 && ex.rates.cost_per_g === 0.02 && ex.pending["u1/a.gcode"] === "pA",
+    "JSON export: every print with its cost, projects with summaries, clients, pending, rates", Object.keys(ex));
   // a date range with both edges: Feb 2026. r3 sits exactly on the start (in), r6 exactly on the end (out), r2 is 30 min before the start (out).
   rep = C.report(rows, projects, clients, RR, { groupBy: "project", from: T("2026-02-01T00:00:00Z"), to: T("2026-03-01T00:00:00Z") });
   ok(rep.rows === 3 && rep.groups.map(g2 => g2.label).join("|") === "Spring <order>|Signs|Loose|(no project)", "by project, February: 3 rows (the start edge is in, the end edge is out); pA joins with no prints because an item was created inside the range", rep.groups.map(g2 => g2.label + ":" + g2.prints + ":" + g2.cost));
@@ -807,6 +837,17 @@ function pureChecks() {
     const rp2 = await (await fetch(HUB + "/api/costing/report/print?group_by=project")).text();
     ok(rp2.includes("Bulk &lt;job&gt;") && !rp2.includes("Bulk <job>"), "…and by project the hostile project name is escaped", null);
     ok((await fetch(HUB + "/api/costing/report/print?group_by=nonsense")).status === 400, "KNOWN-BAD unknown grouping on the page -> 400", null);
+    const jx = await fetch(HUB + "/api/costing/report/jobs.xlsx");
+    const jxB = Buffer.from(await jx.arrayBuffer());
+    const ZR = require("../modules/slicing.js"), jxZ = ZR.zipRead(jxB), jxE = Array.isArray(jxZ) ? jxZ : jxZ.entries;
+    const jxS = ZR.zipEntryContent(jxE.find(e => e.name === "xl/worksheets/sheet1.xml")).toString("utf8");
+    ok(jx.status === 200 && /spreadsheetml/.test(jx.headers.get("content-type")) && /job-costs-\d{4}-\d{2}-\d{2}\.xlsx/.test(jx.headers.get("content-disposition")) && (jxS.match(/<row /g) || []).length === 15 + 2,
+      "jobs.xlsx: every one of the 15 jobs plus header and TOTAL", (jxS.match(/<row /g) || []).length);
+    const jcT = (await (await fetch(HUB + "/api/costing/report/jobs.csv?from=" + lo + "&to=" + hi)).text()).replace(/^﻿/, "");
+    ok(jcT.split("\r\n").filter(Boolean).length === 1 + 14, "jobs.csv honours the report's from/to (14 of 15)", jcT.slice(0, 200));
+    const ej = await fetch(HUB + "/api/costing/export.json"), ejB = await ej.json();
+    ok(ej.status === 200 && /attachment; filename="costing-export-/.test(ej.headers.get("content-disposition")) && ejB.prints.length === 15 && ejB.prints.every(p => p.cost && "direct" in p.cost) && ejB.projects.some(p => p.name === "Bulk <job>" && p.summary) && ejB.fork === "ryvin/u1hub",
+      "export.json: all 15 prints with costs, projects with summaries", { n: ejB.prints && ejB.prints.length });
     await stopHub();
     try { await kobra.close(); } catch {}
     writeConfig(tmp, gcode, portU1, null);

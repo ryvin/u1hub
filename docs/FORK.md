@@ -30,7 +30,7 @@ Switch any of them from Settings → Features, or in `config.json`:
 
 | File | Change |
 |---|---|
-| `modules/printer-sync.js`, `modules/costing.js`, `modules/costing-report.js`, `modules/sme.js`, `modules/multiace.js`, `modules/bl2u1.js`, `modules/estimate.js` + `modules/estimate/*.js` (stl, geometry, sliced, calibrate, match, price, report) | new, server modules (`costing-report.js` is the pure report/CSV/printable-page half of costing, required by `costing.js`; not a feature module of its own) |
+| `modules/printer-sync.js`, `modules/costing.js`, `modules/costing-report.js`, `modules/costing-jobs.js`, `modules/sme.js`, `modules/multiace.js`, `modules/bl2u1.js`, `modules/estimate.js` + `modules/estimate/*.js` (stl, geometry, sliced, calibrate, match, price, report) | new, server modules (`costing-report.js` is the pure report/CSV/printable-page half of costing and `costing-jobs.js` its per-job CSV/XLSX and JSON export, both required by `costing.js`; not feature modules of their own) |
 | `public/modules/library-colors-ui.js`, `public/modules/costing-ui.js`, `public/modules/sme-ui.js`, `public/modules/multiace-ui.js`, `public/modules/estimate-ui.js` | new, client modules |
 | `sme/core/` (agent.md, knowledge.md, schema/tiers/lessons/family/claude/store/review.js, cli.js, CONTEXT.md) | new, the SME core: project-agnostic, no Hub dependency, shared state in `SME_HOME` |
 | `scripts/sme-runner.js`, `scripts/sme-local-sources.js`, `scripts/sme-schedule-install.ps1` | new, the SME runner (host side) and its scheduled tasks |
