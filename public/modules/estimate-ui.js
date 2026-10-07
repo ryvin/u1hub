@@ -48,6 +48,7 @@
       ".estcand{display:flex; gap:10px; align-items:center; padding:8px; border:1px solid var(--line-soft); border-radius:8px;} .estcand img{width:56px; height:56px; object-fit:contain; border-radius:6px; background:var(--panel-2); flex:none;}",
       ".estcand .t{flex:1; min-width:0; font-size:12.5px; color:var(--ink); overflow-wrap:anywhere;} .estcand .s{font-family:var(--mono); font-size:11px; color:var(--ink-faint); margin-top:2px;}",
       ".estrow{display:flex; gap:8px; flex-wrap:wrap; align-items:center;} .estrow .btn{font-size:12px; padding:5px 11px;} .estrow .field{font-size:12.5px; padding:4px 7px; width:auto; max-width:220px;}",
+      ".estsw{display:inline-block; width:14px; height:14px; border-radius:3px; margin-left:6px; vertical-align:middle; border:1px solid var(--line);} .estpal .field{max-width:130px;}",
       "@media (max-width:420px){ .estinputs .field{max-width:120px;} .estprice{font-size:24px;} }"
     ].join("\n");
     document.head.appendChild(s);
@@ -233,6 +234,7 @@
     if (act === "new") { CUR = null; files.length = 0; paintFiles(); render(); return; }
     if (act === "open") return load(t.dataset.id);
     if (act === "del") { await jsend("/api/estimate/" + encodeURIComponent(t.dataset.id), undefined, "DELETE"); if (CUR && CUR.id === t.dataset.id) { CUR = null; render(); } return paintSaved(); }
+    if (/^(r|q)/.test(act) || act === "slice") return onQuoteClick(act, t);
     if (!CUR) return;
     if (act === "use" || act === "geo" || act === "src") {
       const back = (CUR.sources_available || []).includes("sliced") ? "sliced" : ((CUR.sources_available || []).find(x => x !== "printed") || "geometry");
@@ -252,13 +254,108 @@
     }
   }
 
+  // ---- public quotes: requests and settings (docs/quote.md) ------------------------------
+  const RSTATUS = { new: "New", quoted: "Quoted", accepted: "Accepted", declined: "Declined", closed: "Closed" };
+  const rng = q => !q ? "—" : q.price != null ? usd(q.price) : q.price_low != null ? usd(q.price_low) + "–" + usd(q.price_high) : "by hand";
+  let REQS = [], QS = null, SENDING = null, KEYARM = 0;
+  async function paintRequests() {
+    const box = EL && EL.querySelector(".estreq"); if (!box) return;
+    const r = await jget("/api/estimate/quote/requests");
+    REQS = (r.ok && r.d.requests) || [];
+    box.innerHTML = '<div class="estcard"><h3>Quote requests</h3>' + (!REQS.length ? '<div class="estsub">No requests yet. They arrive from the public quote page.</div>'
+      : '<table class="esttable"><tr><th>Who</th><th>Status</th><th>Quoted</th><th>Final</th><th>Actual</th><th></th></tr>' + REQS.map(x => {
+        const q = x.quote || {}, c = x.contact || {};
+        const what = esc(q.qty || 1) + ' × ' + esc(q.multicolour ? "own colours" : [q.material, q.colour].filter(Boolean).join(" ")) + ' · ' + esc(q.quality || "") + (q.rush ? " · rush" : "") + ' · ' + esc(q.confidence || "") + (q.ready_by ? ' · ready ' + esc(q.ready_by) : "");
+        const open = x.status === "new" || x.status === "quoted";
+        return '<tr><td>' + esc(c.name || "?") + '<div class="estsub">' + esc(c.email || "") + ' · ' + what + (c.notes ? '<br>' + esc(c.notes) : "") + (x.files_deleted ? '<br>the visitor deleted the files' : "") + '</div>'
+          + (SENDING === x.id ? '<div class="estrow"><input class="field" data-rs="price" type="number" min="0" step="0.5" value="' + esc(q.price != null ? q.price : (q.price_high != null ? q.price_high : "")) + '" placeholder="final $"><input class="field" data-rs="note" placeholder="note to the customer" value="' + esc(x.owner_note || "") + '"><button class="btn primary" data-est="rsendgo" data-id="' + esc(x.id) + '">Send</button></div>' : "")
+          + '</td><td>' + esc(RSTATUS[x.status] || x.status) + '</td><td>' + rng(q) + '</td><td>' + usd(x.final_price) + '</td><td>' + (x.project_id ? usd(x.actual) : "—") + '</td>'
+          + '<td><div class="estrow"><button class="btn" data-est="open" data-id="' + esc(x.id) + '">Open</button>'
+          + (open ? '<button class="btn" data-est="rsend" data-id="' + esc(x.id) + '">Send quote</button>' : "")
+          + (x.status === "quoted" ? '<button class="btn" data-est="raccept" data-id="' + esc(x.id) + '">Accept</button>' : "")
+          + (open ? '<button class="btn" data-est="rdecline" data-id="' + esc(x.id) + '">Decline</button>' : "")
+          + (x.status === "accepted" ? '<button class="btn" data-est="slice">Slice it</button>' : "")
+          + (x.status !== "closed" ? '<button class="btn" data-est="rclose" data-id="' + esc(x.id) + '">Close</button>' : "") + '</div></td></tr>';
+      }).join("") + '</table>') + '<div class="estmsg estrm"></div></div>';
+  }
+  const palRow = p => '<tr data-pal><td><input class="field" data-pf="material" value="' + esc(p.material) + '"></td><td><input class="field" data-pf="colour" value="' + esc(p.colour) + '"></td>'
+    + '<td><input class="field" data-pf="hex" value="' + esc(p.hex) + '" style="width:90px"><span class="estsw" style="background:' + esc(p.hex) + '"></span></td>'
+    + '<td><input type="checkbox" data-pf="in_stock"' + (p.in_stock ? " checked" : "") + '></td><td><button class="btn" data-est="qpdel">Remove</button><input type="hidden" data-pf="id" value="' + esc(p.id || "") + '"></td></tr>';
+  async function paintQuoteSettings() {
+    const box = EL && EL.querySelector(".estqset"); if (!box) return;
+    const r = await jget("/api/estimate/quote/settings"); if (!r.ok) return;
+    const S = QS = r.d, day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    box.innerHTML = '<div class="estcard"><h3>Public quotes</h3>'
+      + '<div class="estsub">The public page (quote.satisfyingprints3d.com) prices uploads with these settings and your Projects rates. Requests appear above.</div>'
+      + '<div class="estrow"><label class="estsub"><input type="checkbox" data-qs="enabled"' + (S.enabled ? " checked" : "") + '> Taking quotes</label>'
+      + '<label class="estsub"><input type="checkbox" data-qs="firm_prices"' + (S.firm_prices ? " checked" : "") + '> Firm prices for exact quotes</label>'
+      + '<span class="estsub">Service key: ' + (S.key_set ? "set" : "not set") + '</span><button class="btn" data-est="qkey">' + (S.key_set ? "New key" : "Make key") + '</button></div>'
+      + '<div class="estrow">' + [["round_to", "Round to $"], ["valid_days", "Valid days"], ["rush_multiplier", "Rush ×"], ["qty_max", "Max qty"], ["post_days", "Post-processing days"]]
+          .map(([k, l]) => '<label class="estsub">' + l + ' <input class="field" style="width:70px" data-qs="' + k + '" value="' + esc(S[k]) + '"></label>').join("") + '</div>'
+      + '<div class="estrow"><span class="estsub">Working hours</span>' + day.map((d, i) => '<label class="estsub"><input type="checkbox" data-qd="' + i + '"' + (S.hours.days.includes(i) ? " checked" : "") + '>' + d + '</label>').join("")
+      + '<input class="field" style="width:70px" data-qh="start" value="' + esc(S.hours.start) + '"><input class="field" style="width:70px" data-qh="end" value="' + esc(S.hours.end) + '">'
+      + '<input class="field" style="width:170px" data-qh="tz" value="' + esc(S.hours.tz) + '" title="IANA timezone, e.g. America/Chicago"></div>'
+      + '<table class="esttable estpal"><tr><th>Material</th><th>Colour</th><th>Hex</th><th>In stock</th><th></th></tr>' + S.palette.map(palRow).join("") + '</table>'
+      + '<div class="estrow"><button class="btn" data-est="qpadd">Add colour</button><button class="btn" data-est="qpseed">Suggest from loaded spools</button><button class="btn primary" data-est="qsave">Save</button><span class="estsub estqm"></span></div></div>';
+  }
+  function quoteSettingsBody() {
+    const v = k => { const el = EL.querySelector('[data-qs="' + k + '"]'); return el ? el.value : null; };
+    const chk = k => { const el = EL.querySelector('[data-qs="' + k + '"]'); return !!(el && el.checked); };
+    const palette = [...EL.querySelectorAll("[data-pal]")].map(tr => { const f = k => tr.querySelector('[data-pf="' + k + '"]'); return { id: f("id").value || undefined, material: f("material").value, colour: f("colour").value, hex: f("hex").value.trim(), in_stock: f("in_stock").checked }; });
+    return { enabled: chk("enabled"), firm_prices: chk("firm_prices"), round_to: Number(v("round_to")), valid_days: Number(v("valid_days")), rush_multiplier: Number(v("rush_multiplier")),
+             qty_max: Number(v("qty_max")), post_days: Number(v("post_days")),
+             hours: { days: [...EL.querySelectorAll("[data-qd]")].filter(c => c.checked).map(c => Number(c.dataset.qd)), start: EL.querySelector('[data-qh="start"]').value, end: EL.querySelector('[data-qh="end"]').value, tz: EL.querySelector('[data-qh="tz"]').value.trim() },
+             palette };
+  }
+  async function onQuoteClick(act, t) {
+    const qm = t => { const m = EL.querySelector(".estqm"); if (m) m.textContent = t; };
+    const rm = t => { const m = EL.querySelector(".estrm"); if (m) m.textContent = t; };
+    const post = (id, what, b) => jsend("/api/estimate/quote/requests/" + encodeURIComponent(id) + "/" + what, b || {});
+    if (act === "rsend") { SENDING = SENDING === t.dataset.id ? null : t.dataset.id; return paintRequests(); }
+    if (act === "rsendgo") {
+      const row = t.closest("tr"), r = await post(t.dataset.id, "send", { final_price: Number(row.querySelector('[data-rs="price"]').value), note: row.querySelector('[data-rs="note"]').value });
+      if (!r.ok) return rm((r.d && r.d.error) || "could not send");
+      SENDING = null; return paintRequests();
+    }
+    if (act === "raccept") {
+      const x = REQS.find(q => q.id === t.dataset.id); if (!x) return;
+      const c = x.contact || {};
+      const cl = await jsend("/api/costing/clients", { name: c.name || "Quote customer", email: c.email || "" });
+      if (!cl.ok) return rm("client: " + ((cl.d && cl.d.error) || "failed"));
+      const pr = await jsend("/api/costing/projects", { name: "Quote " + new Date().toISOString().slice(0, 10) + " - " + (c.name || "customer"), client_id: cl.d.client.id, charged: x.final_price != null ? x.final_price : "" });
+      if (!pr.ok) return rm("project: " + ((pr.d && pr.d.error) || "failed"));
+      const r = await post(x.id, "accept", { project_id: pr.d.project.id, client_id: cl.d.client.id });
+      if (!r.ok) return rm((r.d && r.d.error) || "could not accept");
+      return paintRequests();
+    }
+    if (act === "rdecline" || act === "rclose") { const r = await post(t.dataset.id, act === "rdecline" ? "decline" : "close"); if (!r.ok) return rm((r.d && r.d.error) || "failed"); return paintRequests(); }
+    if (act === "slice") { const s = [...document.querySelectorAll("button")].find(x => x.textContent.trim() === "Slice"); if (s) s.click(); else rm("Slice it in your slicer (Open shows the estimate and its file), then queue it in Dispatch."); return; }
+    if (act === "qpadd") { EL.querySelector(".estpal").insertAdjacentHTML("beforeend", palRow({ material: "PLA", colour: "", hex: "#ffffff", in_stock: true })); return; }
+    if (act === "qpdel") { t.closest("tr").remove(); return; }
+    if (act === "qpseed") {
+      const r = await jsend("/api/estimate/quote/palette/seed", {}); if (!r.ok) return qm("could not read the loaded spools");
+      const have = new Set([...EL.querySelectorAll('[data-pal] [data-pf="hex"]')].map(i => i.value.toLowerCase()));
+      const add = (r.d.palette || []).filter(p => !have.has(p.hex));
+      add.forEach(p => EL.querySelector(".estpal").insertAdjacentHTML("beforeend", palRow({ ...p, id: "" })));
+      return qm(add.length ? add.length + " colour(s) added - check the names, then Save" : "nothing new on the loaded spools");
+    }
+    if (act === "qsave") { const r = await jsend("/api/estimate/quote/settings", quoteSettingsBody()); if (!r.ok) return qm((r.d && r.d.error) || "could not save"); await paintQuoteSettings(); return qm("Saved."); }
+    if (act === "qkey") {
+      if (QS && QS.key_set && Date.now() - KEYARM > 4000) { KEYARM = Date.now(); t.textContent = "Click again: the running quote service stops until it gets the new key"; return; }
+      KEYARM = 0;
+      const r = await jsend("/api/estimate/quote/key", {}); if (!r.ok) return qm("could not make a key");
+      await paintQuoteSettings();
+      return qm("Key: " + r.d.key + " - put it in quote/.env as QUOTE_KEY. It is not shown again.");
+    }
+  }
+
   // ---- the tab --------------------------------------------------------------------------
   function mount(el) {
     style();
     EL = el;
     el.innerHTML = '<div class="estwrap"><h2 class="esth">Estimate</h2><div class="estsub">Drop an STL or 3MF to get grams, print time, what it costs you and what to charge. Numbers say where they came from: the model\'s geometry, the file\'s own slice, or an earlier print of the same model.</div>'
       + '<div class="estdrop"><div>Drop .stl / .3mf files here</div><button class="btn" data-est="pick">Choose files</button><input class="estpick" type="file" accept=".stl,.3mf" multiple hidden><div class="estfiles"></div></div>'
-      + '<div class="estmsg estm"></div><div class="estout"></div><div class="estsaved"></div></div>';
+      + '<div class="estmsg estm"></div><div class="estout"></div><div class="estsaved"></div><div class="estreq"></div><div class="estqset"></div></div>';
     const drop = el.querySelector(".estdrop"), pick = el.querySelector(".estpick");
     pick.addEventListener("change", () => { if (pick.files.length) addFiles(pick.files); pick.value = ""; });
     drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
@@ -272,7 +369,7 @@
     if (!INFO) { const r = await jget("/api/estimate/info"); INFO = r.ok ? r.d : { presets: [], materials: [] }; }
     const [p, f] = await Promise.all([jget("/api/costing/projects"), jget("/api/fleet")]);
     PROJ = p.ok ? p.d : null; FLEET = f.ok && Array.isArray(f.d) ? f.d : [];
-    render(); paintSaved();
+    render(); paintSaved(); paintRequests(); paintQuoteSettings();
   }
   window.HubModules.register("estimate", { tab: "Estimate", mount, onShow });
 })();
