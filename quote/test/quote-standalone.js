@@ -79,6 +79,13 @@ async function main() {
     const cfg = await jget("/api/config");
     ok(cfg.body.siteKey === "test-site" && cfg.body.maxMb === 1 && !JSON.stringify(cfg.body).includes("test-secret") && !JSON.stringify(cfg.body).includes(KEY), "config: site key only, never secrets", cfg.body);
 
+    const js = await fetch(SVC + "/static/app.js"), css = await fetch(SVC + "/static/style.css");
+    ok(js.status === 200 && css.status === 200, "app.js and style.css served");
+    ok(/src="\/static\/app\.js"/.test(html) && /href="\/static\/style\.css"/.test(html) && !/<script>[^<]/.test(html) && !/style="/.test(html), "no inline script or style (the CSP would block them)");
+    const appjs = await js.text();
+    ok(!/\.innerHTML\s*=\s*[^"'`]/.test(appjs.replace(/innerHTML = ""/g, "")), "app.js never assigns data to innerHTML");
+    ok(/turnstile\.reset/.test(appjs) && /X-Turnstile-Token/.test(appjs), "app.js resets Turnstile after use and sends the token");
+
     console.log("\n-- upload --");
     ok((await up("a.stl", Buffer.alloc(10), "bad-token")).status === 403, "a failed Turnstile -> 403, nothing sent");
     ok((await up("a.obj", Buffer.alloc(10))).status === 400, "only .stl / .3mf");

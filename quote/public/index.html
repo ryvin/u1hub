@@ -1,2 +1,52 @@
 <!doctype html>
-<title>Quote</title>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print Quote</title>
+<meta name="description" content="Upload an STL or 3MF and get a 3D printing price and ready date from Satisfying Prints 3D.">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<main class="wrap">
+  <header class="brand"><span class="mark" aria-hidden="true"></span><span>Satisfying Prints 3D</span></header>
+  <h1 id="title">Get a print quote</h1>
+  <section id="upload" class="card">
+    <label class="drop" id="drop" for="file">
+      <input type="file" id="file" accept=".stl,.3mf" hidden>
+      <strong>Drop an STL or 3MF</strong><span>or choose a file · up to <b id="maxmb">100</b> MB</span>
+    </label>
+    <div id="ts-upload" class="ts"></div>
+    <p class="msg" id="upmsg" role="status" aria-live="polite"></p>
+    <p class="fine">Your file is used only to price this quote. It is deleted after 7 days unless you request the print, and you can delete it any time.</p>
+  </section>
+  <section id="quote" class="card" hidden>
+    <div class="price" id="price"></div>
+    <div class="chips"><span class="chip" id="conf"></span><span class="chip" id="ready"></span></div>
+    <p class="fine" id="valid"></p>
+    <p class="warn" id="note" hidden></p>
+    <blockquote class="ownernote" id="ownernote" hidden></blockquote>
+    <div id="opts" class="opts">
+      <div class="row"><span class="lbl">Quantity</span><div class="qty"><button type="button" id="qminus" aria-label="Fewer">−</button><input id="qty" inputmode="numeric" value="1" aria-label="Quantity"><button type="button" id="qplus" aria-label="More">+</button></div></div>
+      <div class="row"><span class="lbl">Colour</span><div id="swatches" class="swatches"></div></div>
+      <div class="row"><span class="lbl">Quality</span><div class="seg" role="radiogroup"><button type="button" data-q="standard" role="radio">Standard</button><button type="button" data-q="strong" role="radio">Strong</button></div></div>
+      <div class="row"><label class="check"><input type="checkbox" id="rush"> <span id="rushlbl">Rush</span></label></div>
+    </div>
+    <form id="reqform" class="req">
+      <h2>Request this print</h2>
+      <input id="name" placeholder="Your name" maxlength="80" required autocomplete="name">
+      <input id="email" type="email" placeholder="Email" maxlength="200" required autocomplete="email">
+      <textarea id="notes" placeholder="Anything we should know? (optional)" maxlength="2000" rows="3"></textarea>
+      <div id="ts-request" class="ts"></div>
+      <button type="submit" class="primary" id="reqbtn">Request this print</button>
+      <p class="msg" id="reqmsg" role="status" aria-live="polite"></p>
+    </form>
+    <div id="status" class="status" hidden></div>
+    <button type="button" class="ghost" id="del">Delete my files</button>
+  </section>
+</main>
+</body>
+</html>
