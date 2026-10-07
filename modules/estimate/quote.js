@@ -124,5 +124,8 @@ function expired(est, now) {
   if (est.status === "closed" || est.status === "declined") return est.closed_at != null && now - est.closed_at > CLOSED_MS;
   return false;
 }
-module.exports = { QUOTE_DEFAULTS, VIEW_FIELDS, UNREQUESTED_MS, CLOSED_MS, EXACT_BAND, keyOk, pickPublicSource, confidenceOf, bandsFor, priceRange,
+const INTERNAL_MS = 30 * DAY;
+// The estimate module's one prune rule: public quotes by expired(); internal ones unsaved > 30 days.
+function dropOnPrune(est, now) { return est.public ? expired(est, now) : (!est.saved && now - est.created > INTERNAL_MS); }
+module.exports = { dropOnPrune, QUOTE_DEFAULTS, VIEW_FIELDS, UNREQUESTED_MS, CLOSED_MS, EXACT_BAND, keyOk, pickPublicSource, confidenceOf, bandsFor, priceRange,
                    checkOptions, inputsFor, checkContact, checkPalette, checkSettings, customerView, expired };

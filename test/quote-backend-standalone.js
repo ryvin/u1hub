@@ -110,8 +110,16 @@ function pureReadyBy() {
   ok(RB.localParts(Date.UTC(2026, 9, 5, 13, 0), "America/Chicago").min === 8 * 60, "localParts: 13:00Z is 08:00 in Chicago");
 }
 
+function pruneRule() {
+  console.log("\n-- retention rule --");
+  const D = 24 * 3600 * 1000, now = 100 * D;
+  ok(Q.dropOnPrune({ public: true, status: "new", created: now - 40 * D, saved: false }, now) === false, "an open public request survives the old 30-day unsaved rule");
+  ok(Q.dropOnPrune({ status: "quote", created: now - 31 * D, saved: false }, now) === true && Q.dropOnPrune({ created: now - 31 * D, saved: true }, now) === false, "internal estimates: unsaved > 30 days dropped, saved kept");
+  ok(Q.dropOnPrune({ public: true, status: "quote", created: now - 8 * D }, now) === true, "an unrequested public quote is dropped after 7 days");
+}
+
 async function main() {
-  pureQuote(); pureReadyBy();
+  pureQuote(); pureReadyBy(); pruneRule();
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exit(fail ? 1 : 0);
 }

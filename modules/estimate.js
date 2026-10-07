@@ -30,10 +30,11 @@ const { parseGcodeMap, estMinutes } = require("../parser.js");
 const STL = require("./estimate/stl.js"), GEO = require("./estimate/geometry.js"), SL = require("./estimate/sliced.js");
 const ZC = require("./estimate/zipcap.js");
 const CAL = require("./estimate/calibrate.js"), MATCH = require("./estimate/match.js"), PRICE = require("./estimate/price.js"), REP = require("./estimate/report.js");
+const QUOTE = require("./estimate/quote.js");
 
 const FORK = "ryvin/u1hub";
 const MAX_MB = Math.max(0.001, Number(process.env.U1HUB_ESTIMATE_MAX_MB) || 200);
-const PRUNE_MS = 30 * 24 * 3600 * 1000, PRUNE_EVERY_MS = 6 * 3600 * 1000, JOB_TTL_MS = 10 * 60 * 1000, VALID_DAYS = 14;
+const PRUNE_EVERY_MS = 6 * 3600 * 1000, JOB_TTL_MS = 10 * 60 * 1000, VALID_DAYS = 14;
 const LIB_TTL_MS = process.env.U1HUB_ESTIMATE_LIB_TTL_MS != null ? Math.max(0, Number(process.env.U1HUB_ESTIMATE_LIB_TTL_MS) || 0) : 5 * 60 * 1000;
 // One zip entry of an uploaded 3MF may inflate to at most this (mesh XML; a plate gcode is streamed instead).
 const ENTRY_MAX_BYTES = 256 * 1048576;
@@ -240,7 +241,8 @@ function register(ctx) {
     return {
       inputs: I, source, sources_available: sources, source_label: label,
       print: { grams, minutes, plates: plates || files.length, supports_needed, supports_g: r2(geo.reduce((a, g) => a + g.supports_g, 0)), colours, band_pct, designer_minutes,
-               brim: !!(tallest && tallest.aspect > 3), multiace: colours > 4 },
+               brim: !!(tallest && tallest.aspect > 3), multiace: colours > 4,
+               k_err: CALS.k && CALS.k[mode] && CALS.k[mode].err != null ? CALS.k[mode].err : null, multicolour: colours > 1 },
       model: { size_mm: files.length ? size : null, volume_cm3: files.length ? r2(volume) : null, measured: files.length === usable.length && usable.length > 0 }, fits: files.length ? fits.map(f => f.name) : null, fits_unchecked, schedule, printer_id: pid,
       cost: price.cost, pricing: price.pricing, recommended: price.recommended, blanks: price.blanks,
       fit: { key: fit.key, source: fit.source, n: fit.n }, calibration_k: k
@@ -273,6 +275,11 @@ function register(ctx) {
   const get = id => { const k = String(id || ""); return Object.prototype.hasOwnProperty.call(S.estimates, k) ? S.estimates[k] : null; };
   const bad = (res, code, error, extra) => res.status(code).json({ error, ...(extra || {}) });
 
+  const newEstimate = id => ({ id, created: Date.now(), files: [], candidates: [], inputs: { ...DEFAULT_INPUTS }, source: null, candidate_key: null, saved: false, project_id: null, client_id: null, note: "" });
+  // The public quote backend and the owner's quote routes (estimate/quote-backend.js), mounted before /:id.
+  const H = { S, get, save: () => save(), compute, view, receive, newEstimate, JOBS, DIR, fileOf, use, checkInputs, DEFAULT_INPUTS, pruneAt };
+  try { require("./estimate/quote-backend.js").mount(ctx, H); } catch (e) { if (e.code !== "MODULE_NOT_FOUND") throw e; }
+
   // ---- routes (fixed paths before /:id) ----
   ctx.app.get("/api/estimate/info", (req, res) => res.json({ enabled: true, fork: FORK, max_mb: MAX_MB, library: { ...LIB_STATS }, presets: Object.entries(GEO.PRESETS).map(([key, p]) => ({ key, label: p.label })), materials: MATERIALS,
     calibration: { at: CALS.at, fits: CALS.fits, k: CALS.k } }));
@@ -282,16 +289,18 @@ function register(ctx) {
     if (!j) return bad(res, 404, "no such job");
     res.json({ phase: j.phase, done: j.done, error: j.error, id: j.id, file_id: j.file_id });
   });
-  ctx.app.post("/api/estimate/upload", (req, res) => {
+  // One raw-body upload, streamed under a byte cap. Shared by the Estimate tab and the public
+  // quote backend (estimate/quote-backend.js): opts = { cap, capMb, existing, make(id), after?, analysed? }.
+  function receive(req, res, opts) {
     let name = "";
     try { name = path.basename(decodeURIComponent(String(req.get("X-File-Name") || ""))); } catch { name = ""; }
     const m = /\.(stl|3mf)$/i.exec(name);
     if (!m) { req.resume(); return bad(res, 400, "only .stl and .3mf files can be estimated"); }
     const kind = m[1].toLowerCase();
-    const existing = get(req.query.id);
+    const existing = opts.existing || null;
     const id = existing ? existing.id : newId("est_"), file_id = newId("f_");
     const dir = path.join(DIR, id), fp = path.join(dir, file_id + "." + kind);
-    const cap = MAX_MB * 1048576;
+    const cap = opts.cap;
     try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { req.resume(); return bad(res, 500, "could not store the upload: " + e.message); }
     const ws = fs.createWriteStream(fp);
     let bytes = 0, over = false, finished = false;
@@ -300,7 +309,7 @@ function register(ctx) {
     req.on("data", chunk => {
       if (over) return;
       bytes += chunk.length;
-      if (bytes > cap) { over = true; cleanup(); res.set("Connection", "close"); bad(res, 413, "over the " + MAX_MB + " MB limit"); return; }
+      if (bytes > cap) { over = true; cleanup(); res.set("Connection", "close"); bad(res, 413, "over the " + opts.capMb + " MB limit"); return; }
       if (!ws.write(chunk)) { req.pause(); ws.once("drain", () => req.resume()); }
     });
     req.on("aborted", () => { if (!finished && !over) { over = true; cleanup(); } });
@@ -309,7 +318,7 @@ function register(ctx) {
       ws.end(() => {
         finished = true;
         if (!bytes) { cleanup(); return bad(res, 400, "the file is empty"); }
-        const est = existing || { id, created: Date.now(), files: [], candidates: [], inputs: { ...DEFAULT_INPUTS }, source: null, candidate_key: null, saved: false, project_id: null, client_id: null, note: "" };
+        const est = existing || opts.make(id);
         S.estimates[id] = est;
         const f = { file_id, name, kind, bytes, facts: null, sliced: null, error: null };
         est.files.push(f);
@@ -317,12 +326,13 @@ function register(ctx) {
         const jobId = newId("j_");
         const job = { id, file_id, phase: "queued", done: false, error: null, ts: Date.now() };
         JOBS.set(jobId, job);
-        res.json({ id, file_id, jobId });
-        analyse(est, f, job).catch(e => { job.error = e.message; job.done = true; });
+        if (opts.after) opts.after(est, f, job, jobId); else res.json({ id, file_id, jobId });
+        analyse(est, f, job).then(() => opts.analysed && opts.analysed(est)).catch(e => { job.error = e.message; job.done = true; });
       });
     });
     ws.on("error", e => { if (!over) { over = true; cleanup(); bad(res, 500, "could not store the upload: " + e.message); } });
-  });
+  }
+  ctx.app.post("/api/estimate/upload", (req, res) => receive(req, res, { cap: MAX_MB * 1048576, capMb: MAX_MB, existing: get(req.query.id), make: newEstimate }));
   ctx.app.get("/api/estimate", (req, res) => {
     const list = Object.values(S.estimates).filter(e => e.saved).sort((a, b) => b.created - a.created);
     Promise.all(list.map(e => view(e).then(v => ({ id: e.id, name: v.name, created: e.created, recommended: v.recommended, project_id: e.project_id, client_id: e.client_id, note: e.note, actual: v.actual })).catch(() => null)))
@@ -390,11 +400,12 @@ function register(ctx) {
   });
 
   // ---- housekeeping ----
-  function prune() {
-    const cut = Date.now() - PRUNE_MS;
-    for (const est of Object.values(S.estimates)) if (!est.saved && est.created < cut) { delete S.estimates[est.id]; fs.rm(path.join(DIR, est.id), { recursive: true, force: true }, () => {}); }
+  // One rule (estimate/quote.js dropOnPrune): public quotes by their retention, internal estimates unsaved > 30 days.
+  function pruneAt(now) {
+    for (const est of Object.values(S.estimates)) if (QUOTE.dropOnPrune(est, now)) { delete S.estimates[est.id]; fs.rm(path.join(DIR, est.id), { recursive: true, force: true }, () => {}); }
     save();
   }
+  const prune = () => pruneAt(Date.now());
   prune();
   const tp = setInterval(prune, PRUNE_EVERY_MS); if (tp.unref) tp.unref();
 
