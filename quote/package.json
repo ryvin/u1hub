@@ -1,0 +1,9 @@
+{
+  "name": "u1-quote",
+  "private": true,
+  "description": "Public quote page for the U1 Print Hub (fork ryvin/u1hub). Talks to the Hub's /api/quote-backend over a shared key.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node test/quote-standalone.js" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "express": "^4.19.2" }
+}
