@@ -2,7 +2,8 @@
 // (u1-quote, quote/). /api/quote-backend/* answers only with X-Quote-Key =
 // config.json estimate.quote_key; a quote is an estimate with public:true and
 // a 128-bit token, priced by the same compute() as the Estimate tab, and every
-// answer is customerView()'s allow-list. The owner's routes are in mountOwner().
+// answer is customerView()'s allow-list. The owner's routes (/api/estimate/quote/*,
+// Hub session) are at the end of mount().
 // Fork module estimate (ryvin/u1hub). Spec: docs/superpowers/specs/2026-10-07-public-quote-design.md
 "use strict";
 const crypto = require("crypto"), fs = require("fs"), path = require("path");
@@ -96,6 +97,52 @@ function mount(ctx, H) {
     else { est.files_deleted = true; }
     H.save(); res.json({ ok: true });
   });
+  // ---- the owner's side (Hub session) ----
+  const ownerView = async est => {
+    let actual = null;
+    if (est.project_id) { try { const s = H.use("costing.projectSummary", () => null)(est.project_id); actual = s ? s.cost : null; } catch {} }
+    return { id: est.id, status: est.status, contact: est.contact, created: est.created, requested_at: est.requested_at || null, closed_at: est.closed_at || null,
+             quote: await publicView(est).catch(() => null), final_price: est.final_price, owner_note: est.owner_note || "", project_id: est.project_id, client_id: est.client_id, actual,
+             files_deleted: !!est.files_deleted };
+  };
+  const reqOf = id => { const e = H.get(id); return e && e.public && e.status !== "quote" ? e : null; };
+  const settingsOut = () => ({ ...settings(), key_set: typeof conf().quote_key === "string" && conf().quote_key.length >= 32 });
+  ctx.app.get("/api/estimate/quote/settings", (req, res) => res.json(settingsOut()));
+  ctx.app.post("/api/estimate/quote/settings", (req, res) => {
+    const c = QUOTE.checkSettings(req.body || {}, conf().quote || {}); if (c.error) return bad(res, 400, c.error);
+    conf().quote = c.settings; ctx.saveConfig(); res.json(settingsOut());
+  });
+  ctx.app.post("/api/estimate/quote/key", (req, res) => { const key = crypto.randomBytes(32).toString("hex"); conf().quote_key = key; ctx.saveConfig(); res.json({ key }); });
+  ctx.app.post("/api/estimate/quote/palette/seed", (req, res) => {
+    const seen = new Set(), out = [];
+    const add = (material, colour, hex) => {
+      const h = String(hex || "").toLowerCase(), m = String(material || "PLA").toUpperCase();
+      if (!/^#[0-9a-f]{6}$/.test(h) || seen.has(m + h)) return;
+      seen.add(m + h); out.push({ material: m, colour: String(colour || h).slice(0, 40), hex: h, in_stock: true });
+    };
+    try { for (const s of Object.values(ctx.spoolShelf() || {})) add(s.material, s.color_name, s.hex); } catch {}
+    (ctx.printers || []).forEach((p, i) => { try { for (const s of ctx.loadout(i) || []) add(s.material, s.color_name, s.hex); } catch {} });
+    const c = QUOTE.checkPalette(out); res.json({ palette: c.palette || [] });
+  });
+  ctx.app.get("/api/estimate/quote/requests", async (req, res) => {
+    const list = Object.values(H.S.estimates).filter(e => e.public && e.status !== "quote").sort((a, b) => (b.requested_at || b.created) - (a.requested_at || a.created));
+    res.json({ requests: await Promise.all(list.map(ownerView)) });
+  });
+  const act = (name, fn) => ctx.app.post("/api/estimate/quote/requests/:id/" + name, async (req, res) => {
+    const est = reqOf(req.params.id); if (!est) return bad(res, 404, "no such request");
+    const err = await fn(est, req.body || {}); if (err) return bad(res, 400, err);
+    H.save(); res.json(await ownerView(est));
+  });
+  act("send", async (est, b) => {
+    const p = Number(b.final_price);
+    if (!Number.isFinite(p) || p < 0 || p > 1e6) return "final_price must be a dollar amount";
+    est.final_price = Math.round(p * 100) / 100; est.owner_note = String(b.note || "").slice(0, 2000); est.status = "quoted";
+    est.ready_final = null;
+    const v = await publicView(est).catch(() => null); est.ready_final = v && v.ready_by ? v.ready_by : null;
+  });
+  act("accept", async (est, b) => { est.status = "accepted"; est.project_id = b.project_id ? String(b.project_id).slice(0, 80) : null; est.client_id = b.client_id ? String(b.client_id).slice(0, 80) : null; });
+  act("decline", async (est, b) => { est.status = "declined"; est.closed_at = Date.now(); if (b.note) est.owner_note = String(b.note).slice(0, 2000); });
+  act("close", async est => { est.status = "closed"; est.closed_at = Date.now(); });
   return { publicView, settings, TOKENS, byToken };
 }
 module.exports = { mount, QUOTE_MAX_MB };

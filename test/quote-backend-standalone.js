@@ -213,8 +213,44 @@ async function booted() {
     v = await bget("/api/quote-backend/quote/" + T1);
     ok(v.status === 200 && v.body.files_deleted === true && v.body.status === "new", "...its files go, the request stays", v.body);
 
-    console.log("\n-- paused --");
-    // (Task 5 adds the owner settings route; here the switch is flipped through it once it exists)
+    console.log("\n-- owner: settings --");
+    async function jget(p) { return bget(p, null); }
+    async function jpost(p, b) { return bpost(p, b, null); }
+    let s = await jget("/api/estimate/quote/settings");
+    ok(s.status === 200 && s.body.key_set === true && !JSON.stringify(s.body).includes(KEY) && s.body.palette.length === 2, "settings: key_set, never the key itself", s.body);
+    ok((await jpost("/api/estimate/quote/settings", { round_to: 0 })).status === 400, "settings: bad value -> 400");
+    s = await jpost("/api/estimate/quote/settings", { firm_prices: true });
+    ok(s.status === 200 && s.body.firm_prices === true, "settings: firm_prices on");
+    r = await bup("cube.stl", binStl(cubeTris(20)));
+    v = await waitReady(r.body.token);
+    ok(v.body.confidence === "exact" && (v.body.price == null || (v.body.price_low == null && v.body.price_high == null)), "firm + exact -> one price (or none without rates), never a range", v.body);
+    await jpost("/api/estimate/quote/settings", { firm_prices: false });
+    s = await jpost("/api/estimate/quote/settings", { enabled: false });
+    ok((await bup("x.stl", binStl(cubeTris(20)))).status === 503 && (await bget("/api/quote-backend/ping")).body.enabled === false, "disabled -> uploads refused (paused), ping says so");
+    await jpost("/api/estimate/quote/settings", { enabled: true });
+    const seed = await jpost("/api/estimate/quote/palette/seed");
+    ok(seed.status === 200 && Array.isArray(seed.body.palette), "palette seed answers (empty shelf -> empty list)", seed.body);
+
+    console.log("\n-- owner: requests --");
+    let L = await jget("/api/estimate/quote/requests");
+    const req1 = (L.body.requests || []).find(x => x.contact && x.contact.name === "Ann");
+    ok(L.status === 200 && req1 && req1.status === "new" && req1.contact.email === "ann@example.com", "the request is listed with its contact", L.body);
+    ok((await jpost("/api/estimate/quote/requests/" + req1.id + "/send", { final_price: -1 })).status === 400, "send: a negative price -> 400");
+    r = await jpost("/api/estimate/quote/requests/" + req1.id + "/send", { final_price: 42.5, note: "Ready Friday." });
+    ok(r.status === 200 && r.body.status === "quoted", "send -> quoted");
+    v = await bget("/api/quote-backend/quote/" + T1);
+    ok(v.body.status === "quoted" && v.body.final_price === 42.5 && v.body.notes_from_owner === "Ready Friday.", "the visitor's view shows the final price and note", v.body);
+    r = await jpost("/api/estimate/quote/requests/" + req1.id + "/accept", { project_id: "pr_x", client_id: "cl_x" });
+    ok(r.status === 200 && r.body.status === "accepted" && r.body.project_id === "pr_x", "accept links the project");
+    r = await jpost("/api/estimate/quote/requests/" + req1.id + "/close");
+    ok(r.status === 200 && r.body.status === "closed" && r.body.closed_at > 0, "close starts retention");
+    ok((await jpost("/api/estimate/quote/requests/nope/close")).status === 404, "an unknown request -> 404");
+    ok((await jget("/api/estimate")).body.saved.every(x => x.id !== req1.id), "public quotes stay out of the saved-estimates list");
+
+    console.log("\n-- owner: new key --");
+    const nk = await jpost("/api/estimate/quote/key");
+    ok(nk.status === 200 && /^[0-9a-f]{64}$/.test(nk.body.key), "a new key is issued once", nk.body);
+    ok((await bget("/api/quote-backend/ping")).status === 401 && (await bget("/api/quote-backend/ping", nk.body.key)).status === 200, "the old key stops working, the new one works");
     return { tmp, moon, ntfy, T1 };
   } catch (e) { await stopHub(); throw e; }
 }
