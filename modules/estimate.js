@@ -327,7 +327,8 @@ function register(ctx) {
         const job = { id, file_id, phase: "queued", done: false, error: null, ts: Date.now() };
         JOBS.set(jobId, job);
         if (opts.after) opts.after(est, f, job, jobId); else res.json({ id, file_id, jobId });
-        analyse(est, f, job).then(() => opts.analysed && opts.analysed(est)).catch(e => { job.error = e.message; job.done = true; });
+        const go = () => analyse(est, f, job).then(() => opts.analysed && opts.analysed(est));
+        (opts.queue ? opts.queue(go) : go()).catch(e => { job.error = e.message; job.done = true; });
       });
     });
     ws.on("error", e => { if (!over) { over = true; cleanup(); bad(res, 500, "could not store the upload: " + e.message); } });

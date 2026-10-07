@@ -8,7 +8,8 @@ function load(env) {
     verifyUrl: String(env.TURNSTILE_VERIFY_URL || "https://challenges.cloudflare.com/turnstile/v0/siteverify"),
     maxMb: n(env.MAX_MB, 100), uploadsPerHour: n(env.UPLOADS_PER_HOUR, 5), requestsPerDay: n(env.REQUESTS_PER_DAY, 3),
     globalUploadsPerHour: n(env.GLOBAL_UPLOADS_PER_HOUR, 60), readsPerHour: n(env.READS_PER_HOUR, 300), hubTimeoutMs: n(env.HUB_TIMEOUT_MS, 10000),
-    trustCf: env.TRUST_CF !== "0", publicUrl: String(env.PUBLIC_URL || "")
+    // Only behind the tunnel is CF-Connecting-IP the visitor's address; anywhere else it is a header anyone can set.
+    trustCf: env.TRUST_CF === "1", publicUrl: String(env.PUBLIC_URL || "")
   };
   if (c.quoteKey.length < 32) throw new Error("QUOTE_KEY must be the Hub's estimate.quote_key (32+ characters)");
   if (!c.siteKey || !c.secret) throw new Error("TURNSTILE_SITEKEY and TURNSTILE_SECRET are required");

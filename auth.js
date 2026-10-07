@@ -137,7 +137,7 @@ module.exports = function mountAuth(app, express, baseDir, assetDir) {
                          "/api/models/print-request"]);
   app.use((req, res, next) => {
     const p = req.path;
-    if (ALLOW.has(p) || p.startsWith("/api/auth/") || (p.startsWith("/api/quote-backend/") && req.get("X-Quote-Key"))) return next();   // fork (ryvin/u1hub): the public quote service; modules/estimate/quote-backend.js checks the key
+    if (ALLOW.has(p) || p.startsWith("/api/auth/") || (p.startsWith("/api/quote-backend/") && !/\.\.|%2e/i.test(req.originalUrl) && req.get("X-Quote-Key"))) return next();   // fork (ryvin/u1hub): the public quote service; modules/estimate/quote-backend.js checks the key; no dot-segments, so the header never reaches express.static
     if (isAuthed(req)) return next();
     if (p.startsWith("/api/")) return res.status(401).json({ error: "Not logged in" });
     res.redirect(302, "/auth.html");

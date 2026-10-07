@@ -22,9 +22,24 @@ function mount(ctx, H) {
   const guard = (req, res, next) => (QUOTE.keyOk(req.get("X-Quote-Key"), conf().quote_key) ? next() : bad(res, 401, "bad quote key"));
   const paused = res => bad(res, 503, "Quotes are paused - try again soon", { paused: true });
 
+  // Public analyses run one at a time: an upload is untrusted and a 3MF can inflate to hundreds of
+  // MB inside the process that dispatches the printers (final review, Important 4). The visitor sees
+  // "analysing" while one waits.
+  const ANALYSES = { running: 0, waiting: 0, max_running: 0 };
+  let chain = Promise.resolve();
+  const queue = go => {
+    ANALYSES.waiting++;
+    const run = () => { ANALYSES.waiting--; ANALYSES.running++; ANALYSES.max_running = Math.max(ANALYSES.max_running, ANALYSES.running);
+      return Promise.resolve().then(go).finally(() => { ANALYSES.running--; }); };
+    const p = chain.then(run, run);
+    chain = p.catch(() => {});
+    return p;
+  };
+
   function applyOptions(est) {
     const S = settings(), multicolour = !!est.multicolour;
-    const I = QUOTE.inputsFor(est.options || {}, S, multicolour);
+    // A request keeps what the customer asked for, whatever the palette says later (final review, minor 10).
+    const I = est.frozen ? { ...est.frozen, colour_changed: false } : QUOTE.inputsFor(est.options || {}, S, multicolour);
     est.inputs = { ...H.DEFAULT_INPUTS, ...(est.inputs || {}), qty: I.qty, material: I.material, preset: I.preset, rush: I.rush };
     return I;
   }
@@ -41,7 +56,7 @@ function mount(ctx, H) {
     const S = settings();
     const job = [...H.JOBS.values()].find(j => j.id === est.id && !j.done);
     const base = { status: est.status, files_deleted: !!est.files_deleted, notes_from_owner: est.owner_note || "", final_price: est.final_price != null ? est.final_price : undefined,
-                   valid_until: isoDay(est.created + S.valid_days * DAY),
+                   valid_until: isoDay(QUOTE.validUntil(est, S)),
                    limits: { qty_max: S.qty_max, qualities: ["standard", "strong"], rush_multiplier: S.rush_multiplier, palette: S.palette.map(p => ({ id: p.id, material: p.material, colour: p.colour, hex: p.hex, in_stock: p.in_stock })) } };
     if (job) return QUOTE.customerView({ ...base, phase: "analysing" });
     if ((est.files || []).length && est.files.every(f => f.error)) return QUOTE.customerView({ ...base, phase: "done", error: "We couldn't read this file as a 3D model." });
@@ -64,13 +79,14 @@ function mount(ctx, H) {
   }
   const send = (res, est) => publicView(est).then(v => res.json(v)).catch(e => bad(res, 500, "quote failed: " + e.message));
 
-  ctx.app.get("/api/quote-backend/ping", guard, (req, res) => { const S = settings(); res.json({ ok: true, enabled: !!S.enabled, max_mb: QUOTE_MAX_MB }); });
+  ctx.app.get("/api/quote-backend/ping", guard, (req, res) => { const S = settings(); res.json({ ok: true, enabled: !!S.enabled, max_mb: QUOTE_MAX_MB, analyses: { ...ANALYSES } }); });
   ctx.app.post("/api/quote-backend/upload", guard, (req, res) => {
     if (!settings().enabled) { req.resume(); return paused(res); }
     const token = crypto.randomBytes(16).toString("hex");
     H.receive(req, res, { cap: QUOTE_MAX_MB * 1048576, capMb: QUOTE_MAX_MB, existing: null,
       make: id => ({ ...H.newEstimate(id), public: true, token, status: "quote", options: { qty: 1, quality: "standard", rush: false }, contact: null, owner_note: "", final_price: null }),
       after: (est) => { TOKENS.set(token, est.id); H.save(); res.json({ token }); },
+      queue,
       analysed: est => { const p = QUOTE.pickPublicSource(est); if (p) { est.source = p.source; est.candidate_key = p.candidate_key; H.save(); } } });
   });
   ctx.app.get("/api/quote-backend/quote/:token", guard, (req, res) => { const est = byToken(req.params.token); if (!est) return bad(res, 404, "This quote has expired"); send(res, est); });
@@ -84,10 +100,15 @@ function mount(ctx, H) {
     const est = byToken(req.params.token); if (!est) return bad(res, 404, "This quote has expired");
     if (est.status !== "quote") return bad(res, 409, "this quote has already been requested");
     const c = QUOTE.checkContact(req.body || {}); if (c.error) return bad(res, 400, c.error);
+    const I = applyOptions(est);
+    est.frozen = { qty: I.qty, material: I.material, preset: I.preset, rush: I.rush, colour_name: I.colour_name, palette_id: I.palette_id };
     est.contact = c.contact; est.status = "new"; est.requested_at = Date.now(); H.save();
     const v = await publicView(est).catch(() => ({}));
     const price = v.price != null ? "$" + v.price : v.price_low != null ? "$" + v.price_low + "-$" + v.price_high : "to be priced";
-    try { const n = H.use("notify.send", null); if (n) await n({ title: "New quote request", body: c.contact.name + " <" + c.contact.email + ">: " + v.qty + " x, " + price + (v.ready_by ? ", ready " + v.ready_by : ""), priority: 4, tags: "moneybag" }); } catch {}
+    // Not awaited: the request is saved, and a slow ntfy server must not turn the visitor's answer into "paused".
+    const n = H.use("notify.send", null);
+    if (n) Promise.resolve().then(() => n({ title: "New quote request", body: c.contact.name + " <" + c.contact.email + ">: " + v.qty + " x, " + price + (v.ready_by ? ", ready " + v.ready_by : ""), priority: 4, tags: "moneybag" }))
+      .catch(e => ctx.hublog("warn", "quote: request notification failed - " + e.message));
     res.json(v);
   });
   ctx.app.post("/api/quote-backend/quote/:token/delete", guard, (req, res) => {

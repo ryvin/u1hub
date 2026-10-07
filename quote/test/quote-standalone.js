@@ -40,7 +40,7 @@ async function startSvc(extra) {
   LOG = "";
   CHILD = spawn(process.execPath, [path.join(__dirname, "..", "server.js")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PORT: String(SVC_PORT),
     HUB_URL: "http://127.0.0.1:" + FAKE_PORT, QUOTE_KEY: KEY, TURNSTILE_SITEKEY: "test-site", TURNSTILE_SECRET: "test-secret", TURNSTILE_VERIFY_URL: "http://127.0.0.1:" + FAKE_PORT + "/siteverify",
-    MAX_MB: "1", UPLOADS_PER_HOUR: "3", REQUESTS_PER_DAY: "2", GLOBAL_UPLOADS_PER_HOUR: "60", HUB_TIMEOUT_MS: "1500", ...(extra || {}) } });
+    MAX_MB: "1", UPLOADS_PER_HOUR: "3", REQUESTS_PER_DAY: "2", GLOBAL_UPLOADS_PER_HOUR: "60", HUB_TIMEOUT_MS: "1500", TRUST_CF: "1", ...(extra || {}) } });
   CHILD.stdout.on("data", d => LOG += d); CHILD.stderr.on("data", d => LOG += d);
   // waits on observable state; a cold require of express over /mnt/e measured 12.8 s (2026-10-07), so the cap is 60 s
   for (let i = 0; i < 600; i++) { try { if ((await fetch(SVC + "/healthz")).status) return; } catch {} await sleep(100); }
@@ -100,6 +100,12 @@ async function main() {
     r = await jget("/api/q/" + "a".repeat(32));
     ok(r.status === 200 && !("cost" in r.body) && !("printer" in r.body) && !("files" in r.body) && r.body.price_low === 10, "the quote view is allow-listed again", r.body);
     ok((await jget("/api/q/not-a-token")).status === 404, "a malformed token never reaches the Hub");
+    // a broken JSON body or one over the 16 kB limit: a short JSON error, never a stack trace (final review, Important 3)
+    for (const [label, body] of [["broken JSON", "{bad"], ["a 20 kB body", JSON.stringify({ notes: "x".repeat(20000) })]]) {
+      const br = await fetch(SVC + "/api/q/" + "a".repeat(32) + "/options", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+      const bt = await br.text();
+      ok(br.status >= 400 && br.status < 500 && /application\/json/.test(br.headers.get("content-type") || "") && !/node_modules|\sat\s/.test(bt), label + " -> a 4xx JSON error with no stack trace", bt.slice(0, 200));
+    }
 
     console.log("\n-- request --");
     ok((await jpost("/api/q/" + "a".repeat(32) + "/request", { name: "A", email: "a@b.co", turnstile: "bad-token" }, "3.3.3.3")).status === 403, "request needs Turnstile");
@@ -118,9 +124,10 @@ async function main() {
     await stopSvc();
 
     console.log("\n-- client IP --");
-    await startSvc({ TRUST_CF: "0", UPLOADS_PER_HOUR: "1" });
+    // TRUST_CF unset: the default must be the socket address (final review, Important 2)
+    await startSvc({ TRUST_CF: "", UPLOADS_PER_HOUR: "1" });
     await up("x.stl", Buffer.alloc(10), null, "5.5.5.1");
-    ok((await up("x.stl", Buffer.alloc(10), null, "5.5.5.2")).status === 429, "TRUST_CF=0: a spoofed CF-Connecting-IP does not reset the limit");
+    ok((await up("x.stl", Buffer.alloc(10), null, "5.5.5.2")).status === 429, "TRUST_CF unset: a spoofed CF-Connecting-IP does not reset the limit");
     await stopSvc();
   } finally { await stopSvc(); fake.close(); }
   console.log("\n" + pass + " passed, " + fail + " failed");

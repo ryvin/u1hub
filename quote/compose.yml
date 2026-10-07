@@ -1,5 +1,10 @@
-# u1-quote: the public quote page (docs/quote.md). Reached only through the
-# Cloudflare tunnel (quote.satisfyingprints3d.com -> host.docker.internal:4560).
+# u1-quote: the public quote page (docs/quote.md). Reached ONLY through the
+# Cloudflare tunnel (quote.satisfyingprints3d.com -> http://u1-quote:4560): no
+# port is published on the host, so nobody on the LAN can reach it around the
+# tunnel and set their own CF-Connecting-IP (final review, Important 2). It
+# joins the tunnel container's network (snapmaker-cloudflared runs in the
+# YT_Steam_Manager compose project, network yt_steam_manager_default) and
+# reaches the Hub through the host's published :4545.
 name: u1-quote
 services:
   u1-quote:
@@ -11,15 +16,12 @@ services:
       PORT: "4560"
       HUB_URL: http://host.docker.internal:4545
       TRUST_CF: "1"
-    ports:
-      - "4560:4560"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks: [tunnel]
     read_only: true
     tmpfs: [/tmp]
 networks:
-  default:
-    ipam:
-      config:
-        # 10.215 is pihole_default, 10.213-10.218 are taken: 10.219 was free on 2026-10-07 (infra-collision-audit)
-        - subnet: 10.219.0.0/24
+  tunnel:
+    external: true
+    name: yt_steam_manager_default

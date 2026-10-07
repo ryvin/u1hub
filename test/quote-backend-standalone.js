@@ -81,6 +81,11 @@ function pureQuote() {
   ok(!Q.expired({ public: true, status: "new", created: now - 90 * D }, now), "an open request never expires");
   ok(Q.expired({ public: true, status: "closed", created: 0, closed_at: now - 31 * D }, now) && !Q.expired({ public: true, status: "declined", created: 0, closed_at: now - 29 * D }, now), "closed/declined: gone 30 days after");
   ok(!Q.expired({ status: "quote", created: 0 }, now), "a non-public estimate is not this rule's business");
+  // the page must never promise a quote past the day it is deleted (final review, minor 5 re-graded)
+  const S14 = { ...Q.QUOTE_DEFAULTS, valid_days: 14 };
+  ok(Q.validUntil({ status: "quote", created: now }, S14) === now + 7 * D && Q.validUntil({ status: "quote", created: now }, { ...S14, valid_days: 3 }) === now + 3 * D,
+     "an unrequested quote is valid until it is deleted at the latest (min of valid_days and 7 days)");
+  ok(Q.validUntil({ status: "new", created: now }, S14) === now + 14 * D, "a requested quote is valid for the owner's valid_days");
 }
 
 const RB = require("../modules/estimate/readyby.js");
@@ -153,7 +158,9 @@ async function booted() {
   fs.mkdirSync(gdir, { recursive: true });
   const moon = createMock("u1"); const mport = await moon.listen(0);
   // a fake ntfy server: the request notification must arrive here
-  const NTFY = []; const ntfy = http.createServer((req, res) => { let b = ""; req.on("data", d => b += d); req.on("end", () => { NTFY.push({ url: req.url, body: b, title: req.headers["title"] || req.headers["x-title"] }); res.end("{}"); }); });
+  // NTFY_HANG: record the message but never answer (a slow or dead ntfy server must not hold up the visitor's request)
+  const NTFY = []; let NTFY_HANG = false;
+  const ntfy = http.createServer((req, res) => { let b = ""; req.on("data", d => b += d); req.on("end", () => { NTFY.push({ url: req.url, body: b, title: req.headers["title"] || req.headers["x-title"] }); if (!NTFY_HANG) res.end("{}"); }); });
   await new Promise(r => ntfy.listen(0, "127.0.0.1", r));
   const palette = [{ id: "pla-black", material: "PLA", colour: "Black", hex: "#000000", in_stock: true }, { id: "petg-red", material: "PETG", colour: "Red", hex: "#ff0000", in_stock: true }];
   fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: gdir, port: PORT, printers: [{ name: "SECRET-PRINTER", url: "http://127.0.0.1:" + mport }],
@@ -198,12 +205,28 @@ async function booted() {
 
     console.log("\n-- request --");
     ok((await bpost("/api/quote-backend/quote/" + T1 + "/request", { name: "Ann", email: "bad" })).status === 400, "a bad email -> 400");
+    NTFY_HANG = true;
+    const reqT0 = Date.now();
     r = await bpost("/api/quote-backend/quote/" + T1 + "/request", { name: "Ann", email: "ann@example.com", notes: "for a gift" });
+    const reqMs = Date.now() - reqT0;
     ok(r.status === 200 && r.body.status === "new", "request -> status new", r.body);
+    // the notify module's own timeout is 8 s; the answer must not wait for it (final review, minor 7 re-graded)
+    ok(reqMs < 5000, "the request answers without waiting for a hung ntfy server (" + reqMs + " ms)");
     for (let i = 0; i < 100 && !NTFY.length; i++) await sleep(50);
     ok(NTFY.length === 1 && /Ann/.test(NTFY[0].body), "the owner is notified (ntfy)", NTFY);
     ok((await bpost("/api/quote-backend/quote/" + T1 + "/request", { name: "Ann", email: "ann@example.com" })).status === 409, "a second request on the same quote -> 409");
     ok((await bpost("/api/quote-backend/quote/" + T1 + "/options", { qty: 2 })).status === 409, "options are frozen once requested");
+    // the owner drops the colour this customer asked for: the request still says what they asked for (final review, minor 10 re-graded)
+    await bpost("/api/estimate/quote/settings", { palette: [palette[0]] }, null);
+    v = await bget("/api/quote-backend/quote/" + T1);
+    ok(v.body.material === "PETG" && v.body.colour === "Red" && v.body.qty === 4 && v.body.quality === "strong" && v.body.rush === true && !v.body.colour_changed, "a request keeps the colour, quantity and options it was made with", v.body);
+    await bpost("/api/estimate/quote/settings", { palette }, null);
+
+    console.log("\n-- public analyses run one at a time --");
+    const many = await Promise.all([1, 2, 3].map(i => bup("par" + i + ".stl", binStl(cubeTris(10 + i)))));
+    for (const m of many) await waitReady(m.body.token);
+    const pg = (await bget("/api/quote-backend/ping")).body || {};
+    ok(pg.analyses && pg.analyses.max_running === 1 && pg.analyses.running === 0, "three uploads at once are analysed one at a time (max running 1)", pg.analyses);
 
     console.log("\n-- delete my files --");
     r = await bup("throwaway.stl", binStl(cubeTris(10)));
@@ -266,6 +289,10 @@ async function gateInPasswordMode() {
     ok((await bget("/api/quote-backend/ping", null)).status === 401, "password mode: the backend without a key -> 401");
     ok((await bget("/api/quote-backend/ping")).status === 200, "password mode: the backend with the key -> 200");
     ok((await bget("/api/estimate/info", "anything")).status === 401, "a quote key does not open other routes");
+    // fetch() would normalise the dot-segments away, so the raw path goes over http.request (final review, Important 1)
+    const raw = p => new Promise(res => { const r = http.request({ host: "127.0.0.1", port: PORT, path: p, headers: { "X-Quote-Key": "a" } }, x => { x.resume(); res(x.statusCode); }); r.on("error", () => res(0)); r.end(); });
+    const dots = [await raw("/api/quote-backend/../../index.html"), await raw("/api/quote-backend/%2e%2e/%2e%2e/index.html"), await raw("/api/quote-backend/%2E%2E/estimate/info")];
+    ok(dots.every(s => s === 401), "KNOWN-BAD a dot-segment path with any key header gets no static file or route (401)", dots);
   } finally { await stopHub(); }
 }
 

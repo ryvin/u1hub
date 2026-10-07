@@ -43,8 +43,11 @@ quotes: every quote lives in the Hub.
 3. Cloudflare dashboard → Turnstile → add a widget for
    `quote.satisfyingprints3d.com` → its site key and secret into `quote/.env`
    (`TURNSTILE_SITEKEY`, `TURNSTILE_SECRET`). Template: `quote/.env.example`.
-4. `cd quote && docker compose up -d --build`; `curl http://127.0.0.1:4560/healthz`
-   → `{"ok":true,"hub":true,…}`.
+4. `cd quote && docker compose up -d --build`; `docker exec u1-quote wget -qO- http://127.0.0.1:4560/healthz`
+   → `{"ok":true,"hub":true,…}` (no host port is published; see below).
+   Tunnel rule (in `/mnt/e/Code/YT_Steam_Manager/cloudflared-config.yml`, before the
+   final 404): `hostname: quote.satisfyingprints3d.com`, `service: http://u1-quote:4560`,
+   no Access application; then recreate `snapmaker-cloudflared` and add the DNS route.
 5. Tick **Taking quotes** when ready. Until then the page says quotes are
    paused and refuses uploads.
 
@@ -81,7 +84,13 @@ notification (Settings → Notifications) and appears in **Quote requests**:
   queues gcode, a quote is a model).
 - **Decline** / **Close**: start the 30-day retention.
 
-Retention: an unrequested quote and its file go after 7 days; a request keeps
+A request keeps the colour, quantity and options it was made with
+(`frozen` on the estimate), whatever the palette says later. The ntfy message is
+sent without holding up the visitor's answer.
+
+Retention: an unrequested quote and its file go after 7 days (so the page's
+"valid until" for an unrequested quote is the earlier of `valid_days` and 7
+days); a request keeps
 its file until closed or declined + 30 days. The visitor's **Delete my files**
 removes an unrequested quote at once, and only the file of a requested one.
 
@@ -89,16 +98,23 @@ removes an unrequested quote at once, and only the file of a requested one.
 
 `MAX_MB` 100, `UPLOADS_PER_HOUR` 5 per IP, `REQUESTS_PER_DAY` 3 per IP,
 `GLOBAL_UPLOADS_PER_HOUR` 60, `READS_PER_HOUR` 300 per IP; `.stl`/`.3mf` only.
-The client IP is `CF-Connecting-IP` with `TRUST_CF=1` (compose sets it: the
-service is meant to be reached through the tunnel only), the socket address
+The client IP is `CF-Connecting-IP` only with `TRUST_CF=1` (compose sets it,
+which is safe because the container publishes no host port: only the tunnel
+reaches it), the socket address
 otherwise. The Hub enforces its own 100 MB cap (`U1HUB_QUOTE_MAX_MB`) and reads
 every upload with the Estimate tab's hardened readers. CSP: `default-src
 'self'`, scripts and frames also from `challenges.cloudflare.com`, no inline
 script or style. A Hub that does not answer, or answers 5xx or 401, shows
 "Quotes are paused - try again soon"; nothing is queued.
 
-The service runs as `node` on a read-only filesystem, network `10.219.0.0/24`
-(10.213-10.218 were taken on 2026-10-07; 10.215 is pihole), port 4560.
+The service runs as `node` (`NODE_ENV=production`) on a read-only filesystem,
+listens on 4560 inside the container, publishes no host port, and joins the
+tunnel container's network `yt_steam_manager_default` (external; owned by the
+YT_Steam_Manager compose project). It reaches the Hub at
+`host.docker.internal:4545`. Errors (a broken JSON body, one over 16 kB) answer
+a short JSON message, never a stack trace. The Hub analyses public uploads one
+at a time (`ping` reports `analyses: { running, waiting, max_running }`); the
+visitor sees "Reading your model…" while one waits.
 
 ## API
 
@@ -126,7 +142,7 @@ Hub, owner (session): `GET|POST /api/estimate/quote/settings`, `POST
   cost, options, request + ntfy, delete, the owner routes, a new key.
 - `quote/test/quote-standalone.js` (service; falsify `QUOTE_FALSIFY=1`) against
   a fake Hub and a fake siteverify: limits, Turnstile pass/fail, size cap, the
-  allow-list, tokens, "paused", a spoofed `CF-Connecting-IP` with `TRUST_CF=0`,
+  allow-list, tokens, "paused", a spoofed `CF-Connecting-IP` with `TRUST_CF` unset, error bodies,
   the CSP and the page's no-inline/no-innerHTML rules.
 
 ## Verification record

@@ -58,4 +58,11 @@ app.post("/api/q/:token/request", json, withToken(async (req, res) => {
 }));
 app.post("/api/q/:token/delete", readLimit, withToken(async (req, res) => { const r = await hub.post(req.params.token, "delete", {}); res.status(r.status).json(r.status === 200 ? { ok: true } : { error: (r.body && r.body.error) || "Something went wrong" }); }));
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
+// Body-parser and any other error: a short JSON answer, never Express's HTML page with a stack trace.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const code = err && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (code === 500) console.error("u1-quote: " + (err && err.stack || err));
+  res.status(code).json({ error: code === 413 ? "That is too large" : code === 500 ? "Something went wrong" : "Bad request" });
+});
 app.listen(C.port, () => console.log("u1-quote listening on " + C.port + " -> " + C.hubUrl));
