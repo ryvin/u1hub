@@ -122,3 +122,4 @@ estimates.json
 estimate-calibration.json
 estimates/
 .playwright-mcp/
+quote/.env

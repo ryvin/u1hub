@@ -95,6 +95,11 @@ printer type not listed is "size unchecked".
 - `GET /api/estimate/:id/report?format=pdf|csv|xlsx&view=quote|internal`
 - `GET /api/estimate/:id/thumb?file_id=` → the 3MF's own PNG
 - `DELETE /api/estimate/:id`
+- Public quotes (the **Quote requests** and **Public quotes** cards, and the key-gated
+  `/api/quote-backend/*` the public page calls): see [quote.md](quote.md). A public
+  quote is an estimate with `public: true`; it never appears in the saved list, and
+  its retention is 7 days unrequested / closed + 30 days instead of the 30-day
+  unsaved rule.
 
 ## State
 
