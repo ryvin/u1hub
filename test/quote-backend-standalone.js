@@ -80,8 +80,38 @@ function pureQuote() {
   ok(!Q.expired({ status: "quote", created: 0 }, now), "a non-public estimate is not this rule's business");
 }
 
+const RB = require("../modules/estimate/readyby.js");
+function pureReadyBy() {
+  console.log("\n-- readyby.js --");
+  const H = { days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00", tz: "UTC" };
+  const MON8 = Date.UTC(2026, 9, 5, 8, 0);           // Mon 2026-10-05 08:00Z
+  const P = (over) => [{ name: "a", type: "u1", fits: true, free_in_min: 0, ...(over || {}) }];
+  const base = { now: MON8, printers: P(), queue: [], job: { minutes: 120, plates: 1 }, hours: H, post_days: 1, rush: false };
+  let r = RB.readyBy(base);
+  ok(r.finish_at === Date.UTC(2026, 9, 5, 11, 0) && r.ready_by === "2026-10-06", "idle printer, before hours: starts 09:00, done 11:00, ready next working day", r);
+  r = RB.readyBy({ ...base, now: Date.UTC(2026, 9, 9, 16, 30) });
+  ok(r.finish_at === Date.UTC(2026, 9, 9, 18, 30) && r.ready_by === "2026-10-12", "Fri 16:30 start runs past 17:00; +1 working day skips the weekend", r);
+  r = RB.readyBy({ ...base, now: Date.UTC(2026, 9, 9, 17, 30) });
+  ok(r.finish_at === Date.UTC(2026, 9, 12, 11, 0) && r.ready_by === "2026-10-13", "Fri after hours: waits for Mon 09:00", r);
+  const queue = [{ type: "u1", minutes: 300, plates: 1 }];
+  r = RB.readyBy({ ...base, queue });
+  ok(r.finish_at === Date.UTC(2026, 9, 5, 16, 0), "behind a 5 h queued job: 14:00-16:00", r);
+  r = RB.readyBy({ ...base, queue, rush: true });
+  ok(r.finish_at === Date.UTC(2026, 9, 5, 11, 0), "rush goes ahead of the queue", r);
+  r = RB.readyBy({ ...base, queue: [{ type: "kobra-s1", minutes: 300, plates: 1 }] });
+  ok(r.finish_at === Date.UTC(2026, 9, 5, 11, 0), "a queued job for another printer type does not delay this one", r);
+  r = RB.readyBy({ ...base, printers: [...P(), { name: "b", type: "u1", fits: true, free_in_min: 0 }], job: { minutes: 120, plates: 2 } });
+  ok(r.finish_at === Date.UTC(2026, 9, 5, 11, 0), "two plates on two printers run side by side", r);
+  r = RB.readyBy({ ...base, printers: [...P({ free_in_min: 600 }), { name: "big", type: "u1", fits: false, free_in_min: 0 }] });
+  ok(r.finish_at === Date.UTC(2026, 9, 6, 11, 0) && r.ready_by === "2026-10-07", "busy until 18:00: next morning; a printer it doesn't fit is not used", r);
+  ok(RB.readyBy({ ...base, printers: P({ fits: false }) }) === null, "nothing fits -> null");
+  r = RB.readyBy({ ...base, now: Date.UTC(2026, 9, 5, 13, 0), hours: { ...H, tz: "America/Chicago" }, post_days: 0 });
+  ok(r.finish_at === Date.UTC(2026, 9, 5, 16, 0) && r.ready_by === "2026-10-05", "Chicago hours: 08:00 CDT waits for 09:00 CDT (14:00Z)", r);
+  ok(RB.localParts(Date.UTC(2026, 9, 5, 13, 0), "America/Chicago").min === 8 * 60, "localParts: 13:00Z is 08:00 in Chicago");
+}
+
 async function main() {
-  pureQuote();
+  pureQuote(); pureReadyBy();
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exit(fail ? 1 : 0);
 }
