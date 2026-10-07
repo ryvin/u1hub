@@ -343,6 +343,12 @@ Three more buttons sit beside them (`modules/costing-jobs.js`, pure):
   `=…`) is written with a leading `'`, so it is shown, never run.
 - **Job costs (CSV)** (`GET /api/costing/report/jobs.csv?…`): the same rows,
   UTF-8 with a BOM.
+- **All job data (CSV)** (`GET /api/costing/report/jobs-full.csv?…`): every
+  field the ledger holds for each job in the range, flattened to dot paths
+  (`material.grams`, `material.heads`, `multiace.swaps`, `history_status`,
+  `imported_at` …; lists as JSON), then project, client and the computed cost
+  columns. Columns are the union over the jobs, so a field one job lacks is a
+  blank cell. Pick **all time** in the range for every job.
 - **Export all (JSON)** (`GET /api/costing/export.json`): everything costing
   holds - the rates, clients, projects (each with its summary), pending
   assignments, and every ledger print with its computed `cost` - as one
@@ -412,6 +418,7 @@ All under `/api/costing`; absent (404) when the feature is off.
 | GET | `/api/costing/report/print` | same | the printable page, server-rendered, every string escaped, no script |
 | GET | `/api/costing/report/jobs.xlsx` | `?from&to&tz_offset_min` | one row per job; Total / Per piece formulas; `TOTAL` row; Rates sheet |
 | GET | `/api/costing/report/jobs.csv` | same | UTF-8 BOM + one line per job |
+| GET | `/api/costing/report/jobs-full.csv` | same | UTF-8 BOM + one line per job: every ledger field (dot paths) + project, client, costs |
 | GET | `/api/costing/export.json` | | rates, clients, projects (+ summary), pending, every print with its cost |
 | POST | `/api/costing/pending` | `{ file, type, project_id \| null }` | the pending map |
 | GET | `/api/costing/projects/:id` | | `project, client, summary, pricing, prints[]` |

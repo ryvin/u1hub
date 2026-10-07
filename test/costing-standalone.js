@@ -299,6 +299,19 @@ function pureChecks() {
   const hz = ZIPR.zipRead(hostile), he = Array.isArray(hz) ? hz : hz.entries;
   const hs = ZIPR.zipEntryContent(he.find(e => e.name === "xl/worksheets/sheet1.xml")).toString("utf8");
   ok(hs.includes('t="inlineStr"><is><t xml:space="preserve">=HYPERLINK(&quot;x&quot;)</t>') && !hs.includes("<f>HYPERLINK"), "KNOWN-BAD a formula-looking file name is stored as plain text (inline string, shown as typed), never a formula");
+  // every ledger field, flattened, plus the computed costs: "all information for all jobs" (owner, 2026-10-07)
+  const fullRows = rows.map(r => r.id === "r1" ? { ...r, note: "=SUM(1)", multiace: { swaps: 3, heads: [1, 2] } } : r);
+  const fc = J.jobsFullCsv(fullRows, projects, clients, RR, {}).split("\r\n").filter(Boolean);
+  // a real CSV split (quoted cells hold commas: a list is written as JSON)
+  const csvLine = s => { const out = []; let cur = "", q = false; for (let i = 0; i < s.length; i++) { const ch = s[i]; if (q) { if (ch === '"' && s[i + 1] === '"') { cur += '"'; i++; } else if (ch === '"') q = false; else cur += ch; } else if (ch === '"') q = true; else if (ch === ",") { out.push(cur); cur = ""; } else cur += ch; } out.push(cur); return out; };
+  const fh = csvLine(fc[0]);
+  const col = n => fh.indexOf(n);
+  const f1 = csvLine(fc[1]);
+  ok(fc.length === 7 && fh[0] === "id" && fh[1] === "date" && ["at", "material.grams", "material.source", "seconds_source", "multiace.swaps", "multiace.heads", "project", "client", "material_cost", "machine_cost", "energy_cost", "total", "per_piece", "blanks"].every(n => col(n) >= 0),
+    "full CSV: one line per job, every field flattened (material.grams, multiace.swaps …) plus project, client and the cost columns", fh);
+  ok(f1[col("id")] === "r1" && f1[col("material.grams")] === "100" && f1[col("total")] === "2.36" && f1[col("multiace.swaps")] === "3" && f1[col("multiace.heads")] === "[1,2]" && csvLine(fc[2])[col("multiace.swaps")] === "" && f1.length === fh.length,
+    "full CSV values: r1's grams, total 2.36, its multiACE swaps; arrays as JSON; a field a row lacks is blank", f1);
+  ok(fc[1].includes(",'=SUM(1),"), "KNOWN-BAD a formula-looking note in the full CSV gets a leading '");
   const ex = J.exportAll({ prints: rows, projects, clients, pending: { "u1/a.gcode": "pA" }, rates: RR, now: 1000 });
   ok(ex.exported_at === new Date(1000).toISOString() && ex.prints.length === 6 && ex.prints.find(p => p.id === "r1").cost.direct === 2.36 && ex.projects.find(p => p.id === "pA").summary && ex.clients.length === 1 && ex.rates.cost_per_g === 0.02 && ex.pending["u1/a.gcode"] === "pA",
     "JSON export: every print with its cost, projects with summaries, clients, pending, rates", Object.keys(ex));
@@ -845,6 +858,10 @@ function pureChecks() {
       "jobs.xlsx: every one of the 15 jobs plus header and TOTAL", (jxS.match(/<row /g) || []).length);
     const jcT = (await (await fetch(HUB + "/api/costing/report/jobs.csv?from=" + lo + "&to=" + hi)).text()).replace(/^﻿/, "");
     ok(jcT.split("\r\n").filter(Boolean).length === 1 + 14, "jobs.csv honours the report's from/to (14 of 15)", jcT.slice(0, 200));
+    const jf = await fetch(HUB + "/api/costing/report/jobs-full.csv"), jfT = (await jf.text()).replace(/^﻿/, "");
+    const jfL = jfT.split("\r\n").filter(Boolean);
+    ok(jf.status === 200 && /all-job-data-\d{4}-\d{2}-\d{2}\.csv/.test(jf.headers.get("content-disposition")) && jfL.length === 1 + 15 && /^id,date,/.test(jfL[0]) && jfL[0].includes("material.grams") && jfL[0].includes(",total,"),
+      "jobs-full.csv: all 15 jobs, every field plus the costs", jfL[0].slice(0, 200));
     const ej = await fetch(HUB + "/api/costing/export.json"), ejB = await ej.json();
     ok(ej.status === 200 && /attachment; filename="costing-export-/.test(ej.headers.get("content-disposition")) && ejB.prints.length === 15 && ejB.prints.every(p => p.cost && "direct" in p.cost) && ejB.projects.some(p => p.name === "Bulk <job>" && p.summary) && ejB.fork === "ryvin/u1hub",
       "export.json: all 15 prints with costs, projects with summaries", { n: ejB.prints && ejB.prints.length });

@@ -117,6 +117,30 @@ function jobsXlsx(jobs, rates) {
   return zipWrite(parts.map(([n, s]) => makeEntry(n, Buffer.from(s, "utf8"))));
 }
 
+// Every field of every ledger row in range, flattened to dot paths (material.grams,
+// multiace.swaps …; lists as JSON), then project, client and the computed costs.
+// Columns are the union over the rows, so a field one row lacks is a blank cell.
+const COST_COLS = ["project", "client", "material_cost", "material_source", "machine_cost", "energy_kwh", "energy_cost", "total", "per_piece", "blanks"];
+function flatten(o, prefix, out) {
+  for (const [k, v] of Object.entries(o || {})) {
+    const key = prefix + k;
+    if (v != null && typeof v === "object" && !Array.isArray(v)) flatten(v, key + ".", out);
+    else out[key] = Array.isArray(v) ? JSON.stringify(v) : v;
+  }
+  return out;
+}
+function jobsFullCsv(rows, projects, clients, rates, opts) {
+  const o = opts || {}, from = num(o.from), to = num(o.to);
+  const sel = (rows || []).filter(r => r && num(r.at) != null && (from == null || r.at >= from) && (to == null || r.at < to)).slice().sort((a, b) => a.at - b.at);
+  const jobs = jobRows(sel, projects, clients, rates, { tz_offset_min: o.tz_offset_min });
+  const flat = sel.map(r => flatten(r, "", {}));
+  const keys = [...new Set(flat.flatMap(f => Object.keys(f)))].filter(k => k !== "id").sort();
+  const head = ["id", "date"].concat(keys, COST_COLS);
+  const lines = [head.join(",")];
+  flat.forEach((f, i) => { const j = jobs[i]; lines.push([j.id, j.date].concat(keys.map(k => f[k]), COST_COLS.map(k => j[k])).map(csvCell).join(",")); });
+  return lines.join("\r\n") + "\r\n";
+}
+
 function exportAll(o) {
   const { costOf, projectSummary } = costing();
   const R = o.rates || {}, prints = o.prints || [];
@@ -129,4 +153,4 @@ function exportAll(o) {
   };
 }
 
-module.exports = { jobRows, jobsCsv, jobsXlsx, exportAll, COLS };
+module.exports = { jobRows, jobsCsv, jobsFullCsv, jobsXlsx, exportAll, COLS };

@@ -336,6 +336,7 @@
       // fork: every job's cost in the range, as a spreadsheet to work in (live Total / Per-piece formulas), and everything as JSON
       '<a class="btn ghost" id="cst-rjobs" href="/api/costing/report/jobs.xlsx?' + qs(reportQuery()) + '" download title="One row per job in this range: material, machine, energy, total and per-piece cost">Job costs (Excel)</a>' +
       '<a class="btn ghost" id="cst-rjobscsv" href="/api/costing/report/jobs.csv?' + qs(reportQuery()) + '" download>Job costs (CSV)</a>' +
+      '<a class="btn ghost" id="cst-rjobsfull" href="/api/costing/report/jobs-full.csv?' + qs(reportQuery()) + '" download title="Every field the Hub recorded for each job in this range (times, grams, sources, heads, multiACE, import details…) plus its costs">All job data (CSV)</a>' +
       '<a class="btn ghost" id="cst-rjson" href="/api/costing/export.json" download title="Rates, clients, projects with summaries, and every print with its cost">Export all (JSON)</a></div>';
     if (!REP) return h + '<div class="cst-empty">Loading…</div>';
     const T = REP.totals, al = REP.aligned;

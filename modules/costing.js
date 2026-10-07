@@ -1255,6 +1255,11 @@ function register(ctx) {
     res.type("text/csv; charset=utf-8").setHeader("Content-Disposition", 'attachment; filename="job-costs-' + today() + '.csv"');
     res.send("﻿" + JOBS.jobsCsv(jobsFor(req.query || {})));
   });
+  ctx.app.get("/api/costing/report/jobs-full.csv", (req, res) => {
+    const q = req.query || {}, f = filtersOf(q);
+    res.type("text/csv; charset=utf-8").setHeader("Content-Disposition", 'attachment; filename="all-job-data-' + today() + '.csv"');
+    res.send("﻿" + JOBS.jobsFullCsv(L.prints, P.projects, P.clients, conf(), { from: f.from, to: f.to, tz_offset_min: num(q.tz_offset_min) || 0 }));
+  });
   ctx.app.get("/api/costing/report/jobs.xlsx", (req, res) => {
     res.type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet").setHeader("Content-Disposition", 'attachment; filename="job-costs-' + today() + '.xlsx"');
     res.send(JOBS.jobsXlsx(jobsFor(req.query || {}), conf()));
