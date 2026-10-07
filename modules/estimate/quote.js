@@ -43,7 +43,8 @@ function bandsFor(confidence, v) {
 function priceRange(o, priceAt) {
   const step = o.round_to > 0 ? o.round_to : 0.5;
   const down = x => r2(Math.floor(x / step + 1e-9) * step), up = x => r2(Math.ceil(x / step - 1e-9) * step), near = x => r2(Math.round(x / step) * step);
-  const floor = x => (o.min_fee != null && x < o.min_fee ? o.min_fee : x);
+  // Never below the minimum fee, and never $0: a priced job costs at least one rounding step.
+  const floor = x => Math.max(step, o.min_fee != null && x < o.min_fee ? o.min_fee : x);
   if (o.confidence === "exact") {
     const p = priceAt(o.grams, o.minutes);
     if (p == null) return null;

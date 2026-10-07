@@ -47,6 +47,9 @@ function pureQuote() {
   ok(Q.priceRange({ grams: 20, minutes: 100, confidence: "good", g: 0, t: 0.3, round_to: 0.5, firm: true }, lin).price_low === 17, "firm applies to exact only");
   ok(Q.priceRange({ grams: 2, minutes: 10, confidence: "rough", g: 0.3, t: 0.3, round_to: 0.5, min_fee: 5 }, lin).price_low === 5, "the low end never goes under the minimum fee");
   ok(Q.priceRange({ grams: 20, minutes: 100, confidence: "good", g: 0, t: 0.3, round_to: 0.5 }, () => null) === null, "no rates -> no price (never $0)");
+  const tiny = Q.priceRange({ grams: 1, minutes: 1, confidence: "rough", g: 0.3, t: 0.3, round_to: 0.5, min_fee: null }, (g, m) => 0.3 * g + 0.01 * m);
+  ok(tiny.price_low === 0.5 && tiny.price_high === 0.5, "a tiny part's low end rounds to one step, never $0", tiny);
+  ok(Q.priceRange({ grams: 1, minutes: 1, confidence: "exact", round_to: 0.5, firm: true }, () => 0.2).price === 0.5, "a tiny firm price is one step, never $0");
 
   const S = { ...Q.QUOTE_DEFAULTS, palette: [{ id: "pla-blk", material: "PLA", colour: "Black", hex: "#000000", in_stock: true }, { id: "petg-red", material: "PETG", colour: "Red", hex: "#ff0000", in_stock: false }] };
   ok(Q.checkOptions({ qty: 3, palette_id: "pla-blk", quality: "strong", rush: true }, S, false).options.qty === 3, "options: valid set accepted");
@@ -118,8 +121,127 @@ function pruneRule() {
   ok(Q.dropOnPrune({ public: true, status: "quote", created: now - 8 * D }, now) === true, "an unrequested public quote is dropped after 7 days");
 }
 
+const { createMock } = require("./mock-moonraker.js");
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const KEY = "test-quote-key-0123456789abcdef0123456789";
+let CHILD = null, LOG = "";
+async function startHub(dir) {
+  LOG = "";
+  CHILD = spawn(process.execPath, ["server.js"], { cwd: REPO, stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, U1HUB_DIR: dir, U1HUB_PORT: String(PORT), U1HUB_POLL_MS: "400", U1HUB_EVENTS_POLL_MS: "3600000", U1HUB_SYNC_MS: "3600000",
+           U1HUB_COSTING_BACKFILL_BOOT_MS: "0", U1HUB_COSTING_IMPORT_BOOT_MS: "0", U1HUB_COSTING_IMPORT_MS: "0", U1HUB_ESTIMATE_CALIBRATE_BOOT_MS: "0",
+           U1HUB_ESTIMATE_LIB_TTL_MS: "0", SME_HOME: path.join(dir, "sme-home"), U1HUB_PROFILE: "" } });
+  CHILD.stdout.on("data", d => LOG += d); CHILD.stderr.on("data", d => LOG += d);
+  // waits for observable state, not a timer (a cold boot over /mnt/e measured 15 s)
+  for (let i = 0; i < 400; i++) { try { const r = await fetch(HUB + "/api/auth/status"); if (r.ok) return; } catch {} await sleep(150); }
+  throw new Error("hub did not start:\n" + LOG.slice(-2000));
+}
+async function stopHub() { if (CHILD) { const c = CHILD; CHILD = null; await new Promise(r => { c.once("exit", r); c.kill(); }); } }
+const kh = (k) => (k === null ? {} : { "X-Quote-Key": k === undefined ? KEY : k });
+async function bget(p, k) { const r = await fetch(HUB + p, { headers: kh(k) }); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; }
+async function bpost(p, b, k) { const r = await fetch(HUB + p, { method: "POST", headers: { "Content-Type": "application/json", ...kh(k) }, body: JSON.stringify(b || {}) }); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; }
+async function bup(name, buf, k) { const r = await fetch(HUB + "/api/quote-backend/upload", { method: "POST", headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(name), ...kh(k) }, body: buf }); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; }
+function cubeTris(s) {
+  const v = [[0,0,0],[s,0,0],[s,s,0],[0,s,0],[0,0,s],[s,0,s],[s,s,s],[0,s,s]];
+  return [[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]].map(t => t.map(i => v[i]));
+}
+function binStl(tris) { const b = Buffer.alloc(84 + tris.length * 50); b.writeUInt32LE(tris.length, 80); tris.forEach((t, i) => { let o = 84 + i * 50 + 12; for (const p of t) for (const c of p) { b.writeFloatLE(c, o); o += 4; } }); return b; }
+const waitReady = async (token) => { for (let i = 0; i < 400; i++) { const r = await bget("/api/quote-backend/quote/" + token); if (r.body && r.body.phase !== "analysing") return r; await sleep(50); } return { status: 0, body: { error: "timeout" } }; };
+
+async function booted() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-quote-")), gdir = path.join(tmp, "gcode");
+  fs.mkdirSync(gdir, { recursive: true });
+  const moon = createMock("u1"); const mport = await moon.listen(0);
+  // a fake ntfy server: the request notification must arrive here
+  const NTFY = []; const ntfy = http.createServer((req, res) => { let b = ""; req.on("data", d => b += d); req.on("end", () => { NTFY.push({ url: req.url, body: b, title: req.headers["title"] || req.headers["x-title"] }); res.end("{}"); }); });
+  await new Promise(r => ntfy.listen(0, "127.0.0.1", r));
+  const palette = [{ id: "pla-black", material: "PLA", colour: "Black", hex: "#000000", in_stock: true }, { id: "petg-red", material: "PETG", colour: "Red", hex: "#ff0000", in_stock: true }];
+  fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: gdir, port: PORT, printers: [{ name: "SECRET-PRINTER", url: "http://127.0.0.1:" + mport }],
+    notify: { enabled: true, url: "http://127.0.0.1:" + ntfy.address().port, topic: "quotes" },
+    estimate: { quote_key: KEY, quote: { enabled: true, palette, hours: { days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "23:59", tz: "UTC" } } } }, null, 2));
+  // the same earlier-print fixture as the estimate suite: a 20 mm cube printed once in 10 min
+  fs.writeFileSync(path.join(tmp, "prints.json"), JSON.stringify({ prints: [{ id: "p1", at: 1, printer_id: 0, printer: "SECRET-PRINTER", type: "u1", file: "cube_PLA_10m.gcode", outcome: "done", seconds: 600, seconds_source: "actual", material: { grams: 4, source: "slicer", grams_source: "slicer" }, counted: true, pieces: 1 }] }));
+  fs.writeFileSync(path.join(gdir, "cube_PLA_10m.gcode"), "; HEADER_BLOCK_START\n; max_z_height: 20.00\n; HEADER_BLOCK_END\nG1 X1\n; filament used [g] = 4.00\n; total filament used [g] = 4.00\n; estimated printing time (normal mode) = 10m 0s\n; CONFIG_BLOCK_START\n; filament_type = PLA\n; filament_colour = #FF0000\n; print_settings_id = 0.20 Standard\n; CONFIG_BLOCK_END\n");
+  try {
+    await startHub(tmp);
+    console.log("\n-- the backend key --");
+    ok((await bget("/api/quote-backend/ping", null)).status === 401, "no key -> 401");
+    ok((await bget("/api/quote-backend/ping", "wrong-key-wrong-key-wrong-key-wrong-key")).status === 401, "wrong key -> 401");
+    const ping = await bget("/api/quote-backend/ping");
+    ok(ping.status === 200 && ping.body.enabled === true && ping.body.max_mb === 100, "right key -> ping, 100 MB cap", ping.body);
+
+    console.log("\n-- upload -> token -> customer view --");
+    let r = await bup("SECRETNAME_widget.stl", binStl(cubeTris(20)));
+    ok(r.status === 200 && /^[0-9a-f]{32}$/.test(r.body && r.body.token || ""), "upload -> a 128-bit hex token", r.body);
+    const T1 = r.body.token;
+    let v = await waitReady(T1);
+    ok(v.status === 200 && v.body.status === "quote" && v.body.confidence === "rough" && v.body.fits === true && v.body.qty === 1, "an unknown model: rough, fits, qty 1", v.body);
+    const txt = JSON.stringify(v.body);
+    ok(!/SECRETNAME|SECRET-PRINTER|cost|candidates|rates|est_/i.test(txt), "the customer view carries no file name, printer name, cost or candidate", txt.slice(0, 400));
+    ok(v.body.price !== 0 && v.body.price_low !== 0 && v.body.price_high !== 0, "no rates set: never a $0 price", v.body);
+    ok(/^\d{4}-\d{2}-\d{2}$/.test(v.body.ready_by || "") && /^\d{4}-\d{2}-\d{2}$/.test(v.body.valid_until || ""), "ready_by and valid_until are dates", v.body);
+    ok(Array.isArray(v.body.limits.palette) && v.body.limits.palette.length === 2 && v.body.limits.qty_max === 100 && v.body.material === "PLA" && v.body.colour === "Black", "limits carry the palette; default colour is the first in stock", v.body.limits);
+
+    r = await bup("cube.stl", binStl(cubeTris(20)));
+    v = await waitReady(r.body.token);
+    ok(v.body.confidence === "exact", "printed before (same size, done) -> exact", v.body);
+
+    console.log("\n-- options --");
+    r = await bpost("/api/quote-backend/quote/" + T1 + "/options", { qty: 4, palette_id: "petg-red", quality: "strong", rush: true });
+    ok(r.status === 200 && r.body.qty === 4 && r.body.material === "PETG" && r.body.colour === "Red" && r.body.quality === "strong" && r.body.rush === true, "options change the quote", r.body);
+    ok((await bpost("/api/quote-backend/quote/" + T1 + "/options", { qty: 101 })).status === 400, "qty over the cap -> 400");
+    ok((await bpost("/api/quote-backend/quote/" + T1 + "/options", { palette_id: "nope" })).status === 400, "unknown colour -> 400");
+
+    console.log("\n-- tokens --");
+    ok((await bget("/api/quote-backend/quote/" + "0".repeat(32))).status === 404, "an unknown token -> 404");
+    ok((await bget("/api/quote-backend/quote/__proto__")).status === 404, "a prototype key is no token");
+
+    console.log("\n-- request --");
+    ok((await bpost("/api/quote-backend/quote/" + T1 + "/request", { name: "Ann", email: "bad" })).status === 400, "a bad email -> 400");
+    r = await bpost("/api/quote-backend/quote/" + T1 + "/request", { name: "Ann", email: "ann@example.com", notes: "for a gift" });
+    ok(r.status === 200 && r.body.status === "new", "request -> status new", r.body);
+    for (let i = 0; i < 100 && !NTFY.length; i++) await sleep(50);
+    ok(NTFY.length === 1 && /Ann/.test(NTFY[0].body), "the owner is notified (ntfy)", NTFY);
+    ok((await bpost("/api/quote-backend/quote/" + T1 + "/request", { name: "Ann", email: "ann@example.com" })).status === 409, "a second request on the same quote -> 409");
+    ok((await bpost("/api/quote-backend/quote/" + T1 + "/options", { qty: 2 })).status === 409, "options are frozen once requested");
+
+    console.log("\n-- delete my files --");
+    r = await bup("throwaway.stl", binStl(cubeTris(10)));
+    const T3 = r.body.token; await waitReady(T3);
+    ok((await bpost("/api/quote-backend/quote/" + T3 + "/delete")).status === 200 && (await bget("/api/quote-backend/quote/" + T3)).status === 404, "an unrequested quote is deleted outright");
+    ok((await bpost("/api/quote-backend/quote/" + T1 + "/delete")).status === 200, "a requested quote: delete accepted");
+    v = await bget("/api/quote-backend/quote/" + T1);
+    ok(v.status === 200 && v.body.files_deleted === true && v.body.status === "new", "...its files go, the request stays", v.body);
+
+    console.log("\n-- paused --");
+    // (Task 5 adds the owner settings route; here the switch is flipped through it once it exists)
+    return { tmp, moon, ntfy, T1 };
+  } catch (e) { await stopHub(); throw e; }
+}
+
+async function gateInPasswordMode() {
+  console.log("\n-- the gate in password mode --");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-quote-pw-"));
+  fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: path.join(tmp, "g"), port: PORT, printers: [], estimate: { quote_key: KEY, quote: { enabled: true } } }));
+  fs.writeFileSync(path.join(tmp, "auth.json"), JSON.stringify({ mode: "password" }));   // password mode, no session
+  await startHub(tmp);
+  try {
+    ok((await bget("/api/estimate/info", null)).status === 401, "password mode: an ordinary API route needs a session");
+    ok((await bget("/api/quote-backend/ping", null)).status === 401, "password mode: the backend without a key -> 401");
+    ok((await bget("/api/quote-backend/ping")).status === 200, "password mode: the backend with the key -> 200");
+    ok((await bget("/api/estimate/info", "anything")).status === 401, "a quote key does not open other routes");
+  } finally { await stopHub(); }
+}
+
 async function main() {
   pureQuote(); pureReadyBy(); pruneRule();
+  let ctxB = null;
+  try { ctxB = await booted(); }
+  catch (e) { fail++; console.log("  FAIL booted section threw: " + e.message); }
+  finally { await stopHub(); if (ctxB) { ctxB.moon.close && ctxB.moon.close(); ctxB.ntfy.close(); } }
+  try { await gateInPasswordMode(); }
+  catch (e) { fail++; console.log("  FAIL password-mode section threw: " + e.message); }
+  finally { await stopHub(); }
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exit(fail ? 1 : 0);
 }
