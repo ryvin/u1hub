@@ -110,7 +110,32 @@ function gcode(o) {
   return s;
 }
 
+// A multiACE-PROCESSED file shaped like the live VanGogh bookmark (2026-10-06): the
+// original 5-colour header, synthetic heads in the body, INITIAL loads, one explicit
+// swap, and one tool on a head the file never loads (it prints whatever that head holds).
+function reprintGcode() {
+  let s = "; multiACE preflight: print preferences\nSET_PRINT_PREFERENCES BED_LEVEL=1 FLOW_CALIBRATE=0 TIME_LAPSE_CAMERA=0 FORCE=1\n; HEADER_BLOCK_START\n; max_z_height: 1.52\n; HEADER_BLOCK_END\n";
+  s += "; multiACE auto-load: load 3 head(s)\n; multiACE processed: format=4\nACE_SET_PURGE RESET=1\nACE_SWAP_HEAD HEAD=1 ACE=0 SLOT=1 INITIAL=1\nACE_SWAP_HEAD HEAD=2 ACE=1 SLOT=2 INITIAL=1\nACE_SWAP_HEAD HEAD=3 ACE=1 SLOT=3 INITIAL=1\n; multiACE auto-load: end\n";
+  const step = (from, to, head, swap) => "; Change Tool" + from + " -> Tool" + to + " (layer 1)\nM400\nT" + head + "\n" + (swap ? "ACE_SWAP_HEAD HEAD=" + head + " ACE=" + swap[0] + " SLOT=" + swap[1] + " ANTI_OOZE=1.2\n" : "") + "G1 X1 E0.5\n";
+  s += step(0, 0, 2) + step(0, 1, 1, [1, 1]) + step(1, 3, 3) + step(3, 4, 0) + step(4, 2, 2, [0, 0]);
+  s += "; CONFIG_BLOCK_START\n; filament_colour = " + COLORS.join(";") + "\n; filament_type = PLA;PLA;PLA;PLA;PLA\n; filament used [g] = 5.00, 5.00, 5.00, 5.00, 5.00\n; total filament used [g] = 25.00\n; estimated printing time (normal mode) = 1h 0m\n; CONFIG_BLOCK_END\n";
+  return s;
+}
+
 (async () => {
+  console.log("\n== PURE: the reprint plan of a processed file ==");
+  {
+    const plan = MA.processedPlan(reprintGcode().split("\n"));
+    const byT = Object.fromEntries(plan.tools.map(x => [x.t, x]));
+    ok(plan.processed === true && plan.tools.length === 5, "a processed file: 5 tools found", plan);
+    ok(byT[0].head === 2 && byT[0].ace === 1 && byT[0].slot === 2 && byT[0].how === "initial", "T0 -> head 2, ACE 1 slot 2 from the INITIAL load", byT[0]);
+    ok(byT[1].head === 1 && byT[1].ace === 1 && byT[1].slot === 1 && byT[1].how === "swap", "T1 -> head 1, then swapped to ACE 1 slot 1", byT[1]);
+    ok(byT[3].head === 3 && byT[3].ace === 1 && byT[3].slot === 3 && byT[3].how === "initial", "T3 -> head 3, ACE 1 slot 3 (initial)", byT[3]);
+    ok(byT[4].head === 0 && byT[4].ace === null && byT[4].how === "as-loaded", "T4 -> head 0, which the file never loads: it prints whatever head 0 holds", byT[4]);
+    ok(byT[2].head === 2 && byT[2].ace === 0 && byT[2].slot === 0 && byT[2].how === "swap", "T2 -> head 2 after a swap to ACE 0 slot 0", byT[2]);
+    ok(JSON.stringify(plan.heads) === "[0,1,2,3]", "heads used: 0-3", plan.heads);
+    ok(MA.processedPlan(gcode().split("\n")).processed === false, "an unprocessed file is not a reprint");
+  }
   console.log("\n== PURE: the estimators against known answers ==");
   {
     const M = MA.parseFlushMatrix("; flush_multiplier = 1\n; flush_volumes_matrix = " + MATRIX.join(","));
@@ -233,6 +258,7 @@ function gcode(o) {
   fs.writeFileSync(path.join(gdir, "nomarkers.gcode"), gcode({ noMarkers: true }));
   fs.writeFileSync(path.join(gdir, "petg.gcode"), gcode({ types: ["PLA", "PETG", "PLA", "PLA", "PLA"] }));
   fs.writeFileSync(path.join(gdir, "nozzle06.gcode"), gcode({ nozzle: "0.6,0.6,0.6,0.6" }));
+  fs.writeFileSync(path.join(gdir, "reprint.gcode"), reprintGcode());
   const moonA = createMock("u1"), moonB = createMock("u1");
   const ma = createMultiaceMock({ moon: moonA.state });
   moonA.state.multiace = ma.handler;
@@ -480,6 +506,42 @@ function gcode(o) {
     ma.state.failPrint = null;
     r = await jget("/api/multiace/sent");
     ok(r.body.sent[0].started === false && /no feasible/.test(r.body.sent[0].error), "the sent record keeps the failure");
+
+    console.log("\n-- reprint a file multiACE already processed (live 2026-10-07: touchscreen and normal Print colour-mapped it) --");
+    {
+      r = await jget("/api/multiace/reprint?printer=0&type=u1&file=" + encodeURIComponent(FILE));
+      ok(r.status === 200 && r.body.processed === false, "an unprocessed file is no reprint", r.body);
+      r = await jget("/api/multiace/reprint?printer=0&type=u1&file=reprint.gcode");
+      const rows = (r.body && r.body.rows) || [];
+      const live = ma.state.live_slots, at = (a, s) => live.find(x => x.ace === a && x.slot === s);
+      const row = t => rows.find(x => x.t === t) || {};
+      // expectations derived from the mock's live slots and head_source (rule 7)
+      const dE1 = MA.deltaE2000(COLORS[1], at(1, 1).color), h0 = moonA.state.ace.head_source[0];
+      ok(r.status === 200 && r.body.processed === true && rows.length === 5 && JSON.stringify(r.body.heads) === "[0,1,2,3]", "GET reprint: processed, 5 colours, heads 0-3", r.body);
+      ok(row(0).ace === 1 && row(0).slot === 2 && row(0).slot_hex === at(1, 2).color && row(0).warn === null, "black prints from ACE 1 slot 2 (black): no warning", row(0));
+      ok(row(1).slot_hex === at(1, 1).color && Math.abs(row(1).dE - Math.round(dE1 * 10) / 10) < 0.11 && (dE1 > 20 ? /colour/.test(row(1).warn || "") : row(1).warn === null), "red prints from ACE 1 slot 1 (" + at(1, 1).color + ", dE " + dE1.toFixed(1) + "): warned when dE > 20", row(1));
+      ok(row(4).as_loaded === true && row(4).head === 0 && row(4).ace === h0.ace_index && row(4).slot === h0.slot && /head 0/.test(row(4).warn || ""), "orange prints from whatever head 0 holds (ACE " + h0.ace_index + " slot " + h0.slot + "), and says so", row(4));
+      moonA.state.printState = "printing";
+      ok(await waitState(0, "printing") === "printing", "fleet reports Davinci-mock printing");
+      r = await jpost("/api/multiace/reprint", { printer: 0, type: "u1", file: "reprint.gcode" });
+      ok(r.status === 409 && r.body.reasons.some(z => z.code === "busy"), "a reprint on a printing printer is refused", r.body);
+      moonA.state.printState = "standby"; moonA.state.filename = "";
+      ok(await waitState(0, "standby") === "standby", "idle again");
+      r = await jpost("/api/multiace/reprint", { printer: 0, type: "u1", file: FILE });
+      ok(r.status === 400 && /not .*processed/.test(r.body.error || ""), "an unprocessed file is refused by reprint (use Check with multiACE)", r.body);
+      const before = moonA.state.gcodeScripts.length, upBefore = moonA.state.uploads.length, printsBefore = ma.state.prints.length;
+      r = await jpost("/api/multiace/reprint", { printer: 0, type: "u1", file: "reprint.gcode" });
+      ok(r.status === 200 && r.body.started === true, "POST reprint: started", r.body);
+      const sc = moonA.state.gcodeScripts.slice(before), idIdx = sc.findIndex(x => /SET_PRINT_EXTRUDER_MAP CONFIG_EXTRUDER=0 MAP_EXTRUDER=0/.test(x)), stIdx = sc.findIndex(x => /SDCARD_PRINT_FILE FILENAME="reprint.gcode"/.test(x));
+      ok(idIdx >= 0 && stIdx > idIdx && [0, 1, 2, 3].every(i => sc[idIdx].includes("CONFIG_EXTRUDER=" + i + " MAP_EXTRUDER=" + i)), "the identity map goes out BEFORE the file is started, for all four heads", sc);
+      ok(moonA.state.uploads.length === upBefore + 1 && moonA.state.uploads[moonA.state.uploads.length - 1].filename === "reprint.gcode" && ma.state.prints.length === printsBefore, "not on the printer yet -> the library copy is uploaded first; the multiACE engine is not called (no double processing)", moonA.state.uploads.slice(-1));
+      r = await jget("/api/multiace/sent");
+      ok(r.body.sent[0].plan === "reprint" && r.body.sent[0].file === "reprint.gcode" && r.body.sent[0].started === true, "the reprint is recorded (costing reads it)", r.body.sent[0]);
+      moonA.state.printState = "standby"; moonA.state.filename = "";
+      ok(await waitState(0, "standby") === "standby", "idle again");
+      r = await jpost("/api/multiace/preflight", { file: "reprint.gcode", printer: 0, type: "u1" });
+      ok(r.status === 400 && /Reprint via multiACE/.test(r.body.error || ""), "Check with multiACE on a processed file points at Reprint via multiACE, never at the normal Print button", r.body);
+    }
 
     console.log("\n-- 413: too big for the printer's preflight -> the inbox --");
     ma.state.maxBytes = 10;

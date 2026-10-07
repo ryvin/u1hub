@@ -27,12 +27,16 @@
   if (window.HUB_FEATURES && window.HUB_FEATURES.multiace === false) return;
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   async function jget(p) { try { const r = await fetch(p); const d = await r.json().catch(() => null); return { ok: r.ok, status: r.status, d }; } catch (e) { return { ok: false, status: 0, d: { error: e.message } }; } }
-  async function jpost(p, b) {
+  // Never leaves the card waiting forever: an answer that does not come within
+  // the limit is an error the card shows (live 2026-10-07: a card sat on "Starting…").
+  async function jpost(p, b, ms) {
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), ms || 120000);
     try {
-      const r = await fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
+      const r = await fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}), signal: ctl.signal });
       const d = await r.json().catch(() => ({}));
       return { ok: r.ok, status: r.status, d };
-    } catch (e) { return { ok: false, status: 0, d: { error: e.message } }; }
+    } catch (e) { return { ok: false, status: 0, d: { error: e.name === "AbortError" ? "no answer from the Hub within " + Math.round((ms || 120000) / 1000) + " s - reload the page and check the printer" : e.message } }; }
+    finally { clearTimeout(to); }
   }
   const typeSlug = () => (typeof window.activeType === "function" && window.activeType().slug) || "u1";
   const MATCH = 165;   // app.js MATCH_THRESHOLD, the same advisory "looks close" the head grid uses
@@ -87,7 +91,7 @@
       ".macetr .macearrow{color:var(--ink-faint);}",
       ".macetier{font-size:10px; padding:1px 6px; border-radius:999px; border:1px solid var(--line-soft); color:var(--ink-faint);}",
       ".macetier.good{color:var(--ok); border-color:color-mix(in srgb, var(--ok) 40%, var(--line));}",
-      ".macetier.warn{color:var(--busy,#f0c33c); border-color:color-mix(in srgb, var(--busy,#f0c33c) 40%, var(--line));}",
+      ".macetier.warn{color:var(--warn,#f5b316); border-color:color-mix(in srgb, var(--warn,#f5b316) 40%, var(--line));}",
       ".macetier.bad{color:var(--bad); border-color:color-mix(in srgb, var(--bad) 40%, var(--line));}",
       ".macede{color:var(--ink-faint);}",
       ".macepick{font:inherit; font-size:11px; padding:2px 4px; border-radius:5px; border:1px solid var(--line); background:var(--panel-2); color:var(--ink); max-width:190px;}",
@@ -250,9 +254,17 @@
       block.dataset.pid = String(pi.id);
       let html = '<div class="macehdr"><span>multiACE' + (pi.web ? ' · ' + esc(pi.web.replace(/\+.*$/, "")) : "") + '</span>' + (pi.link ? '<a href="' + esc(pi.link) + '" target="_blank" rel="noopener">open ↗</a>' : "") + '</div>' + loadoutHtml(pi.id, lo && lo.d);
       const file = window.SELECTED;
-      const wants = !busy && file && needsMultiace(pi.id);
+      // A file multiACE already processed is reprinted as processed, never checked again and never
+      // colour-mapped by the stock Print button (it would send the rewritten tools to the wrong heads).
+      const rp = file && !busy ? reprintOf(pi.id, file) : null;
+      const wants = !busy && file && !(rp && rp.processed) && needsMultiace(pi.id);
       const fits = wants && FORCED.has(pi.id) && !(need().length > ((window.MAP || {}).physicalHeads || 4));
-      if (wants) {
+      if (rp && rp.processed) {
+        html += '<div class="macejob">' + reprintHtml(pi.id, rp) + '</div>';
+        card.querySelectorAll(".cmap, .foot button[data-id]").forEach(el => { el.style.display = "none"; });
+        const foot = card.querySelector(".foot");
+        if (foot && !foot.querySelector(".macefootnote")) { const n = document.createElement("span"); n.className = "macefootnote macecap"; n.textContent = "stock send hidden: a multiACE-processed file is reprinted through multiACE"; foot.prepend(n); }
+      } else if (wants) {
         const s = stateFor(pi.id, file);
         html += '<div class="macejob">' + jobHtml(pi.id, s, fe, fits) + '</div>';
         card.querySelectorAll(".cmap, .foot button[data-id]").forEach(el => { el.style.display = "none"; });
@@ -387,10 +399,63 @@
     if (typeof window.loadFleet === "function") window.loadFleet();
   }
 
+  // ---- reprint a processed file ----------------------------------------------------------
+  const REPRINT = new Map();   // pid|file -> { at, d } (d = GET /api/multiace/reprint; d.processed false for a plain file)
+  const RSTATE = new Map();    // pid|file -> { phase: "idle"|"sending"|"done"|"error", msg }
+  function reprintOf(pid, file) {
+    const k = key(pid, file), hit = REPRINT.get(k);
+    if (!hit || Date.now() - hit.at > 30000) {
+      if (!hit || !hit.loading) {
+        REPRINT.set(k, { at: hit ? hit.at : 0, d: hit ? hit.d : null, loading: true });
+        jget("/api/multiace/reprint?printer=" + pid + "&type=" + encodeURIComponent(typeSlug()) + "&file=" + encodeURIComponent(file))
+          .then(r => { REPRINT.set(k, { at: Date.now(), d: r.ok ? r.d : { processed: false } }); if (r.ok && r.d.processed) rerender(pid); });
+      }
+    }
+    return (REPRINT.get(k) || {}).d || null;
+  }
+  function reprintHtml(pid, v) {
+    const st = RSTATE.get(key(pid, window.SELECTED)) || { phase: "idle" };
+    const warns = (v.rows || []).filter(r => r.warn).length;
+    let h = '<div class="macemsg"><b>Already prepared by multiACE.</b> This copy has the swaps written in for the loadout it was made for. Reprint it as prepared: the Hub sends the straight tool → head map first (the touchscreen and the normal Print button would re-map the colours and print them on the wrong heads).</div>';
+    h += '<div class="macetbl">' + (v.rows || []).map(r => '<div class="macetr"><span class="fsw" style="background:' + esc(r.hex || "#3a3f49") + '"></span><span class="macet">P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '</span><span class="macearrow">→</span>'
+      + (r.slot_hex ? '<span class="fsw" style="background:' + esc(r.slot_hex) + '"></span>' : '<span class="fsw none"></span>') + '<span>head ' + esc(r.head + 1) + (r.ace != null ? ' · ACE ' + esc(r.ace) + ' slot ' + esc(r.slot) : '') + '</span>'
+      + (r.dE != null ? '<span class="macede">ΔE ' + Number(r.dE).toFixed(1) + '</span>' : '') + (r.warn ? '<span class="macetier warn" title="' + esc(r.warn) + '">' + esc(r.as_loaded ? "as loaded" : /material|holds/.test(r.warn) ? "other material" : /empty/.test(r.warn) ? "empty slot" : "check colour") + '</span>' : '<span class="macetier good">loaded</span>') + '</div>').join("") + '</div>';
+    if (warns) h += '<div class="macecap" style="color:var(--warn,#f5b316)">' + (v.rows || []).filter(r => r.warn).map(r => 'P' + (r.t + 1) + ': ' + esc(r.warn)).join('<br>') + '<br>Check those slots, or re-slice and use Check with multiACE.</div>';
+    if (st.phase === "sending") return h + '<div class="macemsg">' + esc(st.msg || "Sending…") + '</div>';
+    if (st.phase === "done") return h + '<div class="macemsg ok">' + esc(st.msg) + '</div><div class="macebtns"><button class="btn ghost" data-mace="rpreset" data-pid="' + pid + '">OK</button></div>';
+    if (st.phase === "error") h += '<div class="macemsg err">' + esc(st.msg) + '</div>';
+    return h + '<div class="macebtns"><button class="btn primary" data-mace="reprint" data-pid="' + pid + '">Reprint via multiACE</button>' + (v.link ? '<a class="macelink" href="' + esc(v.link) + '" target="_blank" rel="noopener">multiACE page ↗</a>' : "") + '</div>';
+  }
+  async function reprint(pid) {
+    const file = window.SELECTED; if (!file) return;
+    const k = key(pid, file), v = (REPRINT.get(k) || {}).d; if (!v || !v.processed) return;
+    const fe = fleetOf(pid) || {}, warns = (v.rows || []).filter(r => r.warn);
+    const go = await new Promise(resolve => {
+      let m = document.getElementById("macemodal");
+      if (!m) { m = document.createElement("div"); m.id = "macemodal"; m.className = "modal macemodal"; document.body.appendChild(m); }
+      m.innerHTML = '<div class="modalbox"><div class="modalhdr"><span>Reprint via multiACE on ' + esc(fe.name || "") + '</span><button class="modalx" data-x="1" title="Close">×</button></div>'
+        + '<div class="macesum"><span class="k">file</span><span>' + esc(file) + '</span><span class="k">colours</span><span>' + (v.rows || []).map(r => '<span class="msw" style="display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid rgba(255,255,255,.25);vertical-align:-1px;background:' + esc(r.hex) + '"></span> ' + esc(r.hex) + ' → head ' + esc(r.head + 1) + (r.ace != null ? ' (ACE ' + esc(r.ace) + ' slot ' + esc(r.slot) + ')' : '') + (r.warn ? ' <span style="color:var(--warn,#f5b316)">⚠ ' + esc(r.warn) + '</span>' : '')).join("<br>") + '</span></div>'
+        + '<div class="macechk">Prints the file exactly as multiACE prepared it: the straight tool → head map is sent first, then it starts at once.' + (warns.length ? '<br><span style="color:var(--warn,#f5b316)">' + warns.length + ' warning(s) above.</span>' : '') + '</div>'
+        + '<div class="macefoot"><button class="btn ghost" data-x="1">Cancel</button><button class="btn primary" data-go="1">Reprint</button></div></div>';
+      const close = val => { m.classList.remove("show"); m.onclick = null; resolve(val); };
+      m.onclick = ev => { if (ev.target === m || ev.target.closest("[data-x]")) close(false); else if (ev.target.closest("[data-go]")) close(true); };
+      m.classList.add("show");
+    });
+    if (!go) return;
+    RSTATE.set(k, { phase: "sending", msg: "Sending the straight tool → head map and starting the print…" }); rerender(pid);
+    const r = await jpost("/api/multiace/reprint", { printer: pid, file, type: typeSlug() }, 300000);
+    if (!r.ok) { RSTATE.set(k, { phase: "error", msg: (r.d && r.d.error) || ("HTTP " + r.status) }); rerender(pid); return; }
+    RSTATE.set(k, { phase: "done", msg: "Printing on " + (fe.name || "the printer") + " as prepared" + (r.d.uploaded ? " (the library copy was uploaded first)" : "") + ". Watch the first swap." });
+    rerender(pid);
+    if (typeof window.loadFleet === "function") window.loadFleet();
+  }
+
   function onClick(e) {
     const t = e.target.closest("[data-mace]"); if (!t) return;
     const pid = Number(t.dataset.pid), act = t.dataset.mace;
     if (t.tagName === "A") e.preventDefault();
+    if (act === "reprint") return reprint(pid);
+    if (act === "rpreset") { RSTATE.delete(key(pid, window.SELECTED)); rerender(pid); return; }
     if (act === "check") check(pid);
     else if (act === "inbox") inbox(pid);
     else if (act === "print") print(pid);

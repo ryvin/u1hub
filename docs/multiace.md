@@ -100,6 +100,31 @@ or `; LAYER_CHANGE` markers, a used material that no slot holds, TPU/TPE, nozzle
 diameters that differ between the file and the heads. The print step re-checks the
 state ones against fresh reads.
 
+## Reprinting a file multiACE already processed
+
+The engine rewrites a file once, for the loadout it saw: the body's `T<n>` become heads,
+`ACE_SWAP_HEAD HEAD ACE SLOT … INITIAL=1` loads heads at the start, later
+`ACE_SWAP_HEAD` lines load a head from a slot mid-print, and the file is uploaded to the
+printer under its original name (so the Hub's library copy, via printer-sync, is the
+processed one too). The original slicer header stays, so the **touchscreen's reprint and
+the Hub's normal Print button colour-map that header onto the heads** and send the
+rewritten tools to the wrong ones: live 2026-10-07, a touchscreen reprint of the VanGogh
+bookmark printed the wrong colours. The preflight refuses the file ("already processed"),
+and so does the multiACE inbox.
+
+When the selected file is processed, the card shows **Reprint via multiACE** instead of
+the check: a row per original colour with the head and the ACE slot it will print from
+(read from the file: the INITIAL loads, the swap after each tool change, or "as loaded"
+for a head the file never loads), what that slot holds now, ΔE, and a warning for an
+empty slot, another material, or ΔE > 20 (never blocking). Reprint uploads the library
+copy if the printer does not hold a file of the same size under that name, sends the
+identity extruder map (T→T, all four heads, `SET_PRINT_USED_EXTRUDERS` from the file),
+then `SDCARD_PRINT_FILE`. The engine is not called again. The send is recorded with
+plan `reprint`. On the real VanGogh file (2026-10-07) the reader gave black → head 3 / ACE 1
+slot 2, blue → head 4 / ACE 0 slot 3, green → head 3 / ACE 0 slot 2, yellow → head 2 / ACE 0
+slot 1, white → head 4 / ACE 1 slot 3 (heads counted from 1 on the card), matching a hand
+trace of its swap lines, and all five within ΔE 8 of davinci's loadout.
+
 ## Costing and the SME
 
 A print started through this route is recorded in `multiace.json` (plan, swaps,
@@ -130,6 +155,8 @@ with their plan, swaps and purge estimate.
 - `POST /api/multiace/inbox {file, printer, type}` → `{ jobId, link }`
 - `GET /api/multiace/job?job=` → `{ phase, sent, total, done, error, result, engine:{stage, percent} }`
 - `GET /api/multiace/sent` → the last 100 records
+- `GET /api/multiace/reprint?printer=N&type=&file=` → `{ processed:false }` or `{ processed:true, heads, rows:[{ t, hex, material, head, ace, slot, as_loaded, how, slot_hex, slot_material, dE, warn }], link }`
+- `POST /api/multiace/reprint {printer, type, file}` → `{ started, uploaded, heads, warnings }`; 409 printer state; 400 a file that is not processed
 
 The report's `rows[mode]`, `estimates[mode]`, `moves[mode]` and `hub` are the Hub's
 additions; everything else is the engine's report as it came.

@@ -335,6 +335,73 @@ function applyRemap(report, overrides, liveSlots) {
   return { mapping, remap, errors };
 }
 
+// ---- pure: what a multiACE-processed file will print from -----------------------------------
+// The engine rewrites a file once, for the loadout it saw: "; Change ToolX ->
+// ToolY" comments stay, the body's T<n> become heads (synthetic T % 4), INITIAL
+// swaps load heads at the start, and ACE_SWAP_HEAD HEAD ACE SLOT lines load a
+// head from a slot mid-print. Replaying it needs the identity extruder map and
+// the same spools in those slots; this reads, per original tool, the head and
+// the slot it will print from. A tool whose head is neither loaded by the file
+// nor swapped prints whatever that head holds at the start ("as-loaded").
+// -> { processed, tools: [{ t, head, ace, slot, how: "initial"|"swap"|"as-loaded" }], heads }
+function newPlanner() {
+  let processed = false, pending = null, awaiting = null;
+  const loaded = {}, initial = {}, tools = new Map();
+  const swapRe = /^ACE_SWAP_HEAD\s+HEAD=(\d+)\s+ACE=(\d+)\s+SLOT=(\d+)(.*)$/;
+  return {
+    feed(l) {
+      if (!processed && /^; multiACE processed:/.test(l)) { processed = true; return; }
+      let m = /^; Change Tool(\d+) -> Tool(\d+)/.exec(l);
+      if (m) { pending = Number(m[2]); awaiting = null; return; }
+      m = /^T(\d+)\s*$/.exec(l);
+      if (m) {
+        const head = Number(m[1]) % 4;
+        if (pending != null && !tools.has(pending)) {
+          const cur = loaded[head];
+          tools.set(pending, cur ? { t: pending, head, ace: cur[0], slot: cur[1], how: initial[head] && cur === initial[head] ? "initial" : "swap" } : { t: pending, head, ace: null, slot: null, how: "as-loaded" });
+          awaiting = { t: pending, head };
+        }
+        pending = null;
+        return;
+      }
+      m = swapRe.exec(l);
+      if (m) {
+        const head = Number(m[1]), at = [Number(m[2]), Number(m[3])];
+        loaded[head] = at;
+        if (/INITIAL=1/.test(m[4])) initial[head] = at;
+        else if (awaiting && awaiting.head === head) { tools.set(awaiting.t, { t: awaiting.t, head, ace: at[0], slot: at[1], how: "swap" }); awaiting = null; }
+      }
+    },
+    result() {
+      const list = [...tools.values()].sort((a, b) => a.t - b.t);
+      return { processed, tools: list, heads: [...new Set(list.map(x => x.head))].sort((a, b) => a - b) };
+    }
+  };
+}
+function processedPlan(lines) { const p = newPlanner(); for (const l of lines) p.feed(l); return p.result(); }
+// The plan against what is loaded now. palette: the file's colours by tool
+// ([{ i, hex, type }]); headSource: the ace object's head_source. A row warns
+// when the slot is empty, holds another material, or a clearly different colour
+// (CIEDE2000 > REPRINT_WARN_DE); nothing is blocked - the person decides.
+const REPRINT_WARN_DE = 20;
+function reprintRows(plan, palette, liveSlots, headSource) {
+  const live = liveSlots || [], pal = new Map((palette || []).map(p => [p.i, p]));
+  return plan.tools.map(x => {
+    const c = pal.get(x.t) || {};
+    let ace = x.ace, slot = x.slot, asLoaded = x.how === "as-loaded";
+    if (asLoaded) { const hs = (headSource || {})[x.head] || (headSource || {})[String(x.head)]; ace = hs && num(hs.ace_index) != null ? num(hs.ace_index) : null; slot = hs && num(hs.slot) != null ? num(hs.slot) : null; }
+    const there = ace != null ? live.find(s => s.ace === ace && s.slot === slot) : null;
+    const hex = hexOf(c.hex), slotHex = there ? hexOf(there.color) : "";
+    const dE = hex && slotHex ? r2(deltaE2000(hex, slotHex)) : null;
+    let warn = null;
+    if (!there) warn = asLoaded ? "head " + x.head + " is not loaded by the file and its source is unknown" : "ACE " + ace + " slot " + slot + " is empty or unlabelled";
+    else if (c.type && there.material && lc(c.type) !== lc(there.material)) warn = "ACE " + ace + " slot " + slot + " holds " + there.material + ", the file wants " + c.type;
+    else if (dE != null && dE > REPRINT_WARN_DE) warn = "clearly different colour (ΔE " + dE.toFixed(1) + ")";
+    if (asLoaded) warn = "prints whatever head " + x.head + " holds now" + (there ? " (ACE " + ace + " slot " + slot + ", " + slotHex + ")" : "") + (warn && there ? "; " + warn : "");
+    return { t: x.t, hex, material: c.type || "", head: x.head, ace, slot, as_loaded: asLoaded, how: x.how, slot_hex: slotHex, slot_material: there ? there.material : "", dE: dE != null ? Math.round(dE * 10) / 10 : null, warn };
+  });
+}
+
 // ---- pure: the gate and the refusal matrix --------------------------------------------------
 // version: the JSON of GET /multiace/api/version (or null); ace: the `ace`
 // status object (or null). -> { multiace, reason, web, api_version, mode, device_count }
@@ -362,7 +429,9 @@ function checks(snap, facts) {
   if (s.manual) r.push({ code: "manual_head", text: "a head is in manual bypass, so multiACE cannot place colours (livedata 409)" });
   if (!facts) return r;
   if (facts.isFS) r.push({ code: "fs", text: "a Full Spectrum file blends fixed physical heads; multiACE swaps would break the mix" });
-  if (facts.processed) r.push({ code: "processed", text: "this file was already processed by multiACE - send it with the normal Print button (identity mapping), never through the preflight twice" });
+  // Not "the normal Print button": that one colour-maps the file's original header and sends the
+  // rewritten tools to the wrong heads, exactly as a touchscreen reprint does (live 2026-10-07).
+  if (facts.processed) r.push({ code: "processed", text: "this file was already processed by multiACE - use Reprint via multiACE on the card (it prints the file as processed, with the identity map); never the normal Print button or the touchscreen, and never through the preflight twice" });
   if (!facts.markers) r.push({ code: "no_markers", text: "no '; Change Tool' or '; LAYER_CHANGE' markers - the engine cannot place swaps (check the filament/printer profile's tool-change gcode, re-slice)" });
   const loaded = new Set((s.live_slots || []).map(x => lc(x.material)).filter(Boolean));
   for (const t of facts.usedTypes || []) {
@@ -764,8 +833,85 @@ function register(ctx) {
   });
   ctx.app.get("/api/multiace/sent", (req, res) => res.json({ sent: S.sent.slice(-100).reverse() }));
 
+  // ---- reprint a file multiACE already processed ----
+  // The touchscreen and the normal Print button colour-map the file's ORIGINAL
+  // header onto the heads and send the rewritten tools to the wrong ones (live
+  // 2026-10-07, the VanGogh bookmark). Reprint = the library copy as processed,
+  // the identity map first, then start it; the engine is not called again.
+  const PLANS_CACHE = new Map();   // fp -> { size, mtime, plan }
+  async function planOfFile(fp) {
+    const st = await fsp.stat(fp);
+    const hit = PLANS_CACHE.get(fp);
+    if (hit && hit.size === st.size && hit.mtime === st.mtimeMs) return hit.plan;
+    const p = newPlanner();
+    await new Promise((resolve, reject) => {
+      const rl = readline.createInterface({ input: fs.createReadStream(fp) });
+      rl.on("line", l => p.feed(l)); rl.on("close", resolve); rl.on("error", reject);
+    });
+    const plan = p.result();
+    PLANS_CACHE.set(fp, { size: st.size, mtime: st.mtimeMs, plan });
+    return plan;
+  }
+  async function reprintView(idx, f, s) {
+    const plan = await planOfFile(f.fp);
+    if (!plan.processed) return { processed: false };
+    const facts = await fileFacts(f.fp);
+    return { processed: true, file: f.name, heads: plan.heads, rows: reprintRows(plan, facts.palette, s.live_slots, s.head_source), est_minutes: facts.est_minutes, link: s.probe.url + "/multiace/" };
+  }
+  ctx.app.get("/api/multiace/reprint", async (req, res) => {
+    const idx = printerOf(req); if (idx == null) return bad(res, 400, "Unknown printer");
+    const f = fileOf({ body: { file: req.query.file, type: req.query.type } }); if (!f) return bad(res, 400, "Bad file name");
+    try { await fsp.access(f.fp); } catch { return bad(res, 404, "File not found"); }
+    const s = await snapshot(idx, false);
+    if (!s.multiace) return bad(res, 400, "not a multiACE printer", { multiace: false });
+    try { res.json(await reprintView(idx, f, s)); } catch (e) { bad(res, 500, "could not read the file: " + e.message); }
+  });
+  ctx.app.post("/api/multiace/reprint", async (req, res) => {
+    pruneJobs();
+    const idx = printerOf(req); if (idx == null) return bad(res, 400, "Unknown printer");
+    const f = fileOf(req); if (!f) return bad(res, 400, "Bad file name");
+    try { await fsp.access(f.fp); } catch { return bad(res, 404, "File not found"); }
+    const p = printers()[idx];
+    const s = await snapshot(idx, true);
+    if (!s.multiace) return bad(res, 400, p.name + " is not a multiACE printer");
+    const reasons = checks(s, null);
+    if (reasons.length) return res.status(409).json({ error: reasons.map(r => r.text).join("; "), reasons });
+    let view;
+    try { view = await reprintView(idx, f, s); } catch (e) { return bad(res, 500, "could not read the file: " + e.message); }
+    if (!view.processed) return bad(res, 400, f.name + " is not multiACE-processed - use Check with multiACE");
+    const base = s.probe.url;
+    try {
+      // the library copy on the printer, unless the printer already holds a file of the same size under this name
+      const st = await fsp.stat(f.fp);
+      const meta = await jget(base + "/server/files/metadata?filename=" + encodeURIComponent(f.name), 5000).catch(() => null);
+      const there = meta && meta.status === 200 && meta.body && meta.body.result ? num(meta.body.result.size) : null;
+      let uploaded = false;
+      if (there !== st.size) {
+        const up = await uploadMultipart(base + "/server/files/upload", f.fp, f.name, { sent: 0, total: 0 }, ENGINE_WAIT_MS);
+        if (up.status !== 200 && up.status !== 201) throw new Error("upload refused (" + up.status + ")");
+        uploaded = true;
+      }
+      const heads = view.heads.length ? view.heads : [0, 1, 2, 3];
+      const lines = [0, 1, 2, 3].map(i => "SET_PRINT_EXTRUDER_MAP CONFIG_EXTRUDER=" + i + " MAP_EXTRUDER=" + i);
+      lines.push("SET_PRINT_USED_EXTRUDERS EXTRUDERS=" + heads.join(","));
+      const r1 = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent(lines.join("\n")), { method: "POST" });
+      if (!r1.ok) throw new Error("identity extruder map refused (" + r1.status + ")");
+      const r2s = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent('SDCARD_PRINT_FILE FILENAME="' + f.name.replace(/"/g, "") + '"'), { method: "POST" });
+      if (!r2s.ok) throw new Error("start refused (" + r2s.status + "): " + (await r2s.text()).slice(0, 160));
+      const sent = { id: newJobId(), printer_id: idx, printer: p.name, file: f.name, type: f.slug, plan: "reprint", swaps: null, tool_changes: 0, est_added_sec: 0,
+                     purge_mm: null, purge_g: null, swap_seconds: conf().swap_seconds, heads, colours: view.rows.map(x => ({ t: x.t, hex: x.hex, material: x.material, ace: x.ace, slot: x.slot, slot_hex: x.slot_hex, grams: null })),
+                     remap: 0, identity_map: true, ts: Date.now(), started: true, engine_job: null, error: null };
+      S.sent.push(sent); if (S.sent.length > SENT_MAX) S.sent.splice(0, S.sent.length - SENT_MAX); save();
+      ctx.hublog("info", "multiace[" + p.name + "]: reprinted " + f.name + " as processed (identity map, heads " + heads.join(",") + (uploaded ? ", uploaded the library copy" : "") + "); " + view.rows.filter(x => x.warn).length + " warning(s)");
+      res.json({ started: true, uploaded, heads, warnings: view.rows.filter(x => x.warn).map(x => "P" + (x.t + 1) + ": " + x.warn) });
+    } catch (e) {
+      ctx.hublog("warn", "multiace[" + p.name + "]: reprint " + f.name + " - " + e.message);
+      bad(res, 502, e.message);
+    }
+  });
+
   ctx.hublog("info", "multiace (" + FORK + " fork module) armed: swap_seconds " + conf().swap_seconds + ", default plan " + conf().default_plan + "; printers probe on first use");
 }
 
-module.exports = { register, gate, checks, parseFlushMatrix, purgeTopupMm, purgeGrams, simulateSwaps, startFromHeadSource, estimatePlan, applyRemap, rowsFor, deltaE2000, deltaE2000Lab, hexToLab, slotHolds, movesFor, enrichReport, fileFacts,
+module.exports = { register, gate, checks, processedPlan, newPlanner, reprintRows, REPRINT_WARN_DE, parseFlushMatrix, purgeTopupMm, purgeGrams, simulateSwaps, startFromHeadSource, estimatePlan, applyRemap, rowsFor, deltaE2000, deltaE2000Lab, hexToLab, slotHolds, movesFor, enrichReport, fileFacts,
                    DEFAULTS, PLANS, FILAMENT_MM3_PER_MM, PURGE_TOPUP_FRAC, PURGE_MIN_MM, PURGE_MAX_MM, ENGINE_DEFAULT_PURGE_MM, SLOT_MATCH_DE };
