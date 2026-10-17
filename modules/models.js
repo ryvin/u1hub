@@ -35,6 +35,7 @@ const { spawn } = require("child_process");
 const { launchOnDesktop } = require("./desktop.js");   // v2.39.1: Orca on the desktop when the Hub is a service
 const { zipEntryContent } = require("./slicing.js");
 const U1C = require("./u1convert.js");                  // v2.38: Convert to U1 (pure; the route below does the IO)
+const TUNE = require("./tuning.js");                    // v2.42: Open in Orca with the suggested settings (pure)
 const { qtyFromName } = require("./margin.js");         // v2.40: the "x24" plate count, read one way everywhere
 
 const INDEX_TTL_MS = 10 * 60 * 1000;
@@ -42,6 +43,12 @@ const MAX_DEPTH = 4;
 const MAX_FILES = 60000;
 const PAGE_DEFAULT = 60;
 const SKIP_DIR = /^[._]|^(node_modules|manifests|tool|_consumed|_stage|_reports)$/i;
+// 2.42 (H1): the U1 templates live at the top of the models folder and other
+// tools read them. Server-side deny list: the walk never lists them (no card,
+// no Delete button) and rename/delete refuse them by name, whatever a page
+// sends. Matched on the file name, in any folder, any case.
+const PROTECTED = /^(u1_template.*|filament_types)\.3mf$/i;
+const PROTECTED_MSG = "this is a U1 template file (u1_template*.3mf / filament_types.3mf) - the Hub never renames, moves or deletes it";
 const THUMB_MAX = 400;             // disk cache entries kept (LRU by touch)
 
 // ---- zip by ranges (v2.27.1) ------------------------------------------------
@@ -217,7 +224,11 @@ function infoFromParts(ps, ms) {
     try {
       const j = JSON.parse(ps.toString("utf8"));
       const cols = Array.isArray(j.filament_colour) ? j.filament_colour : (typeof j.filament_colour === "string" ? j.filament_colour.split(";") : []);
-      out.colors = cols.map(c => String(c || "").trim().toUpperCase()).filter(c => /^#[0-9A-F]{6}$/.test(c));
+      // v2.41: Snapmaker Orca saves colors with alpha ("#E2E2E2FF"). Those
+      // were dropped, so a 24-color painted U1 project read as having no
+      // colors at all - the card showed none and the settings suggester was
+      // told nothing about them and called Espeon "single-color" (2026-10-12).
+      out.colors = cols.map(c => String(c || "").trim().toUpperCase()).map(c => /^#[0-9A-F]{8}$/.test(c) ? c.slice(0, 7) : c).filter(c => /^#[0-9A-F]{6}$/.test(c));
       out.printer = j.printer_model || j.printer_settings_id || null;
       out.layer_height = j.layer_height != null ? String(j.layer_height) : null;
     } catch {}
@@ -487,6 +498,19 @@ function register(ctx) {
   // v2.30: attributes a person typed (designer, name), keyed by rel, kept
   // beside the index. They ride over the folder-derived values on every
   // list, and Rename uses them to build the file's proper place.
+  // H22 (2.44): designer names come from the top folder verbatim, so the facet
+  // showed "220°c", "a.m", "3D Girl" and "(no folder)" as designers. An alias
+  // map (folder name -> display name, edited from the Folder panel) merges
+  // and renames them without touching a file on disk, and folder names that
+  // cannot be a designer (no letters, one or two characters, a temperature)
+  // fall into "(unsorted)".
+  const ALIAS_FILE = path.join(ctx.baseDir, "models-aliases.json");
+  let ALIASES = {};
+  try { ALIASES = JSON.parse(fs.readFileSync(ALIAS_FILE, "utf8")).aliases || {}; } catch {}
+  const saveAliases = () => { try { fs.writeFileSync(ALIAS_FILE, JSON.stringify({ aliases: ALIASES }, null, 2)); } catch {} };
+  const UNSORTED = "(unsorted)";
+  const junkCreator = n => { const t = String(n || "").trim(); return !t || !/[a-z]/i.test(t) || t.replace(/[^a-z0-9]/gi, "").length <= 2 || /^\d+\s*°?\s*[cf]$/i.test(t); };
+  const aliasOf = n => { const k = String(n || ""); if (Object.prototype.hasOwnProperty.call(ALIASES, k) && ALIASES[k]) return ALIASES[k]; if (/^\(no folder\)$/.test(k)) return k; return junkCreator(k) ? UNSORTED : k; };
   const ATTRS_FILE = path.join(ctx.baseDir, "models-attrs.json");
   let ATTRS = {};
   try { ATTRS = JSON.parse(fs.readFileSync(ATTRS_FILE, "utf8")).attrs || {}; } catch {}
@@ -652,7 +676,7 @@ function register(ctx) {
     const sp = split(it.rel);                      // v2.36: live split (format folders), not the one saved with the index
     const id = identity(it.rel, a);
     const target = id.designer && id.title ? conventionRel(id.designer, id.title, id.group) : null;
-    return { ...it, ...sp, creator: a && a.designer ? cleanPart(a.designer) : sp.creator, name: a && a.name ? cleanPart(a.name) : sp.name,
+    return { ...it, ...sp, creator: a && a.designer ? cleanPart(a.designer) : aliasOf(sp.creator), folder_creator: sp.creator, name: a && a.name ? cleanPart(a.name) : sp.name,
              attrs: a ? { designer: a.designer || "", name: a.name || "" } : null, target, conventional: !!target && target === it.rel,
              requested: REQUESTS[it.rel] || null };   // v2.40: print requests from 3MF Explorer
   }
@@ -662,13 +686,19 @@ function register(ctx) {
     return [...cmap.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  // H22 (2.44): how far a walk has got, for the tab's progress line. A first
+  // scan of 4,000 files on a share used to show "rescanning…" with nothing
+  // moving, which reads as hung.
+  let WALK_PROGRESS = { walked: 0, dirs: 0, since: 0 };
   async function walk() {
     const c = conf();
     const items = [];
     let truncated = false;
+    WALK_PROGRESS = { walked: 0, dirs: 0, since: Date.now() };
     async function rec(dir, rel, depth) {
       let ents;
       try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+      WALK_PROGRESS.dirs++;
       for (const it of ents) {
         if (items.length >= MAX_FILES) { truncated = true; return; }
         if (it.isDirectory()) {
@@ -677,10 +707,12 @@ function register(ctx) {
           continue;
         }
         if (!/\.3mf$/i.test(it.name)) continue;
+        if (PROTECTED.test(it.name)) continue;          // H1: never a card
         let st = null;
         try { st = await fs.promises.stat(path.join(dir, it.name)); } catch { continue; }
         const r = rel + it.name;
         items.push({ rel: r, ...split(r), size: st.size, mtime: st.mtimeMs });
+        WALK_PROGRESS.walked = items.length;
       }
     }
     let dirMtime = 0;
@@ -802,6 +834,8 @@ function register(ctx) {
     res.json({
       folder: ix.folder, missing: !!ix.missing, unreachable: ix.unreachable || null, scanning: !!ix.scanning, error: LAST_ERR,
       indexed_at: ix.at, refreshing: !!WALKING, truncated: !!ix.truncated,
+      scan_progress: WALKING ? { walked: WALK_PROGRESS.walked, dirs: WALK_PROGRESS.dirs, since: WALK_PROGRESS.since, last_total: ix.items.length } : undefined,
+      aliases: ALIASES,   // H22: folder name -> display name
       total_all: all.length, total: list.length, offset, limit,
       sort, seed, printed,
       requested_total: all.filter(it => it.requested).length + offReqs.length,   // v2.40 (+ requests off the shelf)
@@ -810,6 +844,22 @@ function register(ctx) {
       orcaExe: c.orcaExe, orca_found: fs.existsSync(c.orcaExe),
       u1_template: (await u1Template()).path, u1_template_set: c.u1Template
     });
+  });
+
+  // H22 (2.44): the designer alias map. POST { aliases: { "folder": "Display" } }
+  // replaces the whole map (blank value = drop that alias).
+  app.get("/api/models/aliases", (req, res) => res.json({ aliases: ALIASES, unsorted: UNSORTED }));
+  app.post("/api/models/aliases", (req, res) => {
+    const b = (req.body || {}).aliases;
+    if (!b || typeof b !== "object" || Array.isArray(b)) return res.status(400).json({ error: "Body needs { aliases: { folder: display } }" });
+    const next = {};
+    for (const [k, v] of Object.entries(b)) {
+      const from = String(k).trim().slice(0, 120), to = String(v == null ? "" : v).trim().slice(0, 120);
+      if (from && to) next[from] = to;
+    }
+    ALIASES = next; saveAliases();
+    hublog("info", "models: designer aliases saved (" + Object.keys(ALIASES).length + ")");
+    res.json({ ok: true, aliases: ALIASES });
   });
 
   // ---- v2.30: attributes, rename to the convention, delete ---------------------
@@ -840,12 +890,14 @@ function register(ctx) {
     const rel = String((req.body || {}).file || "");
     const from = safePath(rel);
     if (!from) return res.status(404).json({ error: "not in the models folder" });
+    if (PROTECTED.test(path.basename(from))) return res.status(409).json({ error: PROTECTED_MSG });
     const id = identity(rel, ATTRS[rel]);
     if (!id.designer || !id.title) return res.status(400).json({ error: "Set the " + (!id.designer ? "designer" : "name") + " first (Attributes), then rename" });
     const newRel = conventionRel(id.designer, id.title, id.group);
     if (newRel === rel) return res.json({ ok: true, rel, unchanged: true });
     const to = safePath(newRel);
     if (!to) return res.status(400).json({ error: "that designer or name cannot be a folder name" });
+    if (PROTECTED.test(path.basename(to))) return res.status(409).json({ error: PROTECTED_MSG });
     try { await fs.promises.access(from); } catch { return res.status(404).json({ error: "file not found: " + rel }); }
     // Never rename over something: the share refuses silently, and a second
     // copy with the same name is a real possibility in a downloaded library.
@@ -881,6 +933,10 @@ function register(ctx) {
     const rel = String((req.body || {}).file || "");
     const p = safePath(rel);
     if (!p) return res.status(404).json({ error: "not in the models folder" });
+    if (PROTECTED.test(path.basename(p))) {
+      hublog("warn", "models: refused to delete " + rel + " - U1 template file");
+      return res.status(409).json({ error: PROTECTED_MSG });
+    }
     try { await fs.promises.unlink(p); }
     catch (e) { return res.status(e.code === "ENOENT" ? 404 : 500).json({ error: e.code === "ENOENT" ? "file not found: " + rel : "could not delete: " + e.message }); }
     if (ATTRS[rel]) { delete ATTRS[rel]; saveAttrs(); }
@@ -1027,22 +1083,43 @@ function register(ctx) {
   }
 
   const INFO = new Map();
-  app.get("/api/models/info", async (req, res) => {
-    const p = safePath(req.query.file);
-    if (!p) return res.status(404).json({ error: "not in the models folder" });
-    let st; try { st = await fs.promises.stat(p); } catch { return res.status(404).json({ error: "file not found" }); }
+  // One file's project info (colors, objects, printer), cached by path+mtime.
+  // Throws { status, error } the routes turn into HTTP.
+  async function infoFor(rel) {
+    const p = safePath(rel);
+    if (!p) throw { status: 404, error: "not in the models folder" };
+    let st; try { st = await fs.promises.stat(p); } catch { throw { status: 404, error: "file not found" }; }
     const key = p + ":" + st.mtimeMs;
-    if (INFO.has(key)) return res.json(INFO.get(key));
+    if (INFO.has(key)) return INFO.get(key);
     try {
       const parts = await withZip(p, async z => {
         const ps = z.entries.find(e => e.name === "Metadata/project_settings.config");
         const ms = z.entries.find(e => e.name === "Metadata/model_settings.config");
         return [ps ? await z.content(ps) : null, ms ? await z.content(ms) : null];
       });
-      const info = { file: req.query.file, size: st.size, mtime: st.mtimeMs, ...infoFromParts(parts[0], parts[1]) };
+      const info = { file: rel, size: st.size, mtime: st.mtimeMs, ...infoFromParts(parts[0], parts[1]) };
       INFO.set(key, info); if (INFO.size > 500) INFO.delete(INFO.keys().next().value);
-      res.json(info);
-    } catch (e) { res.status(422).json({ error: "could not read the 3MF: " + e.message }); }
+      return info;
+    } catch (e) { throw { status: 422, error: "could not read the 3MF: " + e.message }; }
+  }
+  app.get("/api/models/info", async (req, res) => {
+    try { res.json(await infoFor(req.query.file)); }
+    catch (e) { res.status(e.status || 500).json({ error: e.error || String(e && e.message || e) }); }
+  });
+  // H22 (2.44): the cards that just scrolled into view ask in one request
+  // instead of one each (60 per page over the tunnel). files = rel,rel,...
+  // (URL-encoded, up to 60); six are read at a time.
+  app.get("/api/models/info-batch", async (req, res) => {
+    const files = String(req.query.files || "").split(",").map(x => decodeURIComponent(x)).filter(Boolean).slice(0, 60);
+    const out = {};
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(6, files.length) }, async () => {
+      while (i < files.length) {
+        const rel = files[i++];
+        try { out[rel] = await infoFor(rel); } catch (e) { out[rel] = { error: e.error || "unreadable" }; }
+      }
+    }));
+    res.json({ items: out });
   });
 
   // Open in Orca on the Hub computer, then watch the gcode folder for what
@@ -1050,13 +1127,15 @@ function register(ctx) {
   // 2026-08-29: Snapmaker Orca opens a 3MF passed as its one argument).
   let SEQ = 0;
   const SESSIONS = new Map();
-  app.post("/api/models/open", async (req, res) => {
-    const b = req.body || {};
-    const p = safePath(b.file);
-    if (!p || !(await fs.promises.stat(p).then(() => true, () => false))) return res.status(404).json({ error: "not in the models folder: " + String(b.file || "") });
+  // v2.42: the launch-and-watch half as a function. rel is the LIBRARY file
+  // the session belongs to (the gcode it produces is linked to rel); what Orca
+  // actually opens is launchPath - the file itself, or a tuned scratch copy of
+  // it. Resolves { status, body }.
+  async function openSession(rel, launchPath, slug, extra) {
+    const b = { file: rel };
+    const p = launchPath;
     const c = conf();
-    if (!fs.existsSync(c.orcaExe)) return res.status(503).json({ error: "Snapmaker Orca not found at " + c.orcaExe + " - set the path in Settings → Models" });
-    const slug = String(b.type || "u1");
+    if (!fs.existsSync(c.orcaExe)) return { status: 503, body: { error: "Snapmaker Orca not found at " + c.orcaExe + " - set the path in Settings → Models" } };
     let gdir; try { gdir = ctx.gcodeFolderFor(slug); } catch { gdir = null; }
     // v2.35.1: the snapshot is async and rare. It used to be readdirSync plus
     // one statSync per gcode every 3 s for the half hour a session watches.
@@ -1077,9 +1156,9 @@ function register(ctx) {
     const before = await snap();
     let dirMtime = await dirStamp();
     try { await launchOnDesktop(c.orcaExe, p); }
-    catch (e) { return res.status(500).json({ error: "could not launch Orca: " + e.message }); }
+    catch (e) { return { status: 500, body: { error: "could not launch Orca: " + e.message } }; }
     const sid = ++SEQ;
-    const s = { id: sid, file: String(b.file), type: slug, state: "watching", launchedAt: Date.now(), newGcode: null };
+    const s = { id: sid, file: String(b.file), type: slug, state: "watching", launchedAt: Date.now(), newGcode: null, ...(extra || {}) };
     SESSIONS.set(sid, s);
     // v2.40: what this 3MF is called, so a saved gcode can be checked against
     // it rather than trusted on arrival order - see the fix note just below.
@@ -1132,14 +1211,105 @@ function register(ctx) {
       } finally { busy = false; }
     }, 3000);
     if (iv.unref) iv.unref();
-    hublog("info", "models: opened in Orca: " + s.file);
-    res.json({ ok: true, session: s });
+    hublog("info", "models: opened in Orca: " + s.file + (p !== safePath(rel) ? " (tuned copy " + p + ")" : ""));
+    return { status: 200, body: { ok: true, session: s } };
+  }
+  app.post("/api/models/open", async (req, res) => {
+    const b = req.body || {};
+    const p = safePath(b.file);
+    if (!p || !(await fs.promises.stat(p).then(() => true, () => false))) return res.status(404).json({ error: "not in the models folder: " + String(b.file || "") });
+    const r = await openSession(String(b.file), p, String(b.type || "u1"));
+    res.status(r.status).json(r.body);
+  });
+
+  // ---- v2.42: Open in Orca with the suggested settings ----------------------
+  // The ✦ Settings panel's suggestion, loaded into a SCRATCH copy of the 3MF
+  // and opened in Orca. The library file is never written: the copy lives in
+  // <hub>/orca-tuned/<one folder per open>/<same file name>, so Orca's gcode
+  // comes out under the model's own name (Send to Dispatch and print requests
+  // still match it), and a folder is removed three days after it was made.
+  // Keep the tuned project by Save As in Orca; otherwise it simply goes away.
+  // A project for another printer is converted to U1 first, in memory, the
+  // same way Convert to U1 does it - opened as-is, Orca would ask for a
+  // printer and throw the suggested process values away with the designer's.
+  // Uses the cached suggestion when there is one, so no second charge.
+  const TUNED_DIR = path.join(ctx.baseDir, "orca-tuned");
+  const TUNED_KEEP_MS = 3 * 24 * 3600 * 1000;
+  async function pruneTuned() {
+    let names; try { names = await fs.promises.readdir(TUNED_DIR); } catch { return; }
+    await Promise.all(names.map(async n => {
+      const d = path.join(TUNED_DIR, n);
+      try { const st = await fs.promises.stat(d); if (Date.now() - st.mtimeMs > TUNED_KEEP_MS) await fs.promises.rm(d, { recursive: true, force: true }); } catch {}
+    }));
+  }
+  app.post("/api/models/open-tuned", async (req, res) => {
+    const b = req.body || {};
+    const rel = String(b.file || "");
+    const from = safePath(rel);
+    if (!from || !(await fs.promises.stat(from).then(() => true, () => false))) return res.status(404).json({ error: "not in the models folder: " + rel });
+    const c = conf();
+    if (!fs.existsSync(c.orcaExe)) return res.status(503).json({ error: "Snapmaker Orca not found at " + c.orcaExe + " - set the path in Settings → Models" });
+    const suggest = ctx.use("advisor.suggestModel");
+    if (!suggest) return res.status(503).json({ error: "AI pre-flight is turned off - turn it on in Settings to get suggested settings" });
+    const idx = b.printer == null || b.printer === "" ? null : Number(b.printer);
+    // v2.41 (field, 2026-10-12): load EXACTLY the suggestion on screen. The
+    // panel's printer list had been switched from U3 to U7 after the answer
+    // came back, so the button asked again for U7, got a different answer,
+    // and loaded settings the owner never saw. The page now sends the key of
+    // the answer it is showing; only without one (an older page) is the
+    // suggester asked.
+    let sr;
+    if (b.key) {
+      const byKey = ctx.use("advisor.suggestionByKey");
+      const rec = byKey ? byKey(String(b.key)) : null;
+      if (!rec || rec.file !== rel) return res.status(409).json({ error: "That suggestion is no longer saved - press Ask, then open it again." });
+      sr = { status: 200, body: { ...rec, cached: true } };
+    } else sr = await suggest(rel, Number.isInteger(idx) ? idx : null, false);
+    if (sr.status !== 200) return res.status(sr.status).json(sr.body);
+    const settings = ((sr.body && sr.body.suggestion) || {}).settings || [];
+    let src;
+    try { src = await fs.promises.readFile(from); } catch (e) { return res.status(500).json({ error: "could not read the file: " + e.message }); }
+    let converted = null;
+    if (!U1C.isU1(src)) {
+      const t = await u1Template(true);
+      if (!t.path) return res.status(409).json({ error: "This project is set up for another printer, so it has to become a U1 project first, and that needs the U1 template (the same one Convert to U1 uses). Save one from Snapmaker Orca as u1_template.3mf in " + c.folder + ", or set its path under ⚙ Folder." });
+      let tpl; try { tpl = await fs.promises.readFile(t.path); } catch (e) { return res.status(500).json({ error: "could not read the U1 template: " + e.message }); }
+      const prof = await U1C.profiles(c.orcaExe);
+      let r;
+      try { r = U1C.convert(src, tpl, { keys: prof.keys, names: prof.names }); }
+      catch (e) { return res.status(422).json({ error: e.message }); }
+      if (!r.already) { src = r.buffer; converted = { from: r.printer.from, kept: r.kept }; }
+    }
+    let tuned;
+    try { tuned = TUNE.tuneBuffer(src, settings); }
+    catch (e) { return res.status(422).json({ error: "could not load the settings into the project: " + e.message }); }
+    const dir = path.join(TUNED_DIR, Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex"));
+    const out = path.join(dir, path.basename(from));
+    try { await fs.promises.mkdir(dir, { recursive: true }); await fs.promises.writeFile(out, tuned.buffer); }
+    catch (e) { return res.status(500).json({ error: "could not write the scratch copy: " + e.message }); }
+    pruneTuned().catch(() => {});
+    const info = { applied: tuned.applied, skipped: tuned.skipped, converted, cached: !!sr.body.cached, cost: sr.body.cached ? 0 : (sr.body.cost == null ? null : sr.body.cost), copy: out };
+    hublog("info", "models: tuned copy of " + rel + ": " + tuned.applied.length + " setting(s) applied, " + tuned.skipped.length + " not applied" + (converted ? ", converted from " + converted.from : ""));
+    const r = await openSession(rel, out, String(b.type || "u1"), { tuned: info });
+    if (r.status === 200) Object.assign(r.body, info);
+    res.status(r.status).json(r.body);
   });
   app.get("/api/models/sessions", (req, res) => {
     const cutoff = Date.now() - 3600000;
     for (const [id, s] of SESSIONS) if (s.state !== "watching" && (s.doneAt || s.launchedAt) < cutoff) SESSIONS.delete(id);
+    // 2.43.0: a finished session's job is done once its gcode is in Dispatch,
+    // whether it was sent from the strip or queued any other way (the file
+    // list, a second session for the same gcode). Those leave the strip.
+    for (const [id, s] of SESSIONS) if (s.state === "done" && inDispatch(s)) SESSIONS.delete(id);
     res.json({ sessions: [...SESSIONS.values()].sort((a, b) => b.launchedAt - a.launchedAt) });
   });
+  function inDispatch(s) {
+    if (s.queued) return true;
+    const jobsOf = ctx.use("dispatch.jobs");
+    if (!jobsOf || !s.newGcode) return false;
+    const type = String(s.type || "u1");
+    return (jobsOf() || []).some(j => j.state !== "done" && j.file === s.newGcode && String(j.type || "u1") === type);
+  }
   app.post("/api/models/sessions/dismiss", (req, res) => { SESSIONS.delete(Number((req.body || {}).id)); res.json({ ok: true }); });
   // v2.40: "Send to Dispatch" on a finished Orca session, done HERE so it can
   // only ever happen once per session. The button used to post straight to
@@ -1168,16 +1338,45 @@ function register(ctx) {
   // server-to-server call from 3mf-explorer's own Node process, not a person's
   // browser (Explorer holds the Hub token in ITS config.json and sends it as
   // X-U1-Token; a Hub login session works too, for testing by hand).
+  // v2.40.2: Explorer and the Hub can name the same library differently.
+  // Explorer reads it through a mapped drive (X:\_MMF), while the Hub, running
+  // as a Windows service with no mapped drives, reads the share itself
+  // (\\server\share\_MMF) - and Explorer may be on another PC entirely. So a
+  // request is matched by its place INSIDE the library: the path as given
+  // first, then its tails, longest first, and the first that is a real file
+  // under this Hub's folder wins. Comparing absolute paths across machines
+  // or mount names is what broke: every Mark for print failed "not on the
+  // shelf" once the Hub moved to the UNC path (2026-10-05).
+  async function relOnShelf(abs, folder) {
+    const isFile = p => fs.promises.stat(p).then(s => s.isFile(), () => false);
+    const direct = path.relative(folder, abs).split(path.sep).join("/");
+    const dp = safePath(direct);
+    if (dp && await isFile(dp)) return direct;
+    const parts = String(abs).split(/[\\/]+/).filter(Boolean);
+    for (let k = 1; k < parts.length; k++) {
+      const rel = parts.slice(k).join("/");
+      const p = safePath(rel);
+      if (p && await isFile(p)) return rel;
+    }
+    return null;
+  }
+  // H7: compare the shared secret in constant time (crypto.timingSafeEqual on
+  // equal-length digests), and an unset token never matches a missing header.
+  function tokenMatches(tok) {
+    if (!EXPLORER_TOKEN || typeof tok !== "string" || !tok) return false;
+    const a = crypto.createHash("sha256").update(tok).digest();
+    const b = crypto.createHash("sha256").update(String(EXPLORER_TOKEN)).digest();
+    return crypto.timingSafeEqual(a, b);
+  }
   app.post("/api/models/print-request", async (req, res) => {
     const tok = req.headers["x-u1-token"];
-    if (tok !== EXPLORER_TOKEN && !ctx.isAuthed(req)) return res.status(401).json({ error: "bad or missing token" });
+    if (!tokenMatches(tok) && !ctx.isAuthed(req)) return res.status(401).json({ error: "bad or missing token" });
     const b = req.body || {};
     const abs = String(b.path || "").trim();
     if (!abs) return res.status(400).json({ error: "needs { path }" });
     const c = conf();
-    const rel = path.relative(c.folder, abs).split(path.sep).join("/");
-    if (!safePath(rel)) return res.status(404).json({ error: "not on the shelf this Hub reads (" + c.folder + "): " + abs });
-    if (!(await fs.promises.stat(abs).then(() => true, () => false))) return res.status(404).json({ error: "file not found: " + abs });
+    const rel = await relOnShelf(abs, c.folder);
+    if (!rel) return res.status(404).json({ error: "not on the shelf this Hub reads (" + c.folder + "): " + abs });
     const id = identity(rel, ATTRS[rel]);
     // The same file marked again after it moved (library reorg,
     // rename) - drop the still-pending request filed under its old place.

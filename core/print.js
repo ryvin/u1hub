@@ -25,10 +25,62 @@ function rewriteColors(text, colorMap) {
 }
 
 
+// 2.42 (H3): every call to a printer is bounded. A printer that stops
+// answering used to hold a push (and the file - activePushOf refuses rename
+// and delete while a push is open) forever. Limits are env-tunable so the
+// harness can prove them in seconds.
+const PRINTER_TIMEOUT_MS = Math.max(500, Number(process.env.U1HUB_PRINTER_TIMEOUT_MS) || 10000);
+const UPLOAD_IDLE_MS = Math.max(500, Number(process.env.U1HUB_UPLOAD_IDLE_MS) || 30000);
+const UPLOAD_SOCKET_MS = Math.max(UPLOAD_IDLE_MS, 60000);
+
+// fetch() with a deadline. A timeout rejects with "timed out after N s" so
+// the routes' existing catch blocks report it as a plain sentence.
+async function fetchWithTimeout(url, opts, ms) {
+  const limit = ms || PRINTER_TIMEOUT_MS;
+  try {
+    return await fetch(url, { ...(opts || {}), signal: AbortSignal.timeout(limit) });
+  } catch (e) {
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError"))
+      throw new Error("timed out after " + Math.round(limit / 1000) + " s - the printer did not answer");
+    throw e;
+  }
+}
+
+// 2.43 (H20): the same no-progress rule for every streamed transfer
+// (printer to printer, printer to Hub library). Calls onStall once when
+// job.sent has not moved for `ms` while isDone() is false. Returns a stop
+// function. One helper, used everywhere a stream can stall.
+function progressWatchdog(job, onStall, ms = UPLOAD_IDLE_MS, isDone = () => false) {
+  let last = job.sent, moved = Date.now();
+  const iv = setInterval(() => {
+    if (isDone()) return;
+    if (job.sent !== last) { last = job.sent; moved = Date.now(); return; }
+    if (Date.now() - moved >= ms) {
+      clearInterval(iv);
+      onStall(new Error("transfer stalled - no data moved for " + Math.round(ms / 1000) + " s"));
+    }
+  }, Math.min(1000, Math.max(100, Math.floor(ms / 5))));
+  return () => clearInterval(iv);
+}
+
 // Stream a file to the printer as multipart/form-data, reporting bytes sent so
 // the UI can show a real upload progress bar. Resolves on the printer's 2xx.
+// H3: fails (and so releases the file) when the printer stops taking bytes
+// for UPLOAD_IDLE_MS while the body is still going out, or when the socket
+// goes quiet for UPLOAD_SOCKET_MS at any point (including waiting for the
+// printer's answer after the last byte).
 function uploadWithProgress(base, fp, name, job) {
   return new Promise((resolve, reject) => {
+    let settled = false, watchdog = null, fileStream = null;
+    const done = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(watchdog);
+      if (fileStream) fileStream.destroy();       // let go of the file handle
+      fn(v);
+    };
+    resolve = (r => v => done(r, v))(resolve);
+    reject = (r => e => done(r, e))(reject);
     const boundary = "----u1hub" + Math.random().toString(16).slice(2);
     const pre = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
     const post = Buffer.from(`\r\n--${boundary}--\r\n`);
@@ -43,14 +95,41 @@ function uploadWithProgress(base, fp, name, job) {
       let b = ""; res.setEncoding("utf8"); res.on("data", d => b += d);
       res.on("end", () => (res.statusCode < 300 ? resolve(b) : reject(new Error("Upload " + res.statusCode + ": " + b.slice(0, 160)))));
     });
-    req.on("error", reject);
+    // 2.44: say which of two different things happened. "stalled" is a
+    // printer that stopped answering mid-transfer; a printer that never
+    // accepted the connection is "could not connect" (unplugged, wrong
+    // address, asleep). The hand test on 2.42.0 reported the second as the
+    // first, which sends someone looking at the wrong thing.
+    let connected = false;
+    req.on("socket", sock => { if (sock.connecting === false) connected = true; else sock.once("connect", () => { connected = true; }); });
+    req.on("response", () => { connected = true; });
+    req.on("error", e => {
+      if (!connected && e && /stalled/.test(e.message))
+        return reject(new Error("could not connect to " + u.hostname + " - the printer did not accept the connection (unplugged, asleep, or a wrong address?)"));
+      reject(e);
+    });
+    // Socket idle limit: nothing in or out for UPLOAD_SOCKET_MS ends it.
+    req.setTimeout(UPLOAD_SOCKET_MS, () => req.destroy(new Error(connected
+      ? "upload stalled - the printer stopped answering for " + Math.round(UPLOAD_SOCKET_MS / 1000) + " s"
+      : "could not connect to " + u.hostname + " within " + Math.round(UPLOAD_SOCKET_MS / 1000) + " s - the printer did not accept the connection (unplugged, asleep, or a wrong address?)")));
     req.write(pre); job.sent += pre.length;
-    const fileStream = fs.createReadStream(fp);
+    fileStream = fs.createReadStream(fp);
     const counter = new Transform({ transform(chunk, _e, cb) { job.sent += chunk.length; cb(null, chunk); } });
     fileStream.on("error", reject);
     counter.on("error", reject);
+    // Progress watchdog: while the body is still going out, no new bytes
+    // accepted for UPLOAD_IDLE_MS means the printer has stopped reading.
+    let bodyDone = false, lastSent = job.sent, lastMove = Date.now();
+    watchdog = setInterval(() => {
+      if (bodyDone) return;
+      if (job.sent !== lastSent) { lastSent = job.sent; lastMove = Date.now(); return; }
+      if (Date.now() - lastMove >= UPLOAD_IDLE_MS)
+        req.destroy(new Error(connected
+          ? "upload stalled - the printer took no data for " + Math.round(UPLOAD_IDLE_MS / 1000) + " s"
+          : "could not connect to " + u.hostname + " - the printer did not accept the connection (unplugged, asleep, or a wrong address?)"));
+    }, Math.min(1000, Math.max(100, Math.floor(UPLOAD_IDLE_MS / 5))));
     counter.on("data", chunk => { if (!req.write(chunk)) { counter.pause(); req.once("drain", () => counter.resume()); } });
-    counter.on("end", () => { req.write(post); job.sent += post.length; req.end(); });
+    counter.on("end", () => { bodyDone = true; req.write(post); job.sent += post.length; req.end(); });
     fileStream.pipe(counter);
   });
 }
@@ -194,7 +273,7 @@ app.post("/api/print", async (req, res) => {
   const base = String(p.url).replace(/\/+$/, "");
   const name = path.basename(fp);
   const gcode = async script => {
-    const r = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent(script), { method: "POST" });
+    const r = await fetchWithTimeout(base + "/printer/gcode/script?script=" + encodeURIComponent(script), { method: "POST" });
     if (!r.ok) throw new Error("gcode (" + r.status + "): " + (await r.text()).slice(0, 200));
   };
 
@@ -214,10 +293,45 @@ app.post("/api/print", async (req, res) => {
         // USED_EXTRUDERS is a set of PHYSICAL heads: when two same-color tools
         // share one head it must be listed once, not "3,3".
         lines.push("SET_PRINT_USED_EXTRUDERS EXTRUDERS=" + [...new Set(tools.map(t => map[t]))].join(","));
-        lines.push("SET_PRINT_PREFERENCES BED_LEVEL=0 FLOW_CALIBRATE=0 TIME_LAPSE_CAMERA=0");
+        // v2.41 unload-for-next. The U1 firmware already unloads a head at the
+        // end of a print when print_task_config.end_unload_filament[head] is
+        // true (its PRINT_END -> SM_PRINT_END_AUTO_UNLOAD_FILAMENT; soft
+        // filament like TPU is skipped by the firmware itself). The flags can
+        // only be set while the printer is NOT printing and the firmware
+        // resets them to all-false when a print finishes, so they are decided
+        // here, per print, right before it starts. Dispatch says which heads
+        // the next job planned on this printer will not reuse; off, unknown
+        // or failing all mean [0,0,0,0] - an unload nobody asked for costs a
+        // cut and a reload, a missed one only costs what it cost before.
+        let unload = [0, 0, 0, 0];
+        try {
+          const decide = hub.CAPS_PROVIDED && hub.CAPS_PROVIDED.get("dispatch.unloadPlan");
+          if (decide) {
+            const hexByIdx = ((await hub.paletteForFileAsync(name, t)) || {}).hexByIdx || {};
+            const headHex = {};                        // physical head -> the one color it prints, or null if two
+            for (const tool of tools) {
+              const h = map[tool], hx = String(hexByIdx[tool] || "").replace(/^#/, "").slice(0, 6).toUpperCase();
+              headHex[h] = (h in headHex && headHex[h] !== hx) ? null : (hx || null);
+            }
+            const d = await decide(Number(printer), name, headHex);
+            if (d && Array.isArray(d.unload)) {
+              unload = d.unload.slice(0, 4).map(x => (x ? 1 : 0));
+              while (unload.length < 4) unload.push(0);
+              if (unload.some(Boolean))
+                hublog("info", "print: " + p.name + " will unload " + unload.map((u, i) => u ? "T" + (i + 1) : null).filter(Boolean).join(", ") +
+                  " after " + name + (d.next ? " (next here: " + d.next.file + ")" : ""));
+            }
+          }
+        } catch (e) { hublog("warn", "print: unload-for-next skipped - " + e.message); unload = [0, 0, 0, 0]; }
+        lines.push("SET_PRINT_PREFERENCES BED_LEVEL=0 FLOW_CALIBRATE=0 TIME_LAPSE_CAMERA=0 END_UNLOAD_FILAMENT=[" + unload.join(",") + "]");
+        job.unload = unload;
         await gcode(lines.join("\n"));
       }
-      if (start) { job.phase = "starting"; await gcode(`SDCARD_PRINT_FILE FILENAME="${name}"`); dequeueFile(name, t.slug); }
+      if (start) {
+        job.phase = "starting"; await gcode(`SDCARD_PRINT_FILE FILENAME="${name}"`); dequeueFile(name, t.slug);
+        // S5 (2.44): Dispatch holds this copy in flight until it sees it printing.
+        try { const started = hub.CAPS_PROVIDED && hub.CAPS_PROVIDED.get("dispatch.printStarted"); if (started) started(Number(printer), name, t.slug); } catch {}
+      }
       job.result = { printer: p.name, started: !!start, mapped: tools.length };
       job.phase = "done"; job.done = true;
     } catch (e) {
@@ -246,7 +360,7 @@ app.post("/api/printctl", async (req, res) => {
   if (!cmd) return res.status(400).json({ error: "Bad action" });
   const base = String(p.url).replace(/\/+$/, "");
   try {
-    const r = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent(cmd), { method: "POST" });
+    const r = await fetchWithTimeout(base + "/printer/gcode/script?script=" + encodeURIComponent(cmd), { method: "POST" });
     if (!r.ok) return res.status(502).json({ error: "Moonraker " + r.status + ": " + (await r.text()).slice(0, 160) });
     res.json({ ok: true, action });
   } catch (e) {
@@ -261,7 +375,7 @@ app.get("/api/plate", async (req, res) => {
   if (!p) return res.status(400).json({ error: "Unknown printer" });
   const base = String(p.url).replace(/\/+$/, "");
   try {
-    const r = await fetch(base + "/printer/objects/query?exclude_object", { method: "GET" });
+    const r = await fetchWithTimeout(base + "/printer/objects/query?exclude_object", { method: "GET" });
     if (!r.ok) return res.status(502).json({ error: "Moonraker " + r.status });
     const eo = (((await r.json()).result || {}).status || {}).exclude_object || {};
     res.json({
@@ -282,7 +396,7 @@ app.post("/api/exclude", async (req, res) => {
   if (!name || /["\r\n]/.test(name)) return res.status(400).json({ error: "Bad object name" });
   const base = String(p.url).replace(/\/+$/, "");
   try {
-    const r = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent(`EXCLUDE_OBJECT NAME=${name}`), { method: "POST" });
+    const r = await fetchWithTimeout(base + "/printer/gcode/script?script=" + encodeURIComponent(`EXCLUDE_OBJECT NAME=${name}`), { method: "POST" });
     if (!r.ok) return res.status(502).json({ error: "Moonraker " + r.status + ": " + (await r.text()).slice(0, 160) });
     res.json({ ok: true, excluded: name });
   } catch (e) {
@@ -290,5 +404,5 @@ app.post("/api/exclude", async (req, res) => {
   }
 });
 
-Object.assign(hub, { JOBS, newJobId });
+Object.assign(hub, { JOBS, newJobId, fetchWithTimeout, progressWatchdog, UPLOAD_SOCKET_MS });
 };

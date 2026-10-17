@@ -169,6 +169,15 @@ async function stopHub() {
   // v2.10: run the print-start/complete watcher at 400 ms so the filament-
   // memory section can drive a full lifecycle in seconds (production: 15 s).
   process.env.U1HUB_POLL_MS = "400";
+  // 2.40.2: unload-after-print ships paused (see UNLOAD_PAUSED in dispatch.js).
+  // Run the harness with it un-paused so the decision logic stays covered;
+  // the PAUSE block below starts a Hub without this and checks the pause.
+  process.env.U1HUB_UNLOAD_PAUSED = "0";
+  // 2.42 (H3): bounded printer calls. Production waits 30 s for an upload
+  // that has stopped moving and 10 s for a printer command; the harness uses
+  // short limits so the stall checks take seconds.
+  process.env.U1HUB_UPLOAD_IDLE_MS = "1500";
+  process.env.U1HUB_PRINTER_TIMEOUT_MS = "3000";
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-test-"));
   const hubDir = path.join(tmp, "app");
   stageHub(hubDir);
@@ -753,10 +762,37 @@ async function stopHub() {
       ok(r.status === 200 && r.body.material && r.body.material.sent === null && r.body.material.confirmed === false
          && /touchscreen/.test(r.body.warning || "") && !mockU1.state.gcodeScripts.slice(b2).some(s => /FILAMENT_TYPE/.test(s)),
         "unknown material → nothing bogus written; the warning points at the touchscreen", r.body);
-      // No material in the request → exactly the pre-2.22.1 response shape.
+      // v2.41.1 (field bug 2026-10-09, "it doesn't actually save to the
+      // machine"): a color-only write left the head's vendor at NONE, and the
+      // firmware's next spool-tag re-read (modeled by the mock as
+      // FILAMENT_DT_UPDATE, per print_task_config._rfid_filament_info_update_cb)
+      // wiped it back to white. The old contract above ("send only a color,
+      // get only a color") was the bug. Start from a head in exactly the
+      // field state - typed PLA, vendor NONE - and prove the color survives.
+      const dtUpdate = () => fetch("http://127.0.0.1:" + portU1 + "/printer/gcode/script?script=" + encodeURIComponent("FILAMENT_DT_UPDATE CHANNEL=0"), { method: "POST" });
+      mockU1.state.ptc.filament_vendor[0] = "NONE"; mockU1.state.ptc.filament_type[0] = "PLA";
+      const b3 = nScripts();
       r = await jpost("/api/setcolor", { printer: 0, slot: 0, hex: "#123ABC" });
-      ok(r.status === 200 && r.body.ok === true && r.body.material === undefined && r.body.warning === undefined,
-        "callers that send only a color get the old contract back, untouched", r.body);
+      const sent3 = mockU1.state.gcodeScripts.slice(b3);
+      ok(r.status === 200 && r.body.ok === true && r.body.material && r.body.material.source === "head"
+         && r.body.material.confirmed === true && r.body.warning === undefined
+         && sent3[0] === "SET_PRINT_FILAMENT_CONFIG CONFIG_EXTRUDER=0 VENDOR=Snapmaker FILAMENT_TYPE=PLA FILAMENT_SUBTYPE='Basic'",
+        "a color with no material re-sends the head's own type, which stamps VENDOR=Snapmaker", { body: r.body, sent3 });
+      await dtUpdate();
+      ok(mockU1.state.ptc.filament_color_rgba[0] === "123ABCFF" && mockU1.state.ptc.filament_vendor[0] === "Snapmaker",
+        "…and the color survives the printer's next spool-tag re-read", mockU1.state.ptc);
+      // A head with no material at all: the Hub cannot guess one, so the
+      // color goes on but the reply says, in words, that it will not last.
+      mockU1.state.ptc.filament_vendor[0] = "NONE"; mockU1.state.ptc.filament_type[0] = "NONE";
+      r = await jpost("/api/setcolor", { printer: 0, slot: 0, hex: "#456DEF" });
+      ok(r.status === 200 && r.body.material && r.body.material.source === "none" && r.body.material.confirmed === false
+         && /resets this color to white/.test(r.body.warning || "") && /Pick a material/.test(r.body.warning || ""),
+        "no material anywhere → color set, with a warning that it will reset - never a silent ✓", r.body);
+      await dtUpdate();
+      ok(mockU1.state.ptc.filament_color_rgba[0] === "FFFFFFFF",
+        "(control) the mock really does wipe a vendor-NONE head on a re-read", mockU1.state.ptc.filament_color_rgba[0]);
+      // Put slot 0 back the way the sections below expect it.
+      r = await jpost("/api/setcolor", { printer: 0, slot: 0, hex: "#123ABC", material: "PLA" });
     }
     // Mid-print, colors are untouchable — replay must refuse, not queue.
     mockU1.state.printState = "printing";
@@ -1078,6 +1114,58 @@ async function stopHub() {
         await sleep(400);
       }
       ok(jj && !jj.file_missing, "putting the file back clears the flag on the next library refresh", jj && jj.file_missing);
+      r = await jpost("/api/dispatch/clear-bed", { printer: 0 });
+    }
+    // v2.41 unload-for-next. The U1 firmware unloads a head at print end when
+    // print_task_config.end_unload_filament[head] is set; the Hub decides the
+    // flags per print, at start, from what Dispatch plans next on that
+    // printer. Asserted on what the printer actually receives.
+    {
+      const sends = async (file, map) => {
+        mockU1.state.gcodeScripts.length = 0;
+        const s = await jpost("/api/print", { file, printer: 0, type: "u1", map, start: false });
+        let jb = null;
+        for (let i = 0; i < 40 && !(jb && jb.done); i++) { await sleep(250); jb = (await jget("/api/print-status?job=" + s.body.jobId)).body; }
+        const sc = mockU1.state.gcodeScripts.find(x => /SET_PRINT_PREFERENCES/.test(x)) || "";
+        return { status: s.status, job: jb, flags: (/END_UNLOAD_FILAMENT=(\[[\d,]*\])/.exec(sc) || [])[1] || null };
+      };
+      const MAP3 = { 0: 0, 1: 1, 2: 2 };          // red T1, green T2, blue T3
+      let u = await sends("multi.gcode", MAP3);
+      ok(u.status === 200 && u.flags === "[0,0,0,0]" && (await jget("/api/dispatch")).body.settings.unload_mode === "never",
+        "unload mode 'never' (default): the printer is told to unload nothing", u);
+      let st = await jpost("/api/dispatch/settings", { unload_mode: "always" });
+      ok(st.status === 200 && st.body.settings.unload_mode === "always", "unload mode 'always' saved", st.body.settings.unload_mode);
+      u = await sends("multi.gcode", MAP3);
+      ok(u.flags === "[1,1,1,0]", "'always': every head this print uses unloads (T1-T3), the unused T4 does not", u);
+      st = await jpost("/api/dispatch/settings", { unload_mode: "sometimes" });
+      ok(st.body.settings.unload_mode === "always", "an unknown mode is ignored, not stored", st.body.settings.unload_mode);
+      st = await jpost("/api/dispatch/settings", { unload_for_next: true });     // the first build's boolean
+      ok(st.status === 200 && st.body.settings.unload_mode === "unneeded" && !("unload_for_next" in st.body.settings),
+        "the old on/off flag still works and maps to 'unneeded'", st.body.settings);
+      u = await sends("multi.gcode", MAP3);
+      ok(u.flags === "[0,0,0,0]", "next planned here is copy 2 of the same job - every roll is reused, nothing unloads", u);
+      // Make the next job on printer 0 a single RED print: only red stays.
+      await jpost("/api/dispatch/maintenance", { printer: 1, down: true, note: "harness: keep the next job on printer 0" });
+      await jpost("/api/dispatch/jobs/update", { id: JOBID, qty: 1 });
+      const nj = await jpost("/api/dispatch/jobs", { again: true, file: "single.gcode", type: "u1", qty: 1, deadline: Date.now() + 20 * 86400000 });
+      const NEXTID = nj.body.job && nj.body.job.id;
+      const pl = ((await jget("/api/dispatch/plan")).body.slots || []).filter(s => s.printer === 0 && !s.unplannable).map(s => s.file);
+      ok(pl[0] === "multi.gcode" && pl[1] === "single.gcode", "setup: printer 0 plans multi, then single (red)", pl);
+      u = await sends("multi.gcode", MAP3);
+      ok(u.flags === "[0,1,1,0]", "next job only needs red: green (T2) and blue (T3) unload, red (T1) stays, unused T4 untouched", u);
+      ok(u.job && u.job.done && !u.job.error && u.job.result && u.job.result.mapped === 3, "…and the send itself completes normally", u.job);
+      // Nothing planned after this print: keep everything loaded.
+      await jpost("/api/dispatch/jobs/remove", { id: NEXTID });
+      u = await sends("multi.gcode", MAP3);
+      ok(u.flags === "[0,0,0,0]", "nothing planned next on this printer: nothing unloads", u);
+      // Restore what the rest of this section expects.
+      await jpost("/api/dispatch/jobs/update", { id: JOBID, qty: 2 });
+      await jpost("/api/dispatch/maintenance", { printer: 1, down: false });
+      st = await jpost("/api/dispatch/settings", { unload_mode: "never" });
+      ok(st.body.settings.unload_mode === "never", "…and set back to 'never'", st.body.settings.unload_mode);
+      const dui = fs.readFileSync(path.join(REPO, "public/modules/dispatch-ui.js"), "utf8");
+      ok(/<select id="dsp-unload"/.test(dui) && ["never", "unneeded", "always"].every(m => dui.includes('value="' + m + '"')),
+        "the setting is reachable: a three-way choice on the Dispatch tab");
       r = await jpost("/api/dispatch/clear-bed", { printer: 0 });
     }
     r = await jpost("/api/print", { file: r.body.next.file, printer: 0, type: "u1", start: true });
@@ -1970,7 +2058,7 @@ async function stopHub() {
   }
 
   console.log("\n== SLICE: U1-ify transplant + /api/slice queue (v2.12) ==");
-  {
+  if (process.env.U1HUB_SKIP_SLICE) console.log("  (skipped locally: fixtures live on ichabod)"); else {
     // Real-bytes fixtures are REQUIRED (deterministic count): copy
     // cube-u1.3mf + ag-u1o.3mf into test/fixtures/ (gitignored — ~4 MB).
     const FIXDIR = path.join(__dirname, "fixtures");
@@ -2847,6 +2935,29 @@ async function stopHub() {
       ok(afterInstall === beforeInstall,
         "U1HUB_DIR: and the install dir's own state was not touched at all");
     }
+
+    // --- 2.40.2: unload after a print is paused by default --------------------
+    // A Hub started WITHOUT U1HUB_UNLOAD_PAUSED=0 (production) must tell the
+    // printer to unload nothing, whatever the stored or posted setting says.
+    {
+      mockU1.state.printState = "standby"; mockU1.state.filename = "";
+      await startHub(hubDir, { U1HUB_UNLOAD_PAUSED: "" });
+      let st = await jpost("/api/dispatch/settings", { unload_mode: "always" });
+      ok(st.status === 200 && st.body.settings.unload_mode === "never" && st.body.settings.unload_paused === true,
+        "PAUSE: 'always' is refused while unloading is paused - the mode stays 'never'", st.body.settings);
+      st = await jpost("/api/dispatch/settings", { unload_for_next: true });
+      ok(st.body.settings.unload_mode === "never", "PAUSE: the old on/off flag cannot turn it back on either", st.body.settings.unload_mode);
+      mockU1.state.gcodeScripts.length = 0;
+      const s = await jpost("/api/print", { file: "multi.gcode", printer: 0, type: "u1", map: { 0: 0, 1: 1, 2: 2 }, start: false });
+      let jb = null;
+      for (let i = 0; i < 40 && !(jb && jb.done); i++) { await sleep(250); jb = (await jget("/api/print-status?job=" + s.body.jobId)).body; }
+      const sc = mockU1.state.gcodeScripts.find(x => /SET_PRINT_PREFERENCES/.test(x)) || "";
+      ok(/END_UNLOAD_FILAMENT=\[0,0,0,0\]/.test(sc), "PAUSE: the printer is told to unload nothing", sc);
+      const dui = fs.readFileSync(path.join(REPO, "public/modules/dispatch-ui.js"), "utf8");
+      ok(/\$\$\("#dsp-unload"\)\.disabled = unloadPaused/.test(dui) && dui.includes('id="dsp-unload-paused"'),
+        "PAUSE: the Dispatch setting is locked and says why");
+      await stopHub();
+    }
   }
 
   console.log("\n== PUSH: push a job back one place (v2.20) ==");
@@ -3273,6 +3384,28 @@ async function stopHub() {
     ok(r.status === 200, "roll 1 loaded in T1 of the mock", r.body);
     r = await jpost("/api/slots/assign", { printer: U1ID, slot: 1, spool_id: "spoolman_2" });
     ok(r.status === 200, "roll 2 loaded in T2 of the mock", r.body);
+    // v2.41 Spoolman write-back. A second mock Spoolman that ACCEPTS writes,
+    // recording every PUT /use body. smFail makes it answer 503.
+    const smUses = []; let smFail = false;
+    const smw = http.createServer((rq, rs) => {
+      let body = "";
+      rq.on("data", c => body += c);
+      rq.on("end", () => {
+        const m = rq.method === "PUT" && rq.url.match(/^\/api\/v1\/spool\/(\d+)\/use$/);
+        if (!m) { rs.writeHead(404).end(); return; }
+        if (smFail) { rs.writeHead(503).end("down"); return; }
+        let j = null; try { j = JSON.parse(body); } catch {}
+        smUses.push({ id: m[1], ...(j || {}) });
+        rs.writeHead(200, { "Content-Type": "application/json" }); rs.end("{}");
+      });
+    });
+    await new Promise(r2 => smw.listen(45994, "127.0.0.1", r2));
+    r = await jpost("/api/spoolman/settings", { url: "http://127.0.0.1:45994" });
+    ok(r.status === 200 && r.body.writeback === false, "write-back is OFF until asked for", r.body);
+    r = await jpost("/api/spoolman/settings", { writeback: true });
+    ok(r.status === 200 && r.body.writeback === true && r.body.writeback_pending === 0, "write-back switched on", r.body);
+    ok(JSON.parse(fs.readFileSync(path.join(hubDir, "config.json"), "utf8")).spoolman.writeback === true, "…and persisted in config.json");
+    const waitUses = async n => { for (let i = 0; i < 40 && smUses.length < n; i++) await sleep(100); return smUses.length; };
     mockU1.state.printState = "printing"; mockU1.state.filename = "deduct.gcode";
     let ev = await settle();
     ok(ev.some(e => e.type === "print.started" && /deduct/.test(e.filename)), "standby → printing raises print.started", ev);
@@ -3310,12 +3443,28 @@ async function stopHub() {
       ok(r.body.auto_deduct === true, "auto_deduct is on by default");
       ok(d && d.grams === 22.5 && d.cost === 0.64 && d.cost_partial === false,
         "cost per print: 10 g of a $29.99 roll + 12.5 g of a $27.50 roll = $0.64", d && { grams: d.grams, cost: d.cost, entries: d.entries.map(e => e.cost) });
+      // Write-back: the same grams, per roll, as Spoolman "use" deltas.
+      await waitUses(2);
+      const byId = id => smUses.filter(u => u.id === id).map(u => u.use_weight);
+      ok(JSON.stringify(byId("1")) === "[10]" && JSON.stringify(byId("2")) === "[12.5]",
+        "write-back: Spoolman #1 used 10 g and #2 used 12.5 g - exactly what the Hub deducted", smUses);
+      ok(smUses.every(u => Object.keys(u).sort().join() === "id,use_weight"), "…sent as use_weight only, never a weight, name or color", smUses);
+      let d1 = ((await jget("/api/resources/deductions")).body.deductions || [])[0];
+      ok(d1 && d1.entries.every(e => e.spoolman && e.spoolman.state === "sent"), "…and each log entry says it reached Spoolman", d1 && d1.entries.map(e => e.spoolman));
       r = await jpost("/api/resources/deductions/undo", { at: d.at });
       ok(r.status === 200 && r.body.deduction.undone, "a deduction can be undone", r.body);
       const inv2 = (await jget("/api/resources/spools")).body.spools || [];
       ok(inv2.find(s => s.id === "spoolman_1").remaining_g === 700 && inv2.find(s => s.id === "spoolman_2").remaining_g === 400, "…and the grams are back exactly");
+      await waitUses(4);
+      ok(JSON.stringify(byId("1")) === "[10,-10]" && JSON.stringify(byId("2")) === "[12.5,-12.5]",
+        "write-back: Undo hands the same grams back to Spoolman as a negative use", smUses);
+      d1 = ((await jget("/api/resources/deductions")).body.deductions || [])[0];
+      ok(d1 && d1.entries.every(e => e.spoolman && e.spoolman.state === "reverted"), "…and the log entries say so", d1 && d1.entries.map(e => e.spoolman));
       r = await jpost("/api/resources/deductions/undo", { at: d.at });
       ok(r.status === 409, "…but only once", r.status);
+      ok(smUses.length === 4, "…and a refused second Undo sends nothing", smUses.length);
+      // Spoolman down: the Hub deducts anyway, the use waits, a retry delivers it once.
+      smFail = true;
       // A roll with no recorded weight is never touched; a cancelled print deducts nothing.
       await jpost("/api/resources/inventory", { spool_id: "spoolman_1", remaining_g: null });
       mockU1.state.printState = "printing"; await settle();
@@ -3328,12 +3477,44 @@ async function stopHub() {
       const inv4 = (await jget("/api/resources/spools")).body.spools || [];
       ok(inv4.find(s => s.id === "spoolman_1").remaining_g === null, "a roll with no recorded grams stays unknown rather than going negative");
       ok(inv4.find(s => s.id === "spoolman_2").remaining_g === 387.5, "…while its neighbor with a weight is deducted normally");
+      // That print ran with Spoolman answering 503 (smFail above). Cancelled
+      // print first: nothing deducted, so nothing may be sent either.
+      await sleep(500);
+      ok(smUses.length === 4, "write-back: a cancelled print and a refused request add nothing to Spoolman", smUses);
+      let sv = (await jget("/api/spoolman")).body;
+      ok(sv.writeback_pending === 1, "write-back: Spoolman down - the 12.5 g use is held as pending", sv);
+      let dP = ((await jget("/api/resources/deductions")).body.deductions || [])[0];
+      const eP = dP && dP.entries.find(e => e.spool_id === "spoolman_2");
+      ok(eP && eP.spoolman && eP.spoolman.state === "pending" && /503/.test(eP.spoolman.error || ""), "…with the reason on the log entry", eP && eP.spoolman);
+      ok(dP && !dP.entries.some(e => e.spool_id === "spoolman_1"), "…and the roll the Hub did not deduct is not sent at all", dP && dP.entries);
+      r = await jpost("/api/spoolman/retry", {});
+      ok(r.status === 200 && r.body.writeback_pending === 1 && smUses.length === 4, "retry while still down: still pending, nothing recorded", r.body);
+      smFail = false;
+      r = await jpost("/api/spoolman/retry", {});
+      ok(r.status === 200 && r.body.writeback_pending === 0, "retry once Spoolman is back: nothing left pending", r.body);
+      ok(smUses.length === 5 && smUses[4].id === "2" && smUses[4].use_weight === 12.5, "…and the held use landed exactly once", smUses);
+      r = await jpost("/api/spoolman/retry", {});
+      ok(smUses.length === 5, "a second retry sends nothing more", smUses.length);
+      // Off means off: the next finished print reaches nobody.
+      r = await jpost("/api/spoolman/settings", { writeback: false });
+      ok(r.status === 200 && r.body.writeback === false, "write-back switched off", r.body);
+      mockU1.state.printState = "printing"; await settle();
+      mockU1.state.printState = "complete"; ev = await settle();
+      await sleep(500);
+      ok((await jget("/api/resources/spools")).body.spools.find(s => s.id === "spoolman_2").remaining_g === 375,
+        "write-back off: the Hub still deducts its own copy (387.5 → 375)");
+      ok(smUses.length === 5, "…and Spoolman hears nothing about it", smUses);
+      dP = ((await jget("/api/resources/deductions")).body.deductions || [])[0];
+      ok(dP && dP.entries.every(e => !e.spoolman), "…and the log entry carries no Spoolman state", dP && dP.entries);
       r = await jpost("/api/resources/settings", { auto_deduct: false });
       mockU1.state.printState = "printing"; await settle();
       mockU1.state.printState = "complete"; ev = await settle();
-      ok((await jget("/api/resources/spools")).body.spools.find(s => s.id === "spoolman_2").remaining_g === 387.5, "auto_deduct off: a finished print changes nothing");
+      ok((await jget("/api/resources/spools")).body.spools.find(s => s.id === "spoolman_2").remaining_g === 375, "auto_deduct off: a finished print changes nothing");
       await jpost("/api/resources/settings", { auto_deduct: true });
       await jpost("/api/slots/clear", { spool_id: "spoolman_1" }); await jpost("/api/slots/clear", { spool_id: "spoolman_2" });
+      await jpost("/api/spoolman/settings", { url: "" });
+      if (smw.closeAllConnections) smw.closeAllConnections();
+      await new Promise(r2 => smw.close(r2));
     }
 
     // OFF means no request is made at all.
@@ -3616,6 +3797,11 @@ async function stopHub() {
       const info = mmod.infoFromEntries(zipRead(fs.readFileSync(path.join(mroot, "Cinderwing3D/Baby Dragon/Baby_Dragon_Color.3mf"))));
       ok(info.colors.length === 16 && info.colors_used.length === 2 && info.colors_used[0] === "#F7D2EE" && info.colors_used[1] === "#000000", "info: a full 16-slot palette falls back to the two extruders the objects use", info);
       const info2 = mmod.infoFromEntries(zipRead(fs.readFileSync(path.join(mroot, "3D Tinys Prints/Baby Sheep/Tinys_Sheep_Colored.3mf"))));
+      {
+        // v2.41: Snapmaker Orca saves colors with alpha; Espeon read as colorless.
+        const ia = mmod.infoFromParts(Buffer.from(JSON.stringify({ filament_colour: ["#E2E2E2FF", "#ff0080ff", "#4C7A7F"] })), null);
+        ok(ia.colors.join() === "#E2E2E2,#FF0080,#4C7A7F", "info: colors saved with alpha (#RRGGBBAA) count, as their RGB", ia.colors);
+      }
       ok(info2.colors.length === 3 && info2.colors_used.length === 3, "info: a normal project shows every filament it defines (painted faces use colors the object's extruder never names)", info2.colors_used);
       ok(info.objects.length === 2 && info.objects[0].name === "Dragon" && info.printer === "Bambu Lab X1 Carbon" && info.plates === 1, "info: objects, printer and plate count come from the project", info);
       ok(mmod.pickThumb(zipRead(fs.readFileSync(path.join(mroot, "Cinderwing3D/Baby Dragon/Baby_Dragon_Color.3mf")))).name === "Metadata/plate_1_small.png", "thumb: the small plate render is preferred");
@@ -3676,8 +3862,10 @@ async function stopHub() {
     // Feature flag off removes the surface, same contract as every module.
     ok(/\/modules\/models-ui\.js/.test(await (await fetch(HUB + "/")).text()), "models client script injected when on");
     const mui = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8");
-    ok(/@media \(max-width: 899px\) \{ \.vtab\[data-view=\\"models\\"\] \{ display: none !important/.test(mui), "the Models tab hides itself below 900px (the two-column layout needs the room)");
-    ok(/@media \(pointer: coarse\) \{ \.mdl-act, #mdl-sess, #mdl-cfgbtn \{ display: none !important/.test(mui), "…and on touch the Orca actions and the folder settings go, leaving a read-only library (v2.27)");
+    // 2.44 (H21) reversed v2.27: the tab stays on every width and touch is
+    // not read-only; only what launches a program on the Hub computer hides.
+    ok(!/max-width: 899px\) \{ \.vtab\[data-view=\\"models\\"\] \{ display: none/.test(mui), "the Models tab shows on every width (2.44; it used to hide below 900px)");
+    ok(/@media \(pointer: coarse\) \{ \.mdl-act \.mdl-open, #mdl-sess \{ display: none !important/.test(mui), "…and on touch only Open in Orca and the session strip go (2.44); the library is not read-only");
     ok(/HubModules\.register\("models"/.test(mui), "…and registers as a tab through HubModules");
     // v2.27.1: a blank folder in a Save keeps the setting (the form once
     // showed blanks while loading, and a Save then wiped the folder).
@@ -3731,7 +3919,7 @@ async function stopHub() {
       const mui2 = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8");
       ok(/data-rename=/.test(mui2) && /data-attrs=/.test(mui2) && /data-del=/.test(mui2) && /\/api\/models\/rename/.test(mui2) && /\/api\/models\/delete/.test(mui2) && /\/api\/models\/attrs/.test(mui2), "the card has Rename, Attributes and Delete wired to the routes");
       ok(!/\bconfirm\(/.test(mui2) && !/\balert\(/.test(mui2.replace(/alert\(r\.d\.error/g, "")), "…confirms inline on the card, no browser dialogs for the destructive ones");
-      ok(/@media \(pointer: coarse\) \{ \.mdl-act2, \.mdl-edit(, \.mdl-more)? \{ display: none !important/.test(mui2), "…and the second row hides on touch like the first");
+      ok(!/\(pointer: coarse\) \{ \.mdl-act2, \.mdl-edit/.test(mui2) && /\.mdl-card \.mdl-more\{/.test(mui2), "…and the \u22ef row is reachable on touch too (2.44; it hid there before)");
       ok(/models-attrs\.json/.test(fs.readFileSync(path.join(REPO, ".gitignore"), "utf8")), "models-attrs.json is state and gitignored");
     }
     // v2.38: Convert to U1 (issue #5). A MakerWorld file keeps the designer's
@@ -3864,6 +4052,12 @@ async function stopHub() {
       r = await reqPR({ path: path.join(mroot, "PR Maker", "Tiny Turtle", "Tiny Turtle.3mf"), sha256: "ab12" }, tok);
       ok(r.status === 200 && r.body.rel === "PR Maker/Tiny Turtle/Tiny Turtle.3mf" && r.body.request.status === "requested" && r.body.dispatched === false,
         "print-request: marked, nothing to print yet (no gcode linked)", r.body);
+      // v2.40.2: Explorer on X:\_MMF, the Hub (a service) on \\server\share\_MMF - same file, different names.
+      r = await reqPR({ path: "Z:\\other-name-for-the-library\\PR Maker\\Tiny Turtle\\Tiny Turtle.3mf" }, tok);
+      ok(r.status === 200 && r.body.rel === "PR Maker/Tiny Turtle/Tiny Turtle.3mf",
+        "print-request: the same file named through another drive letter or share is matched by its place inside the library", r.body);
+      r = await reqPR({ path: "Z:\\other-name-for-the-library\\PR Maker\\Tiny Turtle\\No Such Model.3mf" }, tok);
+      ok(r.status === 404 && /not on the shelf/.test(r.body.error), "…but a file that is not in the library is still refused", r.body);
       r = await jget("/api/models?requested=1");
       ok(r.body.requested_total === 1 && r.body.items.length === 1 && r.body.items[0].requested.status === "requested", "the Requested view shows it, with a count", { t: r.body.requested_total, n: r.body.items.length });
       const jobsBefore = (await jget("/api/dispatch")).body;
@@ -4022,13 +4216,33 @@ async function stopHub() {
       let sess = null;
       for (let i = 0; i < 50; i++) { await sleep(200); const q = await jget("/api/models/sessions"); sess = (q.body.sessions || []).find(x => x.id === r.body.session.id); if (sess && sess.state === "done") break; }
       ok(sess && sess.state === "done" && sess.newGcode === "Harness Link Probe.gcode", "…and sees the new gcode land", sess);
+      // 2.43.0 (Danny, 2026-10-15): a finished Orca session leaves the strip
+      // once its gcode is in Dispatch - sent from the strip, or queued any
+      // other way. Shown failing on 2.42.0 first.
+      {
+        const listed = async id => ((await jget("/api/models/sessions")).body.sessions || []).some(x => x.id === id);
+        let s2 = await jpost("/api/models/sessions/send", { id: sess.id });
+        ok(s2.status === 200 && s2.body.job_id, "strip: Send to Dispatch queues the job", s2.body);
+        ok(!(await listed(sess.id)), "strip: …and the finished session leaves the strip");
+        if (s2.body.job_id) await jpost("/api/dispatch/jobs/remove", { id: s2.body.job_id });
+        r = await jpost("/api/models/open", { file: "3D Tinys Prints/Baby Sheep/Tinys_Sheep_Colored.3mf", type: "u1" });
+        const probe2 = path.join(gcodeDir, "Harness Strip Probe.gcode");
+        fs.writeFileSync(probe2, GCODE_SINGLE);
+        let sB = null;
+        for (let i = 0; i < 50; i++) { await sleep(200); const q = await jget("/api/models/sessions"); sB = (q.body.sessions || []).find(x => x.id === r.body.session.id); if (sB && sB.state === "done") break; }
+        ok(sB && sB.state === "done" && await listed(sB.id), "strip: (fixture) a second finished session is on the strip", sB);
+        const qj = await jpost("/api/dispatch/jobs", { again: true, file: "Harness Strip Probe.gcode", type: "u1", qty: 1 });
+        ok(!(await listed(sB.id)), "strip: a session whose gcode was queued in Dispatch some other way leaves the strip too");
+        if (qj.body && qj.body.job) await jpost("/api/dispatch/jobs/remove", { id: qj.body.job.id });
+        fs.unlinkSync(probe2);
+      }
       // v2.35.1: the watcher must not touch the gcode folder synchronously.
       // The harness's folder is local disk, where a sync sweep is 20 ms and
       // invisible; on the SMB share it was 14 s per 3 s tick and the Hub
       // "died" (MISTAKES.md 2026-09-26). So the check is on the source.
       {
         const mjs = fs.readFileSync(path.join(REPO, "modules", "models.js"), "utf8");
-        const openBody = mjs.slice(mjs.indexOf('app.post("/api/models/open"'), mjs.indexOf('app.get("/api/models/sessions"')).replace(/\/\/.*$/gm, "");   // code only; the comment names the old calls
+        const openBody = mjs.slice(mjs.indexOf("async function openSession(") >= 0 ? mjs.indexOf("async function openSession(") : mjs.indexOf('app.post("/api/models/open"'), mjs.indexOf('app.get("/api/models/sessions"')).replace(/\/\/.*$/gm, "");   // code only; the comment names the old calls
         ok(openBody.length > 200 && !/readdirSync|statSync|existsSync\(p\)/.test(openBody) && /fs\.promises\.readdir\(gdir\)/.test(openBody) && /fs\.promises\.stat\(gdir\)/.test(openBody), "the Orca watcher reads the gcode folder asynchronously - one stat of the folder per tick, a listing only when it moved");
       }
       const lf = path.join(hubDir, "models-links.json");
@@ -4047,8 +4261,8 @@ async function stopHub() {
       mockU1.state.history = []; mockSv.state.history = [];
 
       const mui3 = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8");
-      ok(/id="mdl-sort"/.test(mui3) && ["designer", "name", "newest", "oldest", "printed", "random"].every(k => new RegExp(k + ": \"").test(mui3)) && /u1\.models\.sort/.test(mui3), "the bar has the sort select with all six orders, remembered in this browser");
-      ok(/&seed=/.test(mui3) && /id="mdl-shuffle"/.test(mui3) && />printed \' \+ it\.prints \+ "×<\/span> · "/.test(mui3) && /d\.printed\.printers/.test(mui3), "…random pages with the seed and can be re-dealt; printed shows the count first on the card's line (the line clips at the end) and where it came from in the foot");
+      ok(/id="mdl-sort"/.test(mui3) && ["designer", "name", "newest", "oldest", "printed", "random"].every(k => new RegExp(k + ": \"").test(mui3)) && /u1\.models\.sort/.test(mui3), "the bar has the sort control with all six orders, remembered in this browser");
+      ok(/&seed=/.test(mui3) && /id="mdl-shuffle"/.test(mui3) && /class="mdl-pill"[^>]*>printed ' \+ it\.prints/.test(mui3) && /d\.printed\.printers/.test(mui3), "…random pages with the seed and can be re-dealt; printed is a pill on the thumb (2.44) and where it came from is in the foot");
       ok(/models-links\.json/.test(fs.readFileSync(path.join(REPO, ".gitignore"), "utf8")), "models-links.json is state and gitignored");
     }
     r = await jpost("/api/models/settings", { folder: "", clear: true });
@@ -4247,6 +4461,56 @@ async function stopHub() {
       ok(sug && sug.settings.length === 2 && sug.settings[0].label === "layer_height" && sug.settings[1].from === null && sug.heads[0].head === "T2" && sug.watch.length === 2 && sug.orientation === null, "parseSuggestion: JSON out of a fenced reply, labels defaulting to keys, nulls kept", sug);
       ok(amod.parseSuggestion("I cannot help with that.") === null && amod.parseSuggestion('{"x":1}') === null, "parseSuggestion: no sheet, no result");
       ok(amod.MODEL_SYSTEM.length < 4000 && /ONE JSON object/.test(amod.MODEL_SYSTEM) && /Snapmaker U1/.test(amod.MODEL_SYSTEM), "the suggester's system prompt asks for one JSON object and sets the U1 context");
+      // v2.42: the sheet also carries a machine value per row for Orca.
+      ok(/"set"/.test(amod.MODEL_SYSTEM) && amod.parseSuggestion('{"summary":"s","settings":[{"key":"brim_type","value":"Mouse ears","set":"brim_ears"}]}').settings[0].set === "brim_ears",
+        "the suggester asks for an Orca-ready \"set\" value per setting, and keeps it");
+    }
+
+    console.log("\n== v2.42: Open in Orca with these settings - the guardrail ==");
+    {
+      // An AI answer only ever writes whitelisted keys, with values checked
+      // against what a person would accept on a U1; everything else is
+      // reported as not applied, never guessed or clamped.
+      const T = require(path.join(REPO, "modules", "tuning.js"));
+      const nz = (k, v) => T.normalize(k, v);
+      ok(nz("layer_height", "0.12 mm").value === "0.12" && nz("brim_width", "3mm").value === "3" && nz("nozzle_temperature", "220 °C").value === "220" && nz("sparse_infill_density", "15%").value === "15%",
+        "numbers come out of the units Orca shows (0.12 mm, 3mm, 220 °C, 15%)");
+      ok(nz("support_type", "Tree (auto)").value === "tree(auto)" && nz("brim_type", "Mouse ears").value === "brim_ears" && nz("ironing_type", "none").value === "no ironing" && nz("enable_support", "Enabled").value === "1" && nz("enable_prime_tower", "off").value === "0",
+        "choices and on/off land on Orca's own values (Tree (auto), Mouse ears, none, Enabled, off)");
+      ok(nz("layer_height", "0.5").error && nz("nozzle_temperature", "400").error && nz("wall_loops", "2.5").error && nz("layer_height", "0.12-0.16").error && nz("support_type", "spaghetti").error && nz("sparse_infill_density", "150%").error,
+        "out-of-range, fractional walls, ranges and made-up choices are refused");
+      ok(nz("post_process", "C:\\evil.bat").error && nz("start_gcode", "G28").error && nz("printer_model", "Bambu").error,
+        "keys off the list - a post-processing script, gcode hooks, the printer - can never be written");
+      const base = { printer_model: "Snapmaker U1", layer_height: "0.2", enable_support: "0", nozzle_temperature: ["220", "220", "220", "220"], filament_type: ["PLA", "PLA", "PLA", "PLA"], post_process: [] };
+      let r = T.applyTuning(base, [
+        { key: "layer_height", value: "0.12 mm", set: "0.12" }, { key: "enable_support", value: "On" }, { key: "nozzle_temperature", value: "215 °C" },
+        { key: "post_process", value: "evil.bat" }, { key: "layer_height", value: "0.08" }, { key: "brim_width", value: "lots" }]);
+      ok(r.ps.layer_height === "0.12" && r.ps.enable_support === "1" && r.ps.nozzle_temperature.join() === "215,215,215,215" && JSON.stringify(r.ps.post_process) === "[]",
+        "applied: process values, and a temperature on every slot when they all hold one material; post_process untouched", r.ps);
+      ok(r.skipped.map(x => x.key).join() === "post_process,layer_height,brim_width" && r.applied.length === 3 && base.layer_height === "0.2",
+        "skipped with reasons: a key off the list, the same key twice, a value that is not a number - and the input object is not changed", r.skipped);
+      const d = r.ps.different_settings_to_system;
+      ok(Array.isArray(d) && d.length === 6 && d[0] === "enable_support;layer_height" && d[1] === "nozzle_temperature" && d[4] === "nozzle_temperature" && d[5] === "",
+        "every applied key is marked as changed for Orca: process first, then one entry per filament slot", d);
+      r = T.applyTuning({ ...base, filament_type: ["PLA", "PETG", "PLA", "PLA"] }, [{ key: "nozzle_temperature", value: "230" }, { key: "wall_loops", value: "3" }]);
+      ok(r.ps.nozzle_temperature.join() === "220,220,220,220" && r.ps.wall_loops === "3" && /different materials/.test(r.skipped[0].reason),
+        "PLA + PETG in one project: one suggested temperature is not written to both", r.skipped);
+      // v2.41 field case: Espeon is a painted U1 project with 24 filaments
+      // whose temperature lists are 4 long. Lists keep their own length, and
+      // the "changed" list gets one entry per filament with the printer last.
+      const p24 = { printer_model: "Snapmaker U1", filament_type: Array(24).fill("PLA"), filament_settings_id: Array(24).fill("Generic PLA"), nozzle_temperature: ["220", "220", "220", "220"] };
+      r = T.applyTuning(p24, [{ key: "nozzle_temperature", value: "205 °C" }, { key: "enable_prime_tower", value: "0" }]);
+      const d24 = r.ps.different_settings_to_system;
+      ok(r.ps.nozzle_temperature.length === 4 && r.ps.nozzle_temperature.every(v => v === "205") && d24.length === 26 && d24[0] === "enable_prime_tower" && d24[1] === "nozzle_temperature" && d24[24] === "nozzle_temperature" && d24[25] === "",
+        "24 filaments: the temperature list keeps its 4 entries, and the changed-list has 24 filament entries with the printer's last", { len: r.ps.nozzle_temperature.length, diffLen: d24.length });
+      const { zipRead, zipEntryContent } = require(path.join(REPO, "modules", "slicing.js"));
+      const u1ps = JSON.stringify({ printer_model: "Snapmaker U1", layer_height: "0.2", filament_type: ["PLA", "PLA"], nozzle_temperature: ["220", "220"] });
+      const zin = buildZip(files.map(x => x.name === "Metadata/project_settings.config" ? { name: x.name, data: Buffer.from(u1ps) } : x));
+      const t = T.tuneBuffer(zin, [{ key: "layer_height", value: "0.16 mm" }]);
+      const eIn = zipRead(zin), eOut = zipRead(t.buffer);
+      const same = eIn.filter(x => x.name !== "Metadata/project_settings.config").every(x => { const y = eOut.find(z => z.name === x.name); return y && zipEntryContent(y).equals(zipEntryContent(x)); });
+      ok(same && eOut.length === eIn.length && JSON.parse(zipEntryContent(eOut.find(x => x.name === "Metadata/project_settings.config")).toString()).layer_height === "0.16",
+        "tuneBuffer: only the settings file changes; meshes, paint and renders come through byte for byte");
     }
 
     // The route, against a mock Messages endpoint that understands content blocks.
@@ -4303,6 +4567,52 @@ async function stopHub() {
     ok(JSON.parse(fs.readFileSync(path.join(hubDir, "advisor.json"), "utf8")).models.length >= 2, "suggestions persist in advisor.json beside the gcode reviews");
     r = await jget("/api/advisor");
     ok(r.body.suggestions >= 2 && r.body.spent_usd >= 0.02, "GET /api/advisor counts suggestions in the spend", r.body);
+    // v2.42: Open in Orca with these settings. Orca is node here (the same
+    // stand-in the session checks use); the file is a Bambu project, so it
+    // needs the U1 template, and the suggestion comes from the cache.
+    {
+      const callsBefore = calls.length;
+      const absA = path.join(mroot, relA);
+      const before = fs.readFileSync(absA);
+      await jpost("/api/models/settings", { orcaExe: process.execPath, u1Template: path.join(tmp, "no-template-here.3mf") });
+      r = await jpost("/api/models/open-tuned", { file: relA, type: "u1", printer: U1ID });
+      ok(r.status === 409 && /U1 template/.test(r.body.error), "a project for another printer without a U1 template: refused, saying why", r.body);
+      const tplPs = JSON.stringify({ printer_model: "Snapmaker U1", printer_settings_id: "Snapmaker U1 (0.4 nozzle)", print_settings_id: "0.20mm Standard @Snapmaker U1 (0.4 nozzle)",
+        layer_height: "0.2", wall_loops: "2", sparse_infill_density: "15%", enable_support: "0", brim_type: "auto_brim",
+        nozzle_temperature: ["220", "220", "220", "220"], filament_type: ["PLA", "PLA", "PLA", "PLA"], filament_colour: ["#FFFFFF", "#FFFFFF", "#FFFFFF", "#FFFFFF"], filament_settings_id: ["Generic PLA", "Generic PLA", "Generic PLA", "Generic PLA"] });
+      const tplPath = path.join(tmp, "u1tpl-tune.3mf");
+      fs.writeFileSync(tplPath, buildZip([{ name: "3D/3dmodel.model", data: Buffer.from('<?xml version="1.0"?><model><resources/><build/></model>') }, { name: "Metadata/project_settings.config", data: Buffer.from(tplPs) }]));
+      await jpost("/api/models/settings", { u1Template: tplPath });
+      r = await jpost("/api/models/open-tuned", { file: relA, type: "u1", printer: U1ID });
+      ok(r.status === 200 && r.body.session && r.body.session.state === "watching" && r.body.session.file === relA && r.body.session.tuned,
+        "opens: the session belongs to the library file, and says it was a tuned copy", r.body);
+      ok(r.body.cached === true && r.body.cost === 0 && calls.length === callsBefore, "the cached suggestion is reused - no second charge", { cached: r.body.cached, calls: calls.length - callsBefore });
+      // v2.41 field case: the printer list was switched after the answer came
+      // back; the button must load the answer on screen, not ask again.
+      const shown = (await jpost("/api/advisor/model", { file: relA, printer: U1ID })).body.key;
+      const rk = await jpost("/api/models/open-tuned", { file: relA, type: "u1", printer: "", key: shown });
+      ok(rk.status === 200 && calls.length === callsBefore && rk.body.applied.some(a => a.key === "enable_support"),
+        "with the key of the answer on screen, that answer is loaded - even with another printer picked, and nothing new is asked", { status: rk.status, calls: calls.length - callsBefore });
+      const rn = await jpost("/api/models/open-tuned", { file: relA, type: "u1", printer: U1ID, key: "nope" });
+      ok(rn.status === 409 && /press Ask/.test(rn.body.error), "a key that is not saved is refused, not quietly replaced by a new answer", rn.body);
+      ok(fs.readFileSync(absA).equals(before), "the library file is not changed by a single byte");
+      const copy = r.body.copy || "";
+      ok(copy && fs.existsSync(copy) && path.basename(copy) === path.basename(absA) && !path.resolve(copy).startsWith(path.resolve(mroot)),
+        "the copy keeps the file's name (so its gcode still matches) and lives outside the library", copy);
+      if (copy && fs.existsSync(copy)) {
+        const { zipRead, zipEntryContent } = require(path.join(REPO, "modules", "slicing.js"));
+        const ps = JSON.parse(zipEntryContent(zipRead(fs.readFileSync(copy)).find(x => x.name === "Metadata/project_settings.config")).toString());
+        ok(ps.printer_model === "Snapmaker U1" && ps.enable_support === "1" && ps.layer_height === "0.2" && /enable_support/.test((ps.different_settings_to_system || [])[0] || ""),
+          "the copy is a U1 project with the suggested supports on, marked as changed for Orca", { printer: ps.printer_model, support: ps.enable_support, diff: ps.different_settings_to_system });
+        ok(r.body.converted && /Bambu Lab A1/.test(r.body.converted.from) && r.body.applied.some(a => a.key === "enable_support" && a.to === "1"),
+          "…and the reply says it was converted from the Bambu project and lists what was applied", { converted: r.body.converted, applied: r.body.applied });
+      }
+      const mjs2 = fs.readFileSync(path.join(REPO, "modules", "models.js"), "utf8");
+      const tunedRoute = mjs2.slice(mjs2.indexOf('app.post("/api/models/open-tuned"'), mjs2.indexOf('app.get("/api/models/sessions"')).replace(/\/\/.*$/gm, "");
+      ok(tunedRoute.length > 500 && !/Sync\(/.test(tunedRoute.replace(/existsSync\(c\.orcaExe\)/g, "")), "the tuned-open route does no synchronous file IO (the library is a share)");
+      await jpost("/api/models/settings", { orcaExe: path.join(tmp, "no-such-orca.exe"), u1Template: "", clear: true });
+      await jpost("/api/models/settings", { folder: mroot });
+    }
     // The failure the first live call hit (2026-09-22): the model spent the
     // whole budget thinking and answered with no text. That is an error with
     // the reason in it, not an empty sheet.
@@ -4330,6 +4640,9 @@ async function stopHub() {
     const mui = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8");
     ok(/data-suggest=/.test(mui) && /id="mdl-adv"/.test(mui) && /\/api\/advisor\/model/.test(mui), "the Models card has a ✦ Settings button and the panel that calls the suggester");
     ok(/HUB_FEATURES\.advisor === false \? ""/.test(mui), "…which is left off when the advisor module is off");
+    ok(/id="mdl-tuneopen"/.test(mui) && /\/api\/models\/open-tuned/.test(mui) && /pointer: coarse\) \{ \.mdl-tunerow/.test(mui) && /your file is not changed/.test(mui),
+      "the settings panel has Open in Orca with these settings - desktop only, and it says the file is not changed");
+    ok(/key: SHOWNKEY/.test(mui) && /These suggestions are for/.test(mui), "…it sends the key of the answer on screen, and says so when the printer list no longer matches it");
     const appSrc = fs.readFileSync(path.join(REPO, "public", "app.js"), "utf8");
     ok(/Object\.defineProperties\(window,\s*\{\s*SELECTED: \{ get/.test(appSrc) && /FLEET: \{ get/.test(appSrc) && /MAPSEL: \{ get/.test(appSrc),
       "app.js exposes SELECTED, MAP, FLEET and MAPSEL on window (a top-level let is not a window property; the 2.25 job-card button read undefined and did nothing)");
@@ -4518,7 +4831,10 @@ async function stopHub() {
     // Every remaining bare hex must be one of the Gantt's semantic key colours,
     // which stay literal on purpose: the legend tells the user what they mean,
     // so they must not follow the accent.
-    const KEY = /#(274a72|3a6ca8|1d5c3a|164a2e|6e2020|c0392b|2c6b41|8fe0ac|f0a89f|2a1414|8a3b32|12261a|12281a|171a20|5c4a1f|5c4a1d|7a4c46|c07a2b|ffd166|ff9f43|bff0d4|cfe0f5|8fb7e0|0a7a33|0006|fff|000)$/i;
+    // v2.41: #ffb066 (clash mark) and #b0645a ("why?" border) are the
+    // contrast-pass replacements for #ff9f43 and #7a4c46 - same meaning,
+    // measured to 4.5:1 and 3:1 on their bars.
+    const KEY = /#(274a72|3a6ca8|1d5c3a|164a2e|6e2020|c0392b|2c6b41|8fe0ac|f0a89f|2a1414|8a3b32|12261a|12281a|171a20|5c4a1f|5c4a1d|7a4c46|b0645a|c07a2b|ffd166|ff9f43|ffb066|bff0d4|cfe0f5|8fb7e0|0a7a33|0006|fff|000)$/i;
     const bare = [];
     dsp.replace(/(var\(\s*--[a-z0-9-]+\s*,\s*)?#([0-9a-fA-F]{3,8})\b/gi, (m, inVar, hex) => {
       if (!inVar && !KEY.test("#" + hex)) bare.push("#" + hex);
@@ -4527,6 +4843,188 @@ async function stopHub() {
     ok(bare.length === 0,
       "every non-key colour in dispatch-ui.js resolves through a token",
       [...new Set(bare)].slice(0, 12));
+
+    // v2.40.2: the three marks a timeline bar can carry (spool swaps, a color
+    // another printer needs at the same time, waiting for a bed clear) were
+    // unlabeled glyphs - the owner had to ask what they meant. The key that
+    // explains the bar colors must explain them too, using the same classes
+    // the bars use, so a restyle of a badge restyles its legend entry with it.
+    const keyAt = dsp.indexOf('<span class="dsp-gkey">');
+    const keyEnd = dsp.indexOf("</div>", keyAt);
+    const keyHtml = keyAt >= 0 && keyEnd > keyAt ? dsp.slice(keyAt, keyEnd) : "";
+    const badgeMiss = ["dsp-swapn", "dsp-clash", "dsp-idle"]
+      .filter(c => !keyHtml.includes('class="' + c + '"'));
+    ok(keyHtml && badgeMiss.length === 0,
+      "the timeline key explains every badge a bar can carry", badgeMiss);
+
+    // 2026-10-06: the file list's "Send to..." strip (nine printers + Hub
+    // library + a long file name) was one unwrapped flex row ~600px wide and
+    // pushed the whole list sideways on a phone. It must wrap, and its buttons
+    // must not shrink into broken labels.
+    const idx = fs.readFileSync(path.join(REPO, "public", "index.html"), "utf8");
+    const stripRule = (idx.match(/\.actstrip\{[^}]*\}/) || [""])[0];
+    const sbRule = (idx.match(/\.actstrip \.sb\{[^}]*\}/) || [""])[0];
+    ok(/flex-wrap:\s*wrap/.test(stripRule) && /white-space:\s*nowrap/.test(sbRule),
+      "the Send-to strip wraps onto more rows instead of overflowing a phone", { stripRule, sbRule });
+
+    // v2.41 contrast pass (3MF Explorer 1.4.0's method). The full measurement
+    // is scripts/contrast-audit.js against a live throwaway Hub; these are the
+    // static guards that keep its findings fixed.
+    // (a) Controls are bordered in --field (3:1), never the decorative --line.
+    const ruleOf = sel => { const m = idx.match(new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\{[^}]*\\}")); return m ? m[0] : ""; };
+    const ctlSel = [".refresh", ".gear", ".field", ".filter input", ".sortsel", ".qbtn", ".pcard .statsbtn",
+      ".bedrow .bedset", ".btn.ghost", ".pcard .camopen", ".vtab", ".ttab", ".prow .rm", ".typerow .rm", ".cpop .cpin", ".cpop .cpmat"];
+    const ctlBad = ctlSel.filter(s => { const r = ruleOf(s); return !r || /var\(--line/.test(r) || !/--field/.test(r); });
+    ok(/--field:\s*#[0-9a-fA-F]{6}/.test(idx) && ctlBad.length === 0,
+      "inputs, selects and buttons are bordered in --field, not the decorative --line", ctlBad);
+    // (b) Cancel drew the browser's light-gray default button under red text.
+    ok(/background:\s*transparent/.test(ruleOf(".btn.danger")),
+      "the danger button has a background of its own", ruleOf(".btn.danger"));
+    // (c) Any type accent reads as text: run app.js's own readableAccent() on
+    // every preset and on a deliberately dark pick.
+    const appSrc = fs.readFileSync(path.join(REPO, "public", "app.js"), "utf8");
+    const accAt = appSrc.indexOf("function _lum("), accEnd = appSrc.indexOf("function applyAccent(");
+    let accBad = ["readableAccent() not found in app.js"];
+    if (accAt >= 0 && accEnd > accAt) {
+      const A = new Function(appSrc.slice(accAt, accEnd) + "; return { readableAccent, onAccent, _cr };")();
+      const cfgSrc = fs.readFileSync(path.join(REPO, "core", "config.js"), "utf8");
+      const presets = ((cfgSrc.match(/ACCENT_PRESETS\s*=\s*\[([^\]]*)\]/) || [])[1] || "").match(/#[0-9a-fA-F]{6}/g) || [];
+      accBad = ["#FFB200", ...presets, "#3A2A6B", "#000000"]
+        .map(c => ({ c, r: A.readableAccent(c), text: A._cr(A.readableAccent(c), "#31363F"), label: A._cr(A.onAccent(A.readableAccent(c)), A.readableAccent(c)) }))
+        .filter(x => x.text < 4.5 || x.label < 4.5);
+      if (presets.length < 8) accBad.push("ACCENT_PRESETS not found in core/config.js");
+      if (A.readableAccent("#FFB200") !== "#FFB200") accBad.push("the U1 gold was altered");
+    }
+    ok(accBad.length === 0, "every type accent reads at 4.5:1 as text and under its label", accBad);
+    // v2.40.2: head auto-mapping matches MATERIAL first, then color. Reported
+    // on 2.26: with PLA and PETG loaded in the same color, a PETG part could
+    // be mapped to the PLA roll. Runs app.js's own defaultMapping().
+    {
+      const mAt = appSrc.indexOf("const MATCH_THRESHOLD"), mEnd = appSrc.indexOf("function fmtDur(");
+      let M = null;
+      try { M = new Function(appSrc.slice(mAt, mEnd) + "; return { defaultMapping, matWarnText };")(); } catch (e) { M = null; }
+      ok(!!M && mAt >= 0 && mEnd > mAt, "MAPMAT: defaultMapping() can be lifted out of app.js for testing");
+      if (M) {
+        const H = (hex, material) => ({ loaded: true, hex, material });
+        let mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "PETG" }], [H("#FF0000", "PLA"), H("#FF0000", "PETG")]);
+        ok(mp[0] === 1, "MAPMAT: a PETG part goes to the PETG head when PLA and PETG are loaded in the same color", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "PETG" }], [H("#FF0000", "PLA"), H("#E01010", "PETG")]);
+        ok(mp[0] === 1, "MAPMAT: the right material beats a closer color on the wrong material", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "petg" }], [H("#00FF00", "PLA"), H("#FF0000", " PETG ")]);
+        ok(mp[0] === 1, "MAPMAT: material names compare without case or spaces", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "PETG" }], [H("#FF0000", "PLA"), H("#0000FF", "PLA")]);
+        ok(mp[0] === 0, "MAPMAT: no free head has the material - falls back to the nearest color (the row then warns)", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "" }], [H("#0000FF", "PETG"), H("#FF0000", "PLA")]);
+        ok(mp[0] === 1, "MAPMAT: a file that names no material keeps the color-only match", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "PLA" }], [H("#0000FF", ""), H("#FF0000", "")]);
+        ok(mp[0] === 1, "MAPMAT: heads that name no material keep the color-only match", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "PLA" }, { i: 1, hex: "#FF0000", type: "PETG" }], [H("#FF0000", "PLA")]);
+        ok(mp[0] === 0 && mp[1] === undefined, "MAPMAT: two same-color tools only share a head when the material matches too", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF0000", type: "PLA" }, { i: 1, hex: "#FF0000", type: "PLA" }], [H("#FF0000", "PLA")]);
+        ok(mp[0] === 0 && mp[1] === 0, "MAPMAT: same color and same material still share one head", mp);
+        ok(M.matWarnText("PETG", "PLA") === "needs PETG - this head has PLA" && M.matWarnText("PLA", "pla") === "" && M.matWarnText("", "PLA") === "",
+          "MAPMAT: the mismatch warning text, and no warning when it matches or is unknown");
+        // v2.41 field case (2026-10-12): Espion needs white, light purple,
+        // black, red; U6 holds red, orange, black, white. First-come mapping
+        // let light purple (no close roll anywhere) take the red head, sent
+        // red to orange, and Print on best printer said red was missing.
+        mp = M.defaultMapping([{ i: 0, hex: "#FFFFFF", type: "PLA" }, { i: 1, hex: "#8080FF", type: "PLA" }, { i: 2, hex: "#000000", type: "PLA" }, { i: 3, hex: "#FF0000", type: "PLA" }],
+          [H("#E72F1D", "PLA"), H("#FFA500", "PLA"), H("#000000", "PLA"), H("#FFFFFF", "PLA")]);
+        ok(mp[0] === 3 && mp[2] === 2 && mp[3] === 0 && mp[1] === 1, "MAPOPT: the loaded red goes to the red part; the color nothing matches gets what is left", mp);
+        mp = M.defaultMapping([{ i: 0, hex: "#FF8800", type: "PLA" }, { i: 1, hex: "#FF0000", type: "PLA" }], [H("#FF0000", "PLA"), H("#FFAA00", "PLA")]);
+        ok(mp[0] === 1 && mp[1] === 0, "MAPOPT: two close colors each get their own nearest roll, whatever order the file lists them in", mp);
+        const many = Array.from({ length: 8 }, (_, i) => ({ i, hex: "#" + (i * 30).toString(16).padStart(2, "0") + "4080", type: "PLA" }));
+        const t0 = Date.now(); for (let k = 0; k < 50; k++) M.defaultMapping(many, [H("#102030", "PLA"), H("#405060", "PLA"), H("#708090", "PLA"), H("#A0B0C0", "PLA")]);
+        ok(Date.now() - t0 < 400, "MAPOPT: eight colors on four heads stays fast enough to run on every fleet render (50 runs)", Date.now() - t0);
+        const big = Array.from({ length: 12 }, (_, i) => ({ i, hex: "#FF0000", type: "PLA" }));
+        mp = M.defaultMapping(big, [H("#FF0000", "PLA")]);
+        ok(Object.keys(mp).length === 12 && Object.values(mp).every(v => v === 0), "MAPOPT: a palette past the exact-search limit still maps (one-at-a-time, twins share the head)", mp);
+      }
+      ok(/data-need="\$\{esc\(n\.type/.test(appSrc) && /class="cmwarn"/.test(appSrc) && /matWarnText\(row\.dataset\.need, sw\.dataset\.mat\)/.test(appSrc),
+        "MAPMAT: the mapping row warns on a material mismatch and updates when another head is tapped");
+    }
+    // (d) The tab icon, drawn like Explorer's: an SVG with a 32px PNG fallback.
+    const favOk = ["favicon.svg", "favicon-32.png"].every(f => fs.existsSync(path.join(REPO, "public", f))) &&
+      /^<svg[\s>]/.test(fs.readFileSync(path.join(REPO, "public", "favicon.svg"), "utf8")) &&
+      idx.includes('href="/favicon.svg"') && idx.includes('href="/favicon-32.png"');
+    ok(favOk, "the Hub has an SVG favicon with a 32px fallback, linked from the page");
+  }
+
+  console.log("\n== v2.42: Print on best printer ==");
+  {
+    // Forum request 2026-10-11: pick a model, press print, the Hub chooses an
+    // idle printer that already has the right filaments. The choice is a pure
+    // function in app.js, evaluated here on its own with the color helpers it
+    // uses (the same span the job card runs).
+    const src = fs.readFileSync(path.join(REPO, "public", "app.js"), "utf8");
+    const a = src.indexOf("const MATCH_THRESHOLD"), b = src.indexOf("function fmtDur(");
+    let P = null;
+    try { P = new Function(src.slice(a, b) + "; return { pickBestPrinter };")(); } catch (e) { P = null; }
+    ok(!!(P && P.pickBestPrinter), "pickBestPrinter() is defined beside the color matcher");
+    if (P) {
+      const H = (hex, mat) => ({ loaded: true, hex, material: mat || "PLA" });
+      const E = { loaded: false };
+      const need = [{ i: 0, hex: "#FF0000", type: "PLA" }, { i: 1, hex: "#FFFFFF", type: "PLA" }];
+      const pr = (id, o) => Object.assign({ id, name: "U" + (id + 1), online: true, state: "standby", heads: [E, E, E, E] }, o);
+      const fleet = [
+        pr(0, { state: "printing", heads: [H("#FF0000"), H("#FFFFFF"), E, E] }),         // right colors, busy
+        pr(1, { maintenance: { note: "nozzle" }, heads: [H("#FF0000"), H("#FFFFFF"), E, E] }), // right colors, out of service
+        pr(2, { online: false, heads: [H("#FF0000"), H("#FFFFFF"), E, E] }),             // right colors, offline
+        pr(3, { heads: [H("#FF0000"), H("#FFFFFF", "PETG"), E, E] }),                   // white is the wrong material
+        pr(4, { heads: [H("#EE1111"), H("#F4F4F4"), H("#000000"), E] }),                // close shades - qualifies
+        pr(5, { heads: [E, H("#FFFFFF"), H("#FF0000"), E] }),                            // exact - qualifies, closer
+      ];
+      let r = P.pickBestPrinter(need, fleet);
+      ok(r.printer === 5 && r.map[0] === 2 && r.map[1] === 1,
+        "picks the idle, in-service printer with every color loaded, closest match first, and maps each color to its head", r);
+      r = P.pickBestPrinter(need, fleet.slice(0, 5));
+      ok(r.printer === 4, "a close shade of the right color still qualifies when nothing is exact", r);
+      r = P.pickBestPrinter(need, fleet.slice(0, 4));
+      ok(r.printer === null && /U4/.test(r.reason) && /#FFFFFF PLA/.test(r.reason),
+        "busy, out-of-service, offline and wrong-material printers are never picked - and the reason names the closest one and what it lacks", r);
+      r = P.pickBestPrinter(need, [pr(0, { state: "printing" })]);
+      ok(r.printer === null && /idle/.test(r.reason), "no idle printer at all says so instead of guessing", r);
+      const tie = [pr(6, { heads: [H("#FF0000"), H("#FFFFFF"), E, E] }), pr(7, { heads: [H("#FF0000"), H("#FFFFFF"), E, E] })];
+      r = P.pickBestPrinter(need, tie);
+      ok(r.printer === 6, "an exact tie goes to the printer listed first", r);
+      // v2.41 field case: the red is loaded but a color nothing matches used
+      // to take its head; the refusal must name only what is really missing.
+      const espion = [{ i: 0, hex: "#FFFFFF", type: "PLA" }, { i: 1, hex: "#8080FF", type: "PLA" }, { i: 2, hex: "#000000", type: "PLA" }, { i: 3, hex: "#FF0000", type: "PLA" }];
+      r = P.pickBestPrinter(espion, [pr(9, { name: "U6", heads: [H("#E72F1D"), H("#FFA500"), H("#000000"), H("#FFFFFF")] })]);
+      ok(r.printer === null && /#8080FF/.test(r.reason) && !/#FF0000/.test(r.reason), "a refusal names only the color that is really missing, never a loaded red", r);
+      r = P.pickBestPrinter([espion[0], espion[2], espion[3]], [pr(9, { name: "U6", heads: [H("#E72F1D"), H("#FFA500"), H("#000000"), H("#FFFFFF")] })]);
+      ok(r.printer === 9 && r.map[3] === 0, "…and without the purple, that printer is picked with red on its red head", r);
+      // v2.41 Send anyway (owner, 2026-10-12): the closest printer is offered
+      // when it misses a color or two and every color still has a head.
+      const sally = [{ i: 0, hex: "#FF0000", type: "PLA" }, { i: 1, hex: "#00FFFF", type: "PLA" }, { i: 2, hex: "#FFFF00", type: "PLA" }, { i: 3, hex: "#000000", type: "PLA" }];
+      const u4 = pr(3, { name: "U4", heads: [H("#000000"), H("#FFFF00"), H("#8BD5EE"), H("#E72F1D")] });
+      r = P.pickBestPrinter(sally, [u4]);
+      ok(r.printer === null && r.closest && r.closest.sendable === true && r.closest.printer === 3 && r.closest.map[1] === 2
+         && r.closest.subs.length === 1 && r.closest.subs[0].hex === "#00FFFF" && r.closest.subs[0].head === 2 && r.closest.subs[0].headHex === "#8BD5EE",
+        "one color short: the closest printer is offered, saying the light blue in T3 would stand in for cyan", r.closest);
+      r = P.pickBestPrinter([{ i: 0, hex: "#FF0000", type: "PETG" }], [pr(3, { name: "U4", heads: [H("#E72F1D", "PLA"), E, E, E] })]);
+      ok(r.closest && r.closest.sendable && /needs PETG/.test(r.closest.subs[0].matWarn), "a material stand-in is offered too, with the mismatch spelled out", r.closest);
+      r = P.pickBestPrinter([{ i: 0, hex: "#FF0000" }, { i: 1, hex: "#00FF00" }, { i: 2, hex: "#0000FF" }], [pr(3, { name: "U4", heads: [H("#888888"), H("#777777"), H("#666666"), E] })]);
+      ok(r.closest && r.closest.sendable === false, "three colors short: no Send anyway - that is a different print", r.closest);
+      r = P.pickBestPrinter([{ i: 0, hex: "#FF0000" }, { i: 1, hex: "#00FFFF" }], [pr(3, { name: "U4", heads: [H("#FF0000"), E, E, E] })]);
+      ok(r.closest && r.closest.sendable === false, "a color with no head left to go to: no Send anyway", r.closest);
+      r = P.pickBestPrinter(need, [pr(8, { caps: { multiColor: false, heads: 1 }, heads: [] })]);
+      ok(r.printer === null, "a printer without the color API is never auto-picked for a colored file", r);
+    }
+    // The flow around it: announce first with a Cancel, re-pick on fresh fleet
+    // data at send time, and send the verified head map - not whatever the
+    // card's swatches happen to show.
+    const idx2 = fs.readFileSync(path.join(REPO, "public", "index.html"), "utf8");
+    ok(/id="autopick"/.test(idx2) && /id="autopickst"/.test(idx2), "the job card has the Print on best printer button and its status line");
+    const flowAt = src.indexOf("function autoPickStart(");
+    const flowEnd = src.indexOf("function autoPickCountdown(");
+    const flow = flowAt >= 0 && flowEnd > flowAt ? src.slice(flowAt, flowEnd + 3500) : "";
+    ok(/autopickx/.test(flow) && /left=5/.test(flow) && /await loadFleet\(\)/.test(flow)
+       && /pickBestPrinter\(neededColors\(\), autoPickFleet\(\)\)[\s\S]*pickBestPrinter\(neededColors\(\), autoPickFleet\(\)\)/.test(flow)
+       && /pushTo\(target\.printer, true, false, target\.map\)/.test(flow),
+      "it announces the printer with a 5-second Cancel, re-checks on fresh fleet data, then sends the verified map");
+    ok(/id="autopickforce"/.test(flow) && /c\.sendable/.test(flow) && /JSON\.stringify\(map\)!==JSON\.stringify\(pick\.map\)/.test(flow) && /no longer idle/.test(flow),
+      "Send anyway: only offered when the closest printer qualifies for it, and at send time it must still be idle and loaded the same way");
   }
 
   // ---- KLIPPER: each printer's own UI, proxied through the Hub (v2.21) ----
@@ -4683,6 +5181,38 @@ async function stopHub() {
     }
   }
 
+  console.log("\n== TOHUB: copy a printer-only file into the Hub library (v2.40.2) ==");
+  {
+    const UID = (((await jget("/api/fleet")).body || []).find(p => String(p.url || "").endsWith(":" + portU1)) || {}).id;
+    const libDir = path.join(hubDir, "gcode");
+    const bytes = Buffer.from("; sliced straight to the printer\nG28\n" + "G1 X1 Y1\n".repeat(4000));
+    const keepFiles = mockU1.state.files.slice();
+    mockU1.state.files.push({ name: "Printer Only Part.gcode", size: bytes.length, data: bytes });
+    let r = await jpost("/api/printer-files/to-hub", { from: UID, name: "Printer Only Part.gcode" });
+    ok(r.status === 200 && r.body.jobId, "a printer-only file can be sent to the Hub library", r.body);
+    let job = null;
+    for (let i = 0; i < 40 && !(job && job.done); i++) { await sleep(150); job = (await jget("/api/print-status?job=" + r.body.jobId)).body; }
+    const dest = path.join(libDir, "Printer Only Part.gcode");
+    ok(job && job.done && !job.error && job.result && job.result.sizeVerified === true, "…the copy finishes with its size checked against the printer's listing", job);
+    ok(fs.existsSync(dest) && Buffer.compare(fs.readFileSync(dest), bytes) === 0, "…and the library file is byte-for-byte what the printer had");
+    ok(!fs.existsSync(dest + ".u1hub-part"), "…with no half-copied .u1hub-part file left behind");
+    r = await jget("/api/files");
+    ok((r.body.files || []).some(f => f.name === "Printer Only Part.gcode"), "…and the library listing shows it straight away", (r.body.files || []).length);
+    r = await jpost("/api/printer-files/to-hub", { from: UID, name: "Printer Only Part.gcode" });
+    ok(r.status === 409 && /never overwrites/.test(r.body.error), "sending it again is refused - the Hub never overwrites a library file", r.body);
+    r = await jpost("/api/printer-files/to-hub", { from: UID, name: "Not On The Printer.gcode" });
+    ok(r.status === 404, "a name the printer doesn't have is refused", r.body);
+    r = await jpost("/api/printer-files/to-hub", { from: UID, name: "../escape.gcode" });
+    ok(r.status === 400, "a path that tries to leave the library is refused", r.body);
+    const libSrc = fs.readFileSync(path.join(REPO, "core", "library.js"), "utf8");
+    const route = libSrc.slice(libSrc.indexOf('app.post("/api/printer-files/to-hub"'), libSrc.indexOf("// --- queue routes"));
+    ok(route.length > 500 && !/Sync\(/.test(route), "the copy-to-Hub route does no synchronous file IO (the library can be a share)");
+    const appSrc = fs.readFileSync(path.join(REPO, "public", "app.js"), "utf8");
+    ok(/data-t="hub"[^>]*>Hub library</.test(appSrc), "the printer file's Send to... strip offers Hub library");
+    try { fs.unlinkSync(dest); } catch {}
+    mockU1.state.files = keepFiles;
+  }
+
   console.log("\n== LIB: wildcard filter (v2.24) ==");
   {
     // nameMatcher is a pure function in app.js with no DOM dependency, so the
@@ -4704,6 +5234,483 @@ async function stopHub() {
     ok(hits("x20 -penguin").length === 1, "wildcards, words and exclusions combine", hits("x20 -penguin"));
     ok(hits("*(x20)*").length === 0 && hits("*a+b*").length === 0 && hits("*x20.*").length === 2, "regex metacharacters in a glob are literal, not a crash", hits("*x20.*"));
   }
+
+  console.log("\n== UI: back to top (2026-10-14) ==");
+  {
+    // The owner asked for a way back to the top of long Hub pages. It must
+    // reach EVERY view (rule 9), so it lives outside the view containers and
+    // is asserted on the page as served, not only on disk.
+    const page = await (await fetch(HUB + "/")).text();
+    const btnAt = page.indexOf('id="totop"');
+    ok(btnAt > -1 && /<button class="totop" id="totop" type="button" aria-label="Back to top"/.test(page),
+      "the served page carries a real, labeled Back to top button");
+    ok(btnAt > page.indexOf("</main>") && btnAt > page.indexOf('id="dashview"'),
+      "…outside every view, so Dash, Match, Spools, Settings and module tabs all get it", { btnAt, main: page.indexOf("</main>") });
+    const js = (page.slice(btnAt).match(/<script>\s*\(function\(\)\{[\s\S]*?<\/script>/) || [""])[0];
+    ok(/window\.scrollY > Math\.max\(600, window\.innerHeight\)/.test(js) && /classList\.toggle\("show", on\)/.test(js),
+      "…shown only once the page is more than a screen down");
+    ok(/window\.scrollTo\(\{top:0, behavior: still \? "auto" : "smooth"\}\)/.test(js) && /prefers-reduced-motion: reduce/.test(js),
+      "…scrolls the window to the top, without the smooth glide when reduced motion is asked for");
+    const gold = fs.readFileSync(path.join(REPO, "public", "gold.css"), "utf8");
+    const rule = (gold.match(/\.totop\{[^}]*\}/) || [""])[0];
+    ok(/position:fixed/.test(rule) && /safe-area-inset-bottom/.test(rule) && /border:1px solid var\(--field\)/.test(rule)
+       && /visibility:hidden/.test(rule) && /width:44px; height:44px/.test(rule),
+      "…fixed in the corner clear of the phone's home bar, a 44px target, bordered like every control, out of the tab order while hidden", rule);
+    ok(/\.totop\.show\{[^}]*visibility:visible/.test(gold) && /\.totop:focus-visible\{/.test(gold),
+      "…visible when shown, with the same focus ring as every other control");
+  }
+
+  console.log("\n== SPRINT 1: protected templates, bounded pushes, Dispatch state (2.42.0) ==");
+  {
+    // H1. The U1 templates sit at the top of the real models folder. The
+    // Models tab must never list them (no card, no Delete button) and the
+    // routes must refuse them even when asked directly - a server-side deny
+    // list, never a hidden button. Attributes are set first so the rename
+    // route cannot hide behind "set the designer first".
+    const mroot = path.join(tmp, "models");
+    const TPLS = ["u1_template.3mf", "u1_template_supports.3mf", "filament_types.3mf", "Designer X/Thing/U1_Template.3mf"];
+    for (const rel of TPLS) {
+      const p = path.join(mroot, ...rel.split("/"));
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, buildZip([{ name: "3D/3dmodel.model", data: Buffer.from("<template " + rel + "/>") }]));
+    }
+    const bytesOf = rel => fs.readFileSync(path.join(mroot, ...rel.split("/")));
+    const before = Object.fromEntries(TPLS.map(rel => [rel, bytesOf(rel)]));
+    let r = await jpost("/api/models/settings", { folder: mroot });
+    await jget("/api/models?refresh=1");
+    for (let i = 0; i < 30; i++) { r = await jget("/api/models?limit=200"); if (!r.body.refreshing && r.body.total_all) break; await sleep(150); }
+    const listed = (r.body.items || []).map(it => it.rel);
+    ok(r.body.total_all > 0 && !listed.some(rel => /(^|\/)(u1_template[^/]*|filament_types)\.3mf$/i.test(rel)),
+      "H1: the walk never lists u1_template*.3mf or filament_types.3mf, at the top or in a designer folder", listed);
+    for (const rel of TPLS) {
+      await jpost("/api/models/attrs", { file: rel, designer: "Harness", name: "Template Bait" });
+      r = await jpost("/api/models/rename", { file: rel });
+      ok(r.status === 409 && /U1 template/.test(r.body && r.body.error), "H1: rename of " + rel + " is refused with 409", r);
+      r = await jpost("/api/models/delete", { file: rel });
+      ok(r.status === 409 && /U1 template/.test(r.body && r.body.error), "H1: delete of " + rel + " is refused with 409", r);
+      ok(fs.existsSync(path.join(mroot, ...rel.split("/"))) && Buffer.compare(bytesOf(rel), before[rel]) === 0,
+        "H1: …and " + rel + " is still there, byte for byte");
+      await jpost("/api/models/attrs", { file: rel, designer: "", name: "" });
+    }
+    ok(!fs.existsSync(path.join(mroot, "Harness", "Template Bait")), "H1: nothing was moved into the convention folder");
+
+    // H3. A printer that stops reading mid-upload must not hold the push
+    // forever. The harness runs with a 1.5 s idle limit (production: 30 s).
+    const UID = (((await jget("/api/fleet")).body || []).find(p => String(p.url || "").endsWith(":" + portU1)) || {}).id;
+    const stallName = "stall-test.gcode";
+    fs.writeFileSync(path.join(gcodeDir, stallName), Buffer.concat([Buffer.from(GCODE_SINGLE + "\n"), Buffer.alloc(48 * 1024 * 1024, "G1 X1\n")]));
+    mockU1.state.stallUpload = true;
+    let t0 = Date.now();
+    r = await jpost("/api/print", { file: stallName, printer: UID, type: "u1" });
+    ok(r.status === 200 && r.body.jobId, "H3: a push to a printer that will stall starts like any other", r.body);
+    let job = null;
+    for (let i = 0; i < 80 && !(job && job.done); i++) { await sleep(250); job = (await jget("/api/print-status?job=" + r.body.jobId)).body; }
+    ok(job && job.done && /stalled/i.test(job.error || ""), "H3: the stalled upload FAILS (no bytes accepted for the idle limit)", job);
+    ok(Date.now() - t0 < 15000, "H3: …within seconds of the stall, not never", Date.now() - t0);
+    r = await jpost("/api/files/rename", { name: stallName, newName: "stall-test-renamed.gcode", type: "u1" });
+    ok(r.status === 200, "H3: …and the file is released - rename works again once the push has failed", r.body);
+    mockU1.state.stallUpload = false;
+    mockU1.state.releaseHeld && mockU1.state.releaseHeld();
+    try { fs.unlinkSync(path.join(gcodeDir, "stall-test-renamed.gcode")); } catch {}
+    try { fs.unlinkSync(path.join(gcodeDir, stallName)); } catch {}
+    // Every other printer call in the print pipeline carries a timeout too.
+    mockU1.state.stallScripts = true;
+    t0 = Date.now();
+    // The harness's own call is bounded too, so a Hub WITHOUT the fix fails
+    // this check instead of hanging the run.
+    r = await fetch(HUB + "/api/printctl", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ printer: UID, action: "pause" }), signal: AbortSignal.timeout(12000) })
+      .then(async x => ({ status: x.status, body: await x.json().catch(() => null) }), e => ({ status: 0, body: { error: "harness gave up: " + e.message } }));
+    ok(r.status === 502 && /timed out/i.test(r.body && r.body.error), "H3: a printer that never answers a command gives a 502 'timed out', not a hung request", r.body);
+    ok(Date.now() - t0 < 10000, "H3: …within the harness limit (production: 10 s)", Date.now() - t0);
+    mockU1.state.stallScripts = false;
+    mockU1.state.releaseHeld && mockU1.state.releaseHeld();
+    {
+      const src = fs.readFileSync(path.join(REPO, "core", "print.js"), "utf8").split(/\r?\n/).map(l => l.replace(/^\s*\/\/.*$/, "")).join("\n");
+      const bare = src.replace(/function fetchWithTimeout[\s\S]*?\n\}\n/, "").match(/(^|[^\w.])fetch\(/g) || [];
+      ok(/function fetchWithTimeout\(/.test(src) && bare.length === 0, "H3: core/print.js has no bare fetch() left - every printer call goes through fetchWithTimeout", bare.length);
+      ok(/req\.setTimeout\(/.test(src), "H3: the upload request has a socket timeout as well as the idle watchdog");
+    }
+
+    // H4. A pin the user set by hand survives a restart, and lowering a
+    // job's quantity to what is already done finishes it instead of leaving a
+    // row with nothing to print.
+    r = await jpost("/api/dispatch/jobs", { again: true, file: "multi.gcode", type: "u1", qty: 3 });
+    const JID = r.body && r.body.job && r.body.job.id;
+    ok(!!JID, "H4: a 3-copy job is created", r.body);
+    r = await jpost("/api/dispatch/jobs/assign", { id: JID, printer: 0 });
+    ok(r.status === 200 && r.body.pinned === 0, "H4: the job is pinned to printer 0", r.body);
+    let dj = JSON.parse(fs.readFileSync(path.join(hubDir, "dispatch.json"), "utf8"));
+    // 2.43 (H2): on disk a pin names the printer's stable id, not its position.
+    const pid0 = (JSON.parse(fs.readFileSync(path.join(hubDir, "config.json"), "utf8")).printers[0] || {}).id;
+    ok(dj.pins && pid0 && dj.pins[JID] === pid0, "H4: the pin is written to dispatch.json the moment it is set", dj.pins);
+    await stopHub();
+    dj = JSON.parse(fs.readFileSync(path.join(hubDir, "dispatch.json"), "utf8"));
+    const jj = dj.jobs.find(j => j.id === JID); jj.remaining = 1;      // two of three copies already printed
+    fs.writeFileSync(path.join(hubDir, "dispatch.json"), JSON.stringify(dj, null, 2));
+    await startHub(hubDir);
+    r = await jget("/api/dispatch/plan");
+    const pinnedSlot = (r.body.slots || []).find(s => s.job_id === JID && !s.unplannable);
+    ok(pinnedSlot && pinnedSlot.printer === 0 && pinnedSlot.pinned === true, "H4: after a restart the plan still honors the pin", pinnedSlot);
+    r = await jpost("/api/dispatch/jobs/update", { id: JID, qty: 2 });
+    ok(r.status === 200, "H4: lowering the quantity to the copies already done is accepted", r.body);
+    r = await jget("/api/dispatch");
+    ok(!(r.body.jobs || []).some(j => j.id === JID), "H4: …and the job finishes and leaves the queue instead of sitting at 0 remaining", (r.body.jobs || []).find(j => j.id === JID));
+    dj = JSON.parse(fs.readFileSync(path.join(hubDir, "dispatch.json"), "utf8"));
+    ok(!(dj.pins && JID in dj.pins), "H4: …and its pin goes with it", dj.pins);
+    r = await jpost("/api/dispatch/jobs", { again: true, file: "multi.gcode", type: "u1", qty: 1 });
+    const J2 = r.body.job.id;
+    await jpost("/api/dispatch/jobs/assign", { id: J2, printer: 0 });
+    await jpost("/api/dispatch/jobs/assign", { id: J2, printer: "auto" });
+    dj = JSON.parse(fs.readFileSync(path.join(hubDir, "dispatch.json"), "utf8"));
+    ok(!(dj.pins && J2 in dj.pins), "H4: setting a job back to auto removes the pin from dispatch.json too", dj.pins);
+    await jpost("/api/dispatch/jobs/remove", { id: J2 });
+  }
+
+  console.log("\n== SPRINT 2: H20 transfer timeouts (2.43.0) ==");
+  {
+    // H20. A printer-to-printer transfer and a copy into the Hub library hold
+    // a JOBS entry (so the file can't be renamed under them). A printer that
+    // goes quiet mid-stream must fail the job within the idle limit, not hold
+    // it until the Hub restarts.
+    const fleetNow = (await jget("/api/fleet")).body || [];
+    const idOf = port => (fleetNow.find(p => String(p.url || "").endsWith(":" + port)) || {}).id;
+    const UID = idOf(portU1), SID = idOf(portSv);
+    const keepU1 = mockU1.state.files.slice(), keepSv = mockSv.state.files.slice();
+    const BIG = 48 * 1024 * 1024;
+    const waitJob = async id => { let j = null; for (let i = 0; i < 60 && !(j && j.done); i++) { await sleep(250); j = (await jget("/api/print-status?job=" + id)).body; } return j; };
+
+    // (a) destination stops reading the upload
+    mockU1.state.files.push({ name: "H20 Transfer.gcode", size: BIG });
+    mockSv.state.stallUpload = true;
+    let t0 = Date.now();
+    let r = await jpost("/api/printer-files/transfer", { from: UID, to: SID, name: "H20 Transfer.gcode" });
+    ok(r.status === 200 && r.body.jobId, "H20: a transfer to a printer that will stall starts", r.body);
+    let job = r.body && r.body.jobId ? await waitJob(r.body.jobId) : null;
+    ok(job && job.done && /stalled/i.test(job.error || ""), "H20: the stalled transfer FAILS with 'stalled'", job);
+    ok(Date.now() - t0 < 15000, "H20: …within seconds, not never", Date.now() - t0);
+    mockSv.state.stallUpload = false; mockSv.state.releaseHeld();
+
+    // (b) source stops sending mid-download into the Hub library
+    mockU1.state.files.push({ name: "H20 ToHub.gcode", size: BIG });
+    mockU1.state.stallDownload = true;
+    t0 = Date.now();
+    r = await jpost("/api/printer-files/to-hub", { from: UID, name: "H20 ToHub.gcode" });
+    ok(r.status === 200 && r.body.jobId, "H20: a copy-to-Hub from a printer that will stall starts", r.body);
+    job = r.body && r.body.jobId ? await waitJob(r.body.jobId) : null;
+    ok(job && job.done && /stalled/i.test(job.error || ""), "H20: the stalled copy-to-Hub FAILS with 'stalled'", job);
+    ok(Date.now() - t0 < 15000, "H20: …within seconds, not never", Date.now() - t0);
+    const libDest = path.join(hubDir, "gcode", "H20 ToHub.gcode");
+    ok(!fs.existsSync(libDest) && !fs.existsSync(libDest + ".u1hub-part"), "H20: …and leaves no file or half-copied .u1hub-part behind");
+    mockU1.state.stallDownload = false; mockU1.state.releaseHeld();
+    mockU1.state.files = keepU1; mockSv.state.files = keepSv;
+    const libSrc = fs.readFileSync(path.join(REPO, "core", "library.js"), "utf8");
+    ok(/progressWatchdog\(/.test(libSrc) && (libSrc.match(/\.setTimeout\(/g) || []).length >= 3,
+      "H20: core/library.js puts a progress watchdog and socket timeouts on every streamed transfer");
+  }
+
+  console.log("\n== SPRINT 2: H2 stable printer ids, S1/S2/S8 completions (2.43.0) ==");
+  {
+    const cfgPath = path.join(hubDir, "config.json");
+    const djPath = path.join(hubDir, "dispatch.json");
+    const readCfg = () => JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    const readDj = () => JSON.parse(fs.readFileSync(djPath, "utf8"));
+    const jobById = async id => ((await jget("/api/dispatch")).body.jobs || []).find(j => j.id === id);
+    const settle = async () => { await sleep(4500); await jpost("/api/dispatch/tick", {}); };
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+    mockSv.state.printState = "standby"; mockSv.state.filename = "";
+    // Start from the two real mocks only (earlier sections add a dead "Ghost").
+    // The SV mock is put back on its own type (an earlier section moved it to
+    // U1), so a same-name file on it really is another type's print (S8).
+    await jpost("/api/types", { label: "SV06 Plus ACE" });          // 409 if it is already there
+    let cfg = readCfg();
+    const two = cfg.printers.filter(p => /:(\d+)$/.test(p.url) && [portU1, portSv].includes(+p.url.split(":").pop()))
+      .map(p => p.url.endsWith(":" + portSv) ? { ...p, type: "sv06-plus-ace" } : p);
+    let r = await jpost("/api/config", { gcodeFolder: cfg.gcodeFolder, printers: two });
+    cfg = readCfg();
+
+    // H2 (a) every printer has a stable, unique id, and the API hands it out
+    const ids = cfg.printers.map(p => p.id);
+    ok(cfg.printers.length === 2 && ids.every(x => typeof x === "string" && x.length >= 6) && new Set(ids).size === 2,
+      "H2: every printer in config.json carries a unique stable id", cfg.printers);
+    r = await jget("/api/config");
+    ok((r.body.printers || []).every((p, i) => p.id === ids[i]), "H2: /api/config hands the ids to the page", r.body.printers);
+    const U1PID = cfg.printers.find(p => p.url.endsWith(":" + portU1)).id;
+    const SVPID = cfg.printers.find(p => p.url.endsWith(":" + portSv)).id;
+    const u1At = () => readCfg().printers.findIndex(p => p.id === U1PID);
+    const svAt = () => readCfg().printers.findIndex(p => p.id === SVPID);
+
+    // H2 (b) maintenance and a pin follow the MACHINE through a reorder
+    await jpost("/api/dispatch/maintenance", { printer: svAt(), down: true, note: "H2 test" });
+    r = await jpost("/api/dispatch/jobs", { again: true, file: "multi.gcode", type: "u1", qty: 1 });
+    const PJ = r.body.job.id;
+    await jpost("/api/dispatch/jobs/assign", { id: PJ, printer: u1At() });
+    let dj = readDj();
+    ok(dj.printer_keys === "id" && dj.maintenance && dj.maintenance[SVPID] && dj.pins && dj.pins[PJ] === U1PID,
+      "H2: dispatch.json stores maintenance and pins by printer id, not position", { keys: dj.printer_keys, m: dj.maintenance, p: dj.pins });
+    const reversed = [...readCfg().printers].reverse();
+    r = await jpost("/api/config", { gcodeFolder: cfg.gcodeFolder, printers: reversed });
+    ok(r.status === 200 && readCfg().printers[0].id === SVPID && readCfg().printers[1].id === U1PID, "H2: Settings reorders the printers and keeps their ids", readCfg().printers);
+    r = await jget("/api/dispatch");
+    ok(r.body.maintenance && r.body.maintenance[String(svAt())] && !r.body.maintenance[String(u1At())],
+      "H2: after the reorder, 'down for maintenance' is still on the SAME machine (now at a new position)", { m: r.body.maintenance, sv: svAt() });
+    r = await jget("/api/dispatch/plan");
+    let ps = (r.body.slots || []).find(s => s.job_id === PJ && !s.unplannable);
+    ok(ps && ps.printer === u1At() && ps.pinned === true, "H2: …and the pin still points at the machine it was set on", ps && { printer: ps.printer, u1: u1At() });
+    const noIds = readCfg().printers.map(({ id, ...rest }) => rest);
+    r = await jpost("/api/config", { gcodeFolder: cfg.gcodeFolder, printers: noIds });
+    ok(readCfg().printers.every((p, i) => p.id === reversed[i].id), "H2: a save from an older page (no ids) keeps each printer's id, matched by address", readCfg().printers);
+
+    // H2 (c) a legacy dispatch.json (positions) migrates once, by position
+    await stopHub();
+    dj = readDj();
+    delete dj.printer_keys; delete dj.pins;
+    dj.maintenance = { [String(svAt())]: { since: 1, note: "legacy" } };
+    const legacyJob = { id: "job_legacy", file: "sv-single.gcode", type: "sv06-plus-ace", qty: 2, remaining: 2, deadline: null, priority: 3,
+      bundle_id: null, needs_finish: false, est_minutes: 30, colors: [], multi: false, state: "printing", created: Date.now(), history: [], printing_on: svAt() };
+    dj.jobs = dj.jobs.filter(j => j.id !== PJ).concat([legacyJob]);
+    fs.writeFileSync(djPath, JSON.stringify(dj, null, 2));
+    mockSv.state.printState = "printing"; mockSv.state.filename = "sv-single.gcode";
+    await startHub(hubDir);
+    await sleep(5200);
+    dj = readDj();
+    ok(dj.printer_keys === "id" && dj.maintenance[SVPID] && (dj.jobs.find(j => j.id === "job_legacy") || {}).printing_on === SVPID,
+      "H2: a legacy dispatch.json is migrated once, position to id, on load", { keys: dj.printer_keys, m: dj.maintenance, on: (dj.jobs.find(j => j.id === "job_legacy") || {}).printing_on });
+    let lj = await jobById("job_legacy");
+    ok(lj && lj.printing_on === svAt() && lj.state === "printing", "H2: …and the API still speaks positions, so the page is unchanged", lj && lj.printing_on);
+    // put the order back for everything after this
+    r = await jpost("/api/config", { gcodeFolder: cfg.gcodeFolder, printers: [...readCfg().printers].reverse() });
+    lj = await jobById("job_legacy");
+    ok(lj && lj.printing_on === svAt() && svAt() === 1, "H2: the in-flight claim follows the machine back to its old position", lj && { on: lj.printing_on, sv: svAt() });
+    await jpost("/api/dispatch/maintenance", { printer: svAt(), down: false });
+
+    // S1: a copy that finishes while the Hub is DOWN counts as done at boot
+    await settle();                                   // the tick has seen SV printing
+    await stopHub();
+    mockSv.state.printState = "complete";
+    await startHub(hubDir);
+    await sleep(5200);
+    await jpost("/api/dispatch/tick", {});
+    lj = await jobById("job_legacy");
+    ok(lj && lj.remaining === 1 && lj.printing_on === null, "S1: a print that completed while the Hub was down is counted (2 -> 1), not requeued as stale", lj && { rem: lj.remaining, on: lj.printing_on, st: lj.state });
+    ok(lj && (lj.history || []).some(h => h.result === "complete"), "S1: …and recorded in the job's history", lj && lj.history);
+    r = await jget("/api/dispatch/plan");
+    ok((r.body.slots || []).filter(s => s.job_id === "job_legacy" && !s.unplannable).length === 1, "S1: …so only ONE copy is planned, not the finished one again", (r.body.slots || []).filter(s => s.job_id === "job_legacy").length);
+    r = await jget("/api/dispatch");
+    ok((r.body.awaiting || []).includes(svAt()), "S1: …and the bed-clear gate is armed for that printer", r.body.awaiting);
+    ok(readDj().last_state && readDj().last_state[SVPID] && Array.isArray(readDj().awaiting), "S1: LAST_STATE and AWAITING are saved in dispatch.json, by printer id", { ls: readDj().last_state, aw: readDj().awaiting });
+    await jpost("/api/dispatch/clear-bed", { printer: svAt() });
+    mockSv.state.printState = "standby"; mockSv.state.filename = "";
+    await settle();
+
+    // S2: a cancelled print releases the claim, keeps the count, says so
+    mockSv.state.printState = "printing"; mockSv.state.filename = "sv-single.gcode";
+    await settle(); await settle();
+    lj = await jobById("job_legacy");
+    ok(lj && lj.printing_on === svAt() && lj.state === "printing", "S2 setup: the job is claimed again", lj && { on: lj.printing_on, st: lj.state });
+    mockSv.state.printState = "cancelled";
+    await settle();
+    lj = await jobById("job_legacy");
+    ok(lj && lj.printing_on === null && lj.state === "queued" && lj.remaining === 1, "S2: a cancelled print releases the printer and keeps the copy to print (remaining unchanged)", lj && { on: lj.printing_on, st: lj.state, rem: lj.remaining });
+    ok(lj && (lj.history || []).slice(-1)[0] && lj.history.slice(-1)[0].result === "cancelled", "S2: …the result is in the job's history", lj && lj.history);
+    ok(lj && /ended without completing|cancel/i.test(lj.attention || ""), "S2: …and the job carries an attention message for its row", lj && lj.attention);
+    r = await jpost("/api/dispatch/jobs/update", { id: "job_legacy", clear_attention: true });
+    lj = await jobById("job_legacy");
+    ok(lj && !lj.attention, "S2: the attention message clears when the user dismisses it", lj && lj.attention);
+    const dui = fs.readFileSync(path.join(REPO, "public", "modules", "dispatch-ui.js"), "utf8");
+    ok(/\.attention/.test(dui) && /clear_attention/.test(dui), "S2: the Dispatch job row shows the attention message and a way to clear it");
+    mockSv.state.printState = "standby"; mockSv.state.filename = "";
+    await settle();
+    await jpost("/api/dispatch/jobs/remove", { id: "job_legacy" });
+
+    // S8: completions match on file AND type, and adoption records the path
+    r = await jpost("/api/dispatch/jobs", { again: true, file: "multi.gcode", type: "u1", qty: 1 });
+    const TJ = r.body.job.id;
+    mockSv.state.printState = "printing"; mockSv.state.filename = "multi.gcode";   // the SV is a different type
+    await settle(); await settle();
+    let tj = await jobById(TJ);
+    ok(tj && tj.printing_on === null, "S8: a print of the same file name on a printer of another TYPE does not claim the job", tj && tj.printing_on);
+    mockSv.state.printState = "complete";
+    await settle();
+    tj = await jobById(TJ);
+    ok(tj && tj.remaining === 1, "S8: …and its completion does not count against the job", tj && tj.remaining);
+    mockSv.state.printState = "standby"; mockSv.state.filename = "";
+    mockU1.state.printState = "printing"; mockU1.state.filename = "multi.gcode";
+    await settle(); await settle();
+    tj = await jobById(TJ);
+    ok(tj && tj.printing_on === u1At() && tj.pushed_as === "multi.gcode", "S8: adopting on the right type records the path the printer reports (pushed_as)", tj && { on: tj.printing_on, as: tj.pushed_as });
+    mockU1.state.printState = "complete"; mockU1.state.filename = "other/multi.gcode";
+    await settle();
+    tj = await jobById(TJ);
+    ok(tj && tj.remaining === 1, "S8: a completion of a DIFFERENT file with the same name (other folder) is not this job's", tj && { rem: tj.remaining, on: tj.printing_on });
+    mockU1.state.filename = "multi.gcode";
+    await settle();
+    mockU1.state.printState = "printing"; await settle();
+    mockU1.state.printState = "complete"; await settle();
+    tj = await jobById(TJ);
+    ok(!tj, "S8: …while its own path completing does finish it", tj);
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+    await settle();
+  }
+
+  console.log("\n== SPRINT 3: S3 learned estimates, S4 cached plan + SSE, S5 hand-off, S7 why-here (2.44.0) ==");
+  {
+    const jobById = async id => ((await jget("/api/dispatch")).body.jobs || []).find(j => j.id === id);
+    const settle = async () => { await sleep(4500); await jpost("/api/dispatch/tick", {}); };
+    const u1At = () => { const f = JSON.parse(fs.readFileSync(path.join(hubDir, "config.json"), "utf8")).printers; return f.findIndex(p => p.url.endsWith(":" + portU1)); };
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+    mockSv.state.printState = "standby"; mockSv.state.filename = "";
+    await settle();
+    for (const j of ((await jget("/api/dispatch")).body.jobs || [])) await jpost("/api/dispatch/jobs/remove", { id: j.id });
+
+    // ---- S4: the plan is served from a cache and pushed over SSE ----
+    let r = await jpost("/api/dispatch/jobs", { again: true, file: "multi.gcode", type: "u1", qty: 2 });
+    const J4 = r.body.job.id;
+    await sleep(600);
+    let p1 = (await jget("/api/dispatch/plan")).body, p2 = (await jget("/api/dispatch/plan")).body;
+    ok(p1.generated_at && p1.generated_at === p2.generated_at, "S4: two plan reads inside a tick serve the same cached plan", [p1.generated_at, p2.generated_at]);
+    const p3 = (await jget("/api/dispatch/plan?fresh=1")).body;
+    ok(p3.generated_at > p1.generated_at, "S4: ?fresh=1 recomputes", [p1.generated_at, p3.generated_at]);
+    await jpost("/api/dispatch/jobs/update", { id: J4, priority: 5 });
+    await sleep(700);
+    const p4 = (await jget("/api/dispatch/plan")).body;
+    ok(p4.generated_at > p3.generated_at, "S4: a state change replans within the debounce, without being asked", [p3.generated_at, p4.generated_at]);
+    {
+      // the "dispatch" SSE event: open the stream, change state, expect a named event
+      const got = await new Promise(async resolve => {
+        const ctrl = new AbortController(); let buf = "";
+        const t = setTimeout(() => { ctrl.abort(); resolve(null); }, 6000);
+        try {
+          const res = await fetch(HUB + "/api/events", { signal: ctrl.signal });
+          const reader = res.body.getReader(); const dec = new TextDecoder();
+          setTimeout(() => jpost("/api/dispatch/jobs", { again: true, file: "single.gcode", type: "u1", qty: 1 }), 300);   // a new slot changes the picture
+          for (;;) {
+            const { value, done } = await reader.read(); if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const m = buf.match(/event: dispatch\ndata: (\{[\s\S]*?\})\n\n/);
+            if (m) { clearTimeout(t); ctrl.abort(); try { resolve(JSON.parse(m[1])); } catch { resolve({ raw: m[1].slice(0, 80) }); } return; }
+          }
+        } catch {}
+        clearTimeout(t); resolve(null);
+      });
+      ok(got && got.plan && Array.isArray(got.plan.slots), "S4: a dispatch state change pushes a 'dispatch' event with the plan over /api/events", got && Object.keys(got));
+      for (const j of ((await jget("/api/dispatch")).body.jobs || [])) if (j.file === "single.gcode") await jpost("/api/dispatch/jobs/remove", { id: j.id });
+      await sleep(500);
+    }
+    const dispSrc = fs.readFileSync(path.join(REPO, "modules", "dispatch.js"), "utf8");
+    ok(/const p = await cachedPlan\(false\);/.test(dispSrc), "S4: clear-bed reads the cached plan instead of replanning under the tap");
+
+    // ---- S7: why here ----
+    const s7 = (p4.slots || []).find(x => x.job_id === J4 && !x.unplannable);
+    ok(s7 && s7.why && typeof s7.why.reason === "string" && Array.isArray(s7.why.alternatives), "S7: a placed slot says why it landed here and lists the runners-up", s7 && s7.why);
+    ok(s7 && ["earlier finish", "fewer swaps", "sticky", "pinned"].includes(s7.why.reason), "S7: the reason is one of the four words", s7 && s7.why.reason);
+    // the harness fleet has one U1-type printer here, so the runners-up list is
+    // legitimately empty; the shape is checked when there is one
+    ok(s7 && s7.why.alternatives.every(a => a.printerName && typeof a.later_min === "number" && typeof a.swaps === "number"),
+      "S7: each alternative carries the printer, its swaps and how much later it would finish", s7 && s7.why.alternatives);
+    ok(s7 && s7.est_source === "slicer" && s7.est_slicer === s7.est_minutes, "S3: a file never run here is planned at the slicer estimate", s7 && [s7.est_source, s7.est_slicer, s7.est_minutes]);
+
+    // ---- S3: a typed estimate wins ----
+    r = await jpost("/api/dispatch/jobs/update", { id: J4, est_minutes: 90 });
+    ok(r.body.job.est_minutes === 90 && r.body.job.est_user === true, "S3: a typed runtime is stored and flagged as the user's", r.body.job);
+    let pl = (await jget("/api/dispatch/plan?fresh=1")).body;
+    let sl = (pl.slots || []).find(x => x.job_id === J4 && !x.unplannable);
+    ok(sl && sl.est_minutes === 90 && sl.est_source === "user", "S3: …and the plan uses it", sl && [sl.est_minutes, sl.est_source]);
+    r = await jpost("/api/dispatch/jobs/update", { id: J4, est_minutes: null });
+    ok(r.body.job.est_minutes === 62 && !r.body.job.est_user, "S3: clearing it goes back to the file's own estimate", r.body.job.est_minutes);
+
+    // ---- S5 + S3: a hand-off is in flight until seen; a completion records the actual run ----
+    const u1 = u1At();
+    await jpost("/api/dispatch/maintenance", { printer: 1 - u1, down: true, note: "harness: keep it on the U1" });
+    r = await jpost("/api/print", { file: "multi.gcode", printer: u1, type: "u1", start: true, map: { 0: 0, 1: 1, 2: 2 } });
+    for (let i = 0; i < 40; i++) { await sleep(250); const jb = (await jget("/api/print-status?job=" + r.body.jobId)).body; if (jb && jb.done) break; }
+    let tj = await jobById(J4);
+    ok(tj && tj.starting_on && tj.starting_on.printer === u1, "S5: a started print marks the copy as in flight on that printer before the executor sees it", tj && tj.starting_on);
+    pl = (await jget("/api/dispatch/plan?fresh=1")).body;
+    const mine = (pl.slots || []).filter(x => x.job_id === J4 && !x.unplannable);
+    ok(mine.length === 1, "S5: the plan holds one copy back for the hand-off and places only the other", mine.length);
+    const run = (pl.running || []).find(x => x.printer === u1);
+    ok(run && run.starting === true && run.file === "multi.gcode", "S5: the running list shows it as starting on that printer", run);
+    mockU1.state.printState = "printing"; mockU1.state.filename = "multi.gcode";
+    await settle();
+    tj = await jobById(J4);
+    ok(tj && tj.printing_on === u1 && !tj.starting_on && tj.started > 0, "S5/S3: once the printer reports printing, the hand-off clears and the run clock starts", tj && { on: tj.printing_on, so: tj.starting_on, st: tj.started });
+    mockU1.state.printState = "complete";
+    await settle();
+    tj = await jobById(J4);
+    const h = tj && tj.history && tj.history[tj.history.length - 1];
+    ok(h && h.result === "complete" && typeof h.actual_min === "number" && h.est_min === 62, "S3: the completed copy records actual minutes beside the estimate", h);
+    const estFile = path.join(hubDir, "estimates.json");
+    ok(!fs.existsSync(estFile), "S3: a run shorter than half a minute (this mock's) is not learned from", fs.existsSync(estFile));
+    // two runs of this file -> the plan uses the file's own median ratio (seeded: real runs take real minutes)
+    fs.writeFileSync(estFile, JSON.stringify({ files: { "u1/multi.gcode": [{ at: Date.now(), actual: 93, est: 62, printer_id: null }, { at: Date.now(), actual: 93, est: 62, printer_id: null }] }, printers: {} }));
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+    await settle();
+    await stopHub(); await startHub(hubDir);
+    pl = (await jget("/api/dispatch/plan?fresh=1")).body;
+    sl = (pl.slots || []).find(x => x.job_id === J4 && !x.unplannable);
+    ok(sl && sl.est_source === "file" && sl.est_runs === 2 && sl.est_minutes === 93 && sl.est_slicer === 62,
+      "S3: with two recorded runs the plan uses the file's learned time (93 from a 62 estimate) and says so", sl && [sl.est_source, sl.est_runs, sl.est_minutes, sl.est_slicer]);
+    // S5 expiry: a hand-off that never turns into a print raises attention after the TTL (source-level: 5 min is too long to wait here)
+    ok(/STARTING_TTL_MS = 5 \* 60000/.test(dispSrc) && /did not begin within 5 min/.test(dispSrc), "S5: a hand-off nobody saw printing expires into an attention note after 5 min");
+    await jpost("/api/dispatch/maintenance", { printer: 1 - u1, down: false });
+    await jpost("/api/dispatch/jobs/remove", { id: J4 });
+    try { fs.unlinkSync(estFile); } catch {}
+  }
+
+  console.log("\n== SPRINT 3: H21/H22 Models tab - aliases, unsorted, batched info, phone layout (2.44.0) ==");
+  {
+    const mroot = path.join(tmp, "models");
+    const mk = (rel, files) => { const p = path.join(mroot, ...rel.split("/")); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, buildZip(files)); };
+    mk("220\u00b0c/tower/Tower.3mf", [{ name: "3D/3dmodel.model", data: Buffer.from("<model/>") }]);
+    mk("a.m/thing/Thing.3mf", [{ name: "3D/3dmodel.model", data: Buffer.from("<model/>") }]);
+    mk("Bambu Lab/cube/Cube.3mf", [{ name: "3D/3dmodel.model", data: Buffer.from("<model/>") }]);
+    await jpost("/api/models/settings", { folder: mroot });
+    await jget("/api/models?refresh=1"); await sleep(800);
+    let r = await jget("/api/models?limit=200");
+    const names = (r.body.creators || []).map(c => c.name);
+    ok(names.includes("(unsorted)") && !names.includes("220\u00b0c") && !names.includes("a.m"),
+      "H22: folder names that cannot be a designer (a temperature, two letters) are grouped as (unsorted)", names);
+    ok(r.body.aliases && typeof r.body.aliases === "object", "H22: the response carries the alias map");
+    r = await jpost("/api/models/aliases", { aliases: { "Bambu Lab": "Bambu", "a.m": "Alex M" } });
+    ok(r.status === 200 && r.body.aliases["Bambu Lab"] === "Bambu", "H22: aliases save", r.body);
+    r = await jget("/api/models?limit=200");
+    const names2 = (r.body.creators || []).map(c => c.name);
+    ok(names2.includes("Bambu") && !names2.includes("Bambu Lab") && names2.includes("Alex M"),
+      "H22: an alias renames the designer in the list, and an aliased junk folder is no longer (unsorted)", names2);
+    r = await jget("/api/models?limit=200&creator=" + encodeURIComponent("Bambu"));
+    ok(r.body.items.length === 1 && r.body.items[0].rel === "Bambu Lab/cube/Cube.3mf", "H22: filtering by the alias finds the folder's files", r.body.items.map(x => x.rel));
+    ok(fs.existsSync(path.join(hubDir, "models-aliases.json")), "H22: aliases live in models-aliases.json beside the other state files");
+    await jpost("/api/models/aliases", { aliases: {} });
+    r = await jget("/api/models/info-batch?files=" + ["Cinderwing3D/Baby Dragon/Baby_Dragon_Color.3mf", "Cinderwing3D/Tiny Horse/Horse_2_Color.3mf", "nope/none.3mf"].map(encodeURIComponent).join(","));
+    ok(r.status === 200 && r.body.items && Array.isArray(r.body.items["Cinderwing3D/Baby Dragon/Baby_Dragon_Color.3mf"].colors) && r.body.items["nope/none.3mf"].error,
+      "H22: /api/models/info-batch answers several files at once and names the ones it cannot read", r.body.items && Object.keys(r.body.items));
+    const ui = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8");
+    ok(/let SORT = "newest"/.test(ui), "H21: the shelf opens newest-first");
+    ok(/const TOP_N = 12/.test(ui) && /mdl-railq/.test(ui) && !/d\.creators\.map\(c => \{ const v = c\.name \|\| "__none__"; return '<button class="' \+ \(CREATOR === v \? "on" : ""\)/.test(ui),
+      "H21: the rail shows the top designers plus a typeahead, never every designer as a button");
+    ok(/body\[data-view=\\"models\\"\]:not\(\.mdl-side-open\) \.side \{ display: none !important; \}/.test(ui) && /id="mdl-sidebtn"/.test(ui),
+      "H21: on narrow screens the gcode sidebar folds away behind a Library button");
+    ok(!/\(pointer: coarse\) \{ \.mdl-act2, \.mdl-edit, \.mdl-more \{ display: none/.test(ui) && /\(pointer: coarse\) \{ \.mdl-act \.mdl-open, #mdl-sess \{ display: none/.test(ui),
+      "H21: touch keeps the \u22ef menu and its actions; only Open in Orca and the session strip are console-only");
+    ok(/info-batch\?files=/.test(ui) && /#mdl-err/.test(ui) && /id="mdl-retry"/.test(ui) && /history\.replaceState/.test(ui),
+      "H22: the page batches info requests, shows an error bar with Retry, and keeps its state in the URL hash");
+    ok(/scan_progress/.test(ui) && /mdl-skel/.test(ui), "H22: a scan in progress shows a count and skeleton cards");
+    ok(/--pal/.test(ui) && /mdl-pills/.test(ui) && /mdl-div/.test(ui) && /mdl-seg/.test(ui) && !/\u{1F3B2} Shuffle|\u{1F4CB} Requested|\u27F3 Rescan|\u2699 Folder/u.test(ui),
+      "F13: palette strip, thumb pills, newest dividers, segmented sort; no emoji prefixes in the toolbar");
+    const appSrc = fs.readFileSync(path.join(REPO, "public", "app.js"), "utf8");
+    ok(/raw\.split\("\?"\)\[0\]/.test(appSrc), "H22: a deep link with view state after ? still opens the right view");
+  }
+
+  // H7 runs auth.js on its own bare Express app (the harness Hub is in open
+  // mode); see test/h7-auth-checks.js. Shown failing 5 of 12 on 2.42.0.
+  console.log("\n== SPRINT 2: H7 auth - proxy allowlist, per-visitor limiter, credential-bound sessions (2.43.0) ==");
+  await require("./h7-auth-checks")(ok);
+
+  // Sprint 3 (2.44.0): H5/H6/H11 client behavior at the source level, H8 and
+  // H23 on bare apps; see test/sprint3-checks.js.
+  console.log("\n== SPRINT 3: reliability - pollJob cap, 401 bounce, tunnel supervisor + pinning, shelf hoist, hidden-tab pause (2.44.0) ==");
+  await require("./sprint3-checks")(ok);
 
   await stopHub();
   await mockU1.close(); await mockSv.close();

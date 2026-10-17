@@ -24,12 +24,27 @@ own key in place.
 status, progress, loaded colors, camera, and bed temperature. A print that
 paused or failed says why, in the firmware's own words, so you know whether to
 walk over. A printer that is down for maintenance says so right on the card,
-and the scheduler routes work around it until you bring it back.
+and the scheduler routes work around it until you bring it back. Tap a
+head's color on an idle printer to change it, pick the material, and it stays
+on the printer just like a color set on the touchscreen.
 
 **Send prints without walking over.** Pick a file, see the colors it needs,
-choose which head prints which color, and push it to any idle machine. Files
+choose which head prints which color, and push it to any idle machine. The Hub
+suggests a head for each color by matching the material first and the color
+second, so a PETG part goes to the PETG roll even when PLA in the same color is
+loaded too, and it warns you if the head you pick holds something else. Files
 live in one merged list: the Hub's library plus whatever is stored on each
-printer, with thumbnails.
+printer, with thumbnails. A file that only lives on one printer (sliced
+straight to it) can be copied into the Hub library with one tap, so you can
+queue it, plan it, or send it to any other machine.
+
+**Let the Hub pick the printer.** Select a file and press Print on best
+printer. The Hub looks at every idle printer and picks one that already has
+every color the file needs loaded, close in shade and the right material.
+It tells you which one and gives you five seconds to cancel before it sends.
+If nothing fits, it says which printer came closest and what it's missing,
+and when that's only a color or two you can send it there anyway - it shows
+you which loaded roll would stand in for each missing color first.
 
 **Know whether it is worth printing.** Under every file you select, one line
 says what its filament costs, the least it has to sell for (per piece when the
@@ -58,7 +73,14 @@ of 3MF project files (Designer\Model\file.3mf, the way designers ship them)
 and shows each one with the plate render saved inside it, the colors it was
 painted with, and the objects on the plate. Open in Orca launches it in
 Snapmaker Orca on the Hub computer; when you save the gcode, the Hub notices
-and offers to select it or send it to Dispatch. The shelf can be tidied from
+and offers to select it or send it to Dispatch, and that line goes away once
+the file is in Dispatch. The shelf opens newest first, so what you just saved
+is at the top, and each card carries a thin strip of the model's own colors.
+The designer list shows your twelve biggest designers plus a search box for
+the rest, and if a folder name is wrong or two folders are really the same
+designer, the Designer names box under ⚙ Folder fixes the name without moving
+a file. The filter, designer and sort you pick stay in the address bar, so a
+refresh or a shared link opens the same shelf. The shelf can be tidied from
 the shelf, too: Rename files a model as `Designer\Name\Designer - Name.3mf`
 (it shows you where first), Attributes fixes a designer or name the folders
 got wrong and offers the same move, and Delete removes a file for good after
@@ -81,8 +103,9 @@ Models tab under Requested. As soon as that model's gcode is saved from Orca
 (or you link one by hand with Link gcode behind the ⋯), the Hub queues one
 print of it in Dispatch on its own. To pair them, open Models, then ⚙ Folder:
 the Hub shows its address and a token to copy into 3MF Explorer's settings.
-Both apps need to be looking at the same model folder, since a request names
-the file by where it sits on disk.
+Both apps need to be looking at the same model library, but they don't have
+to reach it the same way - one can use a mapped drive letter and the other the
+network path, or 3MF Explorer can run on a different computer.
 
 ![Models, filtered to Requested: what was marked for print in 3MF Explorer, one already queued, and Link gcode open on a card](docs/print-requests.png)
 
@@ -97,13 +120,34 @@ from the actual meshes (size, how much of the surface overhangs, undersides
 that float, how much touches the bed, painted faces, volume), the designer's
 own project settings, and what is loaded in your printer. It maps the
 project's colors to your loaded heads when it can, and lists what to watch.
+Under the table, Open in Orca with these settings opens a copy of the file in
+Orca with those suggestions already filled in, marked as changes so you can
+put any of them back. Your own file is never touched; keep the tuned project
+with Save As in Orca, or let the copy clean itself up after three days.
 
 ![Settings for a 3MF: what to set in Orca, what the file had, and why](docs/models-settings.png)
 
 **Plan your whole printing day.** The Dispatch tab schedules your queue across
 every printer, inside the hours you are actually home to swap plates. It flags
 jobs that want the same spool at the same time, lets you push a job back a
-place, and adopts prints that are already running.
+place, and adopts prints that are already running. The key under the timeline
+explains every mark a bar can carry: spool swaps before it starts, a color
+another printer needs at the same time, and a wait for someone to clear the
+bed. There is also a setting for what a printer does with its rolls when a
+print finishes: keep them all loaded, unload only the ones the next job on
+that printer doesn't use, or unload every roll the print used. As of 2.40.2
+it is switched off and every roll stays loaded, while we check whether
+unloading after every print is behind some nozzle clogs.
+
+The plan gets better the more you print. Every finished copy records how long
+it really took, so a file you have run before is planned at its own real time
+instead of the slicer's guess, and you can type a time on a job yourself. Tap
+any block on the timeline and "Why here" tells you why it landed on that
+printer and what the next best choices would have cost. The timeline redraws
+itself as printers finish, a copy that finishes while the Hub is restarting
+still counts, and a cancelled or failed print frees its printer right away
+and keeps that copy on the list with a note on the job. You can reorder your
+printers in Settings without anything moving to the wrong machine.
 
 ![Dispatch: the week's prints laid out across the fleet](docs/dispatch.png)
 
@@ -120,8 +164,10 @@ color, and temps, tracks which machine each spool is loaded in, and tracks
 grams left and price per roll. When a print finishes, the grams each head used
 come off the roll that was in it, with the cost of that print at the price you
 paid, and an Undo if it got one wrong. Already keep your rolls in
-[Spoolman](https://github.com/Donkie/Spoolman)? Import them in one click; the
-Hub reads Spoolman and never writes to it.
+[Spoolman](https://github.com/Donkie/Spoolman)? Import them in one click. If
+you want Spoolman to stay your master list, tick one box and the grams each
+print uses get recorded there too - only the grams, nothing else about your
+rolls is ever changed.
 
 ![Spools: every roll you own, where it is, and what is left on it](docs/spools-inventory.png)
 
@@ -168,9 +214,14 @@ exactly as they do when you visit the printer on its own.
 ![A printer's own Fluidd page, one click from the dashboard](docs/klipper-proxy.png)
 
 **Use it from your phone.** The whole thing is built for a phone screen. Add
-it to your home screen and it behaves like an app. (The Models tab and its
-Open in Orca button are desktop only, because they open a program on the Hub
-computer.)
+it to your home screen and it behaves like an app. Every label, button and
+field is checked for contrast, so it stays readable on a dim shop screen or a
+phone in daylight, whatever accent color your printer types use. The Models tab works on a
+phone too: two columns of cards, the file library tucked behind a Library
+button, Convert to U1 right on the card, and the rest (Suggest settings, Link
+gcode, Attributes, Rename, Delete) behind the ⋯ menu. Only Open in Orca needs the Hub computer itself, because it
+opens a program there. A tab you are not looking at stops checking for
+updates, so a phone in your pocket is not using data on the Hub's behalf.
 
 <img src="docs/remote-phone.png" width="300" alt="The dashboard on a phone">
 
@@ -283,7 +334,11 @@ Two switches in the Hub, no router changes:
    and gives you an HTTPS address that works from anywhere.
 
 Everything the Hub itself shows works remotely this way: the fleet, sending
-prints, cameras, spools, and scheduling. The printers' own Klipper pages are
+prints, cameras, spools, and scheduling. If the tunnel drops, the Hub starts
+it again on its own, and the tunnel program it downloads is one pinned,
+checked version rather than whatever is newest. While the tunnel is on, the
+password stays on. If your sign-in expires after 30 days, the page takes you
+to the sign-in screen and back to where you were. The printers' own Klipper pages are
 best used on your own network; opening them from outside can depend on your
 network setup.
 

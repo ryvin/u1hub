@@ -77,6 +77,124 @@ printers, and nothing leaves your network unless you turn remote access on.
 
 ---
 
+### 2.44.0 - the Models tab on a phone, a scheduler that learns, a tunnel that comes back
+
+- **The Models tab works on a phone.** The designer list shows the twelve biggest
+  designers plus a search box over the rest, instead of every designer as a chip above
+  the cards (about 600 on a real library). The shelf opens newest first, so what you just
+  saved from Orca is at the top; a remembered sort still wins. Under 1100px the gcode
+  sidebar folds away behind a **Library** button while Models is showing, so the cards get
+  the width (two columns on a phone). On touch the card's menu stays, with Convert to U1
+  as the primary button, and Suggest settings, Link gcode, Attributes, Rename and Delete
+  behind it; only Open in Orca and the Orca session strip are console-only. Touch is no
+  longer a read-only view.
+- **Cards carry their colors.** A 3px strip along the top of each card is the project's
+  own filament palette; the printed count and the "filed" mark are pills on the picture;
+  Today, This week, This month and Earlier dividers run down the newest view; the sort is
+  a segmented control; loading shows placeholder cards; an empty shelf says why in one
+  line with one button. No new accent color, no emoji prefixes in the toolbar.
+- **Designer names you can fix.** The Folder panel has a Designer names box: `folder name
+  = Display Name`, one per line, to rename or merge designers without touching a file.
+  Folder names that cannot be a designer (a temperature, a number, one or two letters)
+  group as **(unsorted)**.
+- **The Models tab tells you what is going on.** A load that fails shows a bar with Retry
+  and keeps the old grid dimmed instead of saying nothing; a scan in progress shows how
+  many files it has found; the filter, designer, sort and Requested state live in the
+  address bar, so a refresh or a shared link lands on the same shelf; the color chips for
+  the cards on screen come in one request instead of one each.
+- **Dispatch learns how long things take.** Every completed copy records its real run
+  time beside the slicer's estimate (`estimates.json` next to dispatch.json). A file with
+  two or more runs is planned at its own typical time; a file never run here borrows the
+  printer's typical ratio once that printer has three runs; a runtime you type on the job
+  row (click the estimate) wins over both, and clearing it goes back to the file's figure.
+  The block's panel says where the runtime came from.
+- **The plan keeps itself current.** It is recomputed when something changes or the fleet
+  moves, served from memory, and pushed to the page over the existing live stream, so the
+  timeline redraws itself instead of waiting for a tap. "Bed cleared, start next" reads
+  the ready plan instead of replanning under your finger.
+- **A started print is held from the moment you start it.** From the start command until
+  the executor sees the printer printing, that copy is in flight on that printer, so a
+  second "start next" elsewhere cannot be handed the same copy. A start that never shows
+  up as printing within five minutes raises a notice on the job.
+- **Every block says why.** Tap a planned block: "Why here" gives the reason (finishes
+  soonest, fewer spool changes, kept where it was, pinned) and the runners-up with how
+  much later each would finish and how many swaps it would cost.
+- **An expired sign-in sends you to sign in.** After the 30-day cookie runs out, the page
+  goes to the sign-in screen and comes back to where you were, instead of every card
+  reading "Fleet unreachable" until someone reloads.
+- **The tunnel comes back on its own.** When autostart is on and cloudflared exits
+  unexpectedly, the Hub relaunches it with growing waits (5 s, 10 s ... 5 min) and the
+  status says when the next try is. The download is pinned to one cloudflared release
+  instead of whatever is latest, checked against a known sha256 on Windows and Linux
+  (and against its reported version elsewhere), bounded in time and size, and re-checked
+  before every launch so a swapped executable never runs. Fixed: a cloudflared.exe that
+  failed to launch could take the whole Hub down from the Settings tab.
+- **The tunnel and the proxy sign-in modes exclude each other.** Switching the sign-in
+  mode away from password while the tunnel is running is refused with the reason (the
+  tunnel delivers visitors straight to the Hub); the tunnel already refused to start in
+  those modes.
+- **Quieter and lighter.** Nothing polls while the tab is hidden (lists, fleet fallback,
+  camera frames, power, stats); one refresh when you come back. A push blocks only its
+  own printer card from re-rendering, and gives up after 15 missed polls instead of
+  spinning forever. The planner reads the spool shelf once per plan instead of once per
+  copy and lane, and gcode estimates are cached by file version.
+- **"Could not connect" is not "stalled".** A push to a printer that never accepted the
+  connection (unplugged, asleep, wrong address) says so.
+- 3MF Explorer 1.7.0 ships alongside (see its own changelog).
+
+### 2.43.0 - printer identity and sign-in hardening
+
+- **Copies between printers can't hang either.** Sending a file from one printer to
+  another, or copying a printer-only file into the Hub library, now fails with
+  "transfer stalled" when either side stops moving data for 30 seconds (or goes quiet
+  for 60), the same rule a print push follows since 2.42. The file is released at once
+  and a half-copied library file is cleaned up.
+- **Printers keep their identity when you reorder them.** Each printer now has a
+  permanent id. Dispatch claims, maintenance flags and pins are stored against that id
+  instead of the printer's position in the list, so dragging U3 above U1 in Settings no
+  longer moves U3's maintenance flag onto U1. An existing dispatch.json is converted once
+  on the first start (the log says "migrated dispatch.json from printer positions to
+  printer ids").
+- **A copy that finishes while the Hub is off still counts.** If a print completes while
+  the Hub is stopped or restarting, the next start counts it as done (one fewer remaining,
+  bed-clear gate armed) instead of planning the same copy again. The last state seen on
+  each printer and the bed-clear gates are now saved, so a restart picks up where it left
+  off.
+- **Cancelled and failed prints free the printer.** A print that is cancelled, errors out
+  or drops back to standby releases its printer at once, keeps the copy as still to print,
+  records the result in the job's history and shows a notice on the job row until you
+  press OK.
+- **Completions match the exact file.** A finished print is credited to a job only when
+  the printer type matches and the path matches the one the job was started or adopted
+  with, not just the bare file name. A same-named file in another folder, or on a
+  different kind of printer, no longer counts as one of your copies.
+- **Sign-in hardening.** Changing the password (or the sign-in mode) now signs out every
+  older session, so a copied cookie stops working with the password it came from. Because
+  of this, everyone is asked to sign in once after upgrading. Failed-login lockouts now
+  count per visitor through the Cloudflare tunnel instead of for the whole tunnel, so a
+  stranger guessing passwords can no longer lock you out. In forward-auth mode the
+  identity header is accepted only from a trusted proxy (this machine by default, or the
+  addresses in `trusted_proxies` in auth.json). The 3MF Explorer's print-request token is
+  checked in constant time.
+- **The Orca strip on the Models tab clears itself.** An "Orca saved ... gcode" line goes
+  away as soon as that gcode is in Dispatch, whether you pressed Send to Dispatch on the
+  line or queued the file some other way. Lines for the same gcode saved more than once
+  all clear together.
+
+### 2.42.0 - safety fixes
+
+- **The U1 templates are off limits.** The Models tab never lists `u1_template*.3mf`
+  or `filament_types.3mf`, in any folder, and its Rename and Delete refuse them on
+  the server with a 409, whatever the page sends.
+- **A printer that stops answering can't hold a file hostage.** A push fails when the
+  printer takes no data for 30 seconds (or goes quiet for 60), the job reports
+  "upload stalled", and the file can be renamed or deleted again. Pause, resume,
+  cancel, skip-object, the plate map and the start commands all give up after
+  10 seconds with "timed out" instead of hanging.
+- **Dispatch keeps what you set by hand.** Moving a job to a printer is saved to
+  `dispatch.json` at once and survives a restart. Lowering a job's count to the
+  copies already printed finishes it instead of leaving a row with nothing to print.
+
 ### 2.40.1 - a tidier Logbook
 
 The Logbook's entries and schedule came out as tall cards that were mostly

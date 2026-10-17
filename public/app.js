@@ -2,6 +2,30 @@
 // index.html so the browser can cache it, compiled, between releases; the
 // page keeps `const VERSION` inline and this file reads it as a global).
 // Served as app.js?v=<VERSION> — see core/app.js serveIndex.
+// H6 (2.44): one place that notices the session has ended. Every /api call in
+// the page and in the modules goes through window.fetch, so a 401 from the
+// auth gate bounces to the sign-in page exactly once, with the way back in
+// ?next= - instead of every poller failing quietly and the dashboard reading
+// "Fleet unreachable" until someone reloads by hand.
+(function(){
+  if(window.__hubFetchWrapped) return;
+  window.__hubFetchWrapped=true;
+  const raw=window.fetch.bind(window);
+  let bounced=false;
+  window.fetch=async function(input, init){
+    const r=await raw(input, init);
+    try{
+      const u=typeof input==="string" ? input : ((input && input.url) || "");
+      if(r.status===401 && /^\/api\//.test(u) && !/^\/api\/auth\//.test(u) && !bounced){
+        bounced=true;
+        const next=location.pathname+location.search+location.hash;
+        location.replace("/auth.html?next="+encodeURIComponent(next));
+      }
+    }catch(e){}
+    return r;
+  };
+})();
+
 
 const $ = id => document.getElementById(id);
 // v2.23 PERF (the owner, from work over the tunnel: "several seconds to load").
@@ -56,9 +80,31 @@ async function loadTypes(){
   if(!TYPES.find(t=>t.slug===ACTIVETYPE)) ACTIVETYPE=TYPES[0].slug; // stored type may have been deleted
   applyAccent(); renderTypeBar();
 }
+// v2.41 contrast pass (same method as 3MF Explorer 1.4.0): the accent is also
+// a TEXT color - section heads, the active zoom, Dispatch's day labels - and
+// an owner can pick any color for a type. readableAccent() lightens a dark
+// pick toward white just until it reads at 4.5:1 on the lightest surface it
+// is written on (--panel-2, #31363F), so every type passes; the U1 gold and
+// most presets need no change at all. onAccent() picks the label color for an
+// accent fill (primary buttons, the active type tab): near-black or white,
+// whichever contrasts more.
+function _lum(hex){
+  const v=[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16)/255).map(c=>c<=0.03928?c/12.92:Math.pow((c+0.055)/1.055,2.4));
+  return 0.2126*v[0]+0.7152*v[1]+0.0722*v[2];
+}
+function _cr(a,b){ const x=_lum(a), y=_lum(b); return (Math.max(x,y)+0.05)/(Math.min(x,y)+0.05); }
+function readableAccent(hex){
+  if(!/^#[0-9a-fA-F]{6}$/.test(hex||"")) return "#FFB200";
+  let out=hex;
+  for(let t=0.02; _cr(out,"#31363F")<4.5 && t<=1; t+=0.02)
+    out="#"+[1,3,5].map(i=>{ const c=parseInt(hex.slice(i,i+2),16); return Math.round(c+(255-c)*t).toString(16).padStart(2,"0"); }).join("");
+  return out;
+}
+function onAccent(hex){ return _cr("#1A1400",hex)>=_cr("#FFFFFF",hex) ? "#1A1400" : "#FFFFFF"; }
 function applyAccent(){
-  const a=activeType().accent||"#FFB200";
+  const a=readableAccent(activeType().accent||"#FFB200");
   document.documentElement.style.setProperty("--signal", a);
+  document.documentElement.style.setProperty("--on-accent", onAccent(a));
   const th=document.querySelector('meta[name="theme-color"]'); if(th) th.setAttribute("content","#0F1115");
 }
 function renderTypeBar(){
@@ -95,7 +141,8 @@ init();
 // remembered tab — a link someone followed should beat a remembered default.
 // setView() already falls back to the dashboard for names that don't exist.
 window.addEventListener("load", () => {
-  const h = decodeURIComponent(location.hash.replace(/^#/, "")).toLowerCase();
+  const raw = decodeURIComponent(location.hash.replace(/^#/, ""));
+  const h = raw.split("?")[0].toLowerCase();   // H22 (2.44): a view may carry its own state after "?"
   if (!h) return;
   if (h === "settings") { setView("dash"); $("setup").classList.add("show"); return; }
   setView(h);
@@ -122,6 +169,7 @@ async function init(){
   $("platemodal").addEventListener("click", e=>{ if(e.target===$("platemodal")) closePlate(); });
   $("qhead").addEventListener("click", ()=>{ QOPEN=!QOPEN; renderQueue(); });
   $("qadd").addEventListener("click", ()=>{ if(SELECTED) addQueue(SELECTED); });
+$("autopick").addEventListener("click", ()=>autoPickStart());
   // v2.11: modules can claim the selected file (Dispatch does). Drag-and-drop
   // never fires on touch, so this button is the phone/tablet path — and core
   // stays ignorant of what the module actually does with it.
@@ -136,10 +184,19 @@ async function init(){
   });
   // The 15s list refreshes also rebuild rows (file Print buttons, queue
   // actions) — same mid-tap hazard, same guard.
-  setInterval(()=>{ if(!INTERACTING) loadFiles(); }, 15000);
-  setInterval(()=>{ if(!INTERACTING) loadPrinterFiles(); }, 15000);
-  setInterval(()=>{ if(!INTERACTING) loadQueue(); }, 15000);
-  setInterval(()=>{ if(ES_OK) return; if(fleetRenderBlocked()) return; loadFleet(); }, 5000);
+  // H11 (2.44): nothing polls while the tab is hidden. A phone with the Hub
+  // in a background tab used to keep three list polls, the fleet fallback,
+  // camera frames, power and stats running over the tunnel all day. On return
+  // the page refreshes once, so what you see is current within a second.
+  setInterval(()=>{ if(document.hidden||INTERACTING) return; loadFiles(); }, 15000);
+  setInterval(()=>{ if(document.hidden||INTERACTING) return; loadPrinterFiles(); }, 15000);
+  setInterval(()=>{ if(document.hidden||INTERACTING) return; loadQueue(); }, 15000);
+  setInterval(()=>{ if(document.hidden||ES_OK) return; if(fleetRenderBlocked()) return; loadFleet(); }, 5000);
+  document.addEventListener("visibilitychange", ()=>{
+    if(document.hidden) return;
+    loadFleet(); loadFiles(); loadQueue(); loadPrinterFiles();
+    try{ tickCameras(); }catch(e){}
+  });
 }
 
 async function checkVersion(){
@@ -302,8 +359,11 @@ function renderList(){
           const x=s.querySelector('[data-a="x"]'); if(x) x.addEventListener("click",()=>{ XFER=null; renderList(); });
         } else if(ACT.send){
           const targets=(ONBOARD||[]).filter(pr=>pr.id!==loc.pid);
-          s.innerHTML=`<span>Send "${esc(f.name)}" to:</span> `+targets.map(pr=>`<span class="sb" role="button" data-t="${pr.id}">${esc(pr.name)}</span>`).join(" ")+` <span class="sb" role="button" data-a="x">✕</span>`;
+          // v2.40.2: a file that lives only on a printer can be copied into the Hub library too.
+          const toHub=f.src!=="lib";
+          s.innerHTML=`<span>Send "${esc(f.name)}" to:</span> `+(toHub?`<span class="sb" role="button" data-t="hub" title="Copy into the Hub library, so it can be queued and sent to any printer">Hub library</span> `:"")+targets.map(pr=>`<span class="sb" role="button" data-t="${pr.id}">${esc(pr.name)}</span>`).join(" ")+` <span class="sb" role="button" data-a="x">✕</span>`;
           targets.forEach(pr=>{ s.querySelector(`[data-t="${pr.id}"]`).addEventListener("click",()=>startTransfer(loc.pid,loc.pname,pr.id,pr.name,f.name,loc.size)); });
+          if(toHub) s.querySelector('[data-t="hub"]').addEventListener("click",()=>startTransfer(loc.pid,loc.pname,"hub","the Hub library",f.name,loc.size));
           s.querySelector('[data-a="x"]').addEventListener("click",()=>{ ACT.send=false; renderList(); });
         } else {
           s.innerHTML=`<span>${esc(loc.pname)} storage:</span> <span class="sb" role="button" data-a="ren">✎ Rename</span> <span class="sb" role="button" data-a="del">🗑 Delete</span> <span class="sb" role="button" data-a="send">→ Send to…</span> <span class="sb" role="button" data-a="x">✕</span>`;
@@ -359,7 +419,9 @@ async function startTransfer(fromPid,fromName,toPid,toName,name,size){
   if(XFER && !XFER.done){ alert("A transfer is already running — one at a time."); return; }
   if(!confirm('Copy "'+name+'" ('+fmtSize(size||0)+')\nfrom '+fromName+' to '+toName+'?')) return;
   try{
-    const d=await post("/api/printer-files/transfer",{from:fromPid,name,to:toPid});
+    const d=toPid==="hub"
+      ? await post("/api/printer-files/to-hub",{from:fromPid,name})
+      : await post("/api/printer-files/transfer",{from:fromPid,name,to:toPid});
     XFER={ name, fromPid, toName, jobId:d.jobId, msg:"starting…", err:null, done:false };
     ACT={ name, pid:fromPid }; renderList(); pollXfer();
   }catch(e){ alert("Transfer failed to start: "+e.message); }
@@ -375,6 +437,7 @@ async function pollXfer(){
       else{
         XFER.msg="done"+(d.result&&d.result.sizeVerified?" ✓ size verified":" — SIZE MISMATCH, check the copy");
         loadPrinterFiles();
+        if(XFER.toName==="the Hub library") loadFiles();
       }
     } else {
       XFER.msg = d.phase==="verify" ? "verifying…"
@@ -700,7 +763,7 @@ async function fetchCardStats(id){
 }
 // refresh open panels every 15s (temperature_store is ~110 KB on-printer; the
 // hub downsamples, but no need to hammer it on the 5s fleet cadence)
-setInterval(()=>{ STATSOPEN.forEach(id=>fetchCardStats(id)); }, 15000);
+setInterval(()=>{ if(document.hidden) return; STATSOPEN.forEach(id=>fetchCardStats(id)); }, 15000);
 
 async function loadFleet(){
   // v2.23 PERF: "high" so the fleet is never queued behind thumbnails or the
@@ -718,7 +781,8 @@ async function loadFleet(){
 // 5 s poll takes over automatically — worst case is exactly v2.3.0 behavior.
 let ES=null, ES_OK=false, ES_LAST_RENDER=0, ES_RENDER_T=null;
 function fleetRenderBlocked(){
-  if(PUSHES>0 || PICKOPEN || INTERACTING) return true;
+  // H5 (2.44): a push no longer blocks the fleet; renderFleet keeps that one card.
+  if(PICKOPEN || INTERACTING) return true;
   const a=document.activeElement;
   return !!(a && a.closest && a.closest("#fleet") && (a.tagName==="SELECT"||a.tagName==="INPUT"));
 }
@@ -745,6 +809,7 @@ window.addEventListener("pointercancel",endInteract,{capture:true,passive:true})
 function startEvents(){
   if(!window.EventSource) return;
   try{ ES=new EventSource("/api/events"); }catch{ return; }
+  ES.addEventListener("dispatch", e=>{ let d; try{ d=JSON.parse(e.data); }catch{ return; } HubModules.event("dispatch", d); });
   ES.onmessage=e=>{
     ES_OK=true;
     let d; try{ d=JSON.parse(e.data); }catch{ return; }
@@ -794,25 +859,125 @@ function hexRGB(h){ if(!h) return null; const m=/^#?([0-9a-f]{6})$/i.exec(h.trim
 // recolored to the same value (the Orca workaround for un-mergeable extruders)
 // need fewer physical rolls than they have tools, and the server now allows
 // same-color tools to share a head.
+//
+// v2.40.2: material first, then color. With PLA and PETG loaded in the same
+// color, a PETG part used to land on whichever head came first (reported by a
+// user on 2.26). A head whose material differs from the file's is now only
+// picked when no head with the right material is free, and the row says so.
+// Material is compared only when BOTH sides name one - an unnamed side keeps
+// the old color-only behavior, because that is all there is to go on.
+function normMat(x){ return String(x==null?"":x).trim().toUpperCase(); }
+function matMismatch(needType, headMat){ const a=normMat(needType), b=normMat(headMat); return !!(a && b && a!==b); }
+function matWarnText(needType, headMat){ return matMismatch(needType, headMat) ? `needs ${normMat(needType)} - this head has ${normMat(headMat)}` : ""; }
+const MAT_PENALTY = 1e6;     // bigger than any color distance, so material always wins
+// v2.41: the BEST assignment, not first-come. Field case (2026-10-12, Print
+// on best printer): a file needing white, light purple, black and red, on a
+// printer with red, orange, black and white loaded. Taking the colors in the
+// file's order, light purple came before red, found the red roll "nearest"
+// of what was left, and took it - so red landed on orange and the printer
+// was turned down for "missing red" while red sat loaded in T1. Now every
+// way of placing the colors on the heads is weighed and the one with the
+// smallest total difference wins (material mismatch still costs more than
+// any color difference, and leaving a color unplaced costs more than either,
+// so as many colors as possible get a head, as before). Four heads make this
+// a few hundred cases; past MAP_EXACT_MAX colors it falls back to the old
+// one-at-a-time pass so a 16-color palette can't stall a fleet render.
+const MAP_UNPLACED = 1e7, MAP_EXACT_MAX = 8;
+function mapCost(n, h){
+  if(!h || !h.loaded || !n.hex || !h.hex) return Infinity;   // a side with no color is never auto-picked, as before
+  return colorDist(n.hex,h.hex) + (matMismatch(n.type, h.material)?MAT_PENALTY:0);
+}
 function defaultMapping(need, heads){
-  const taken=new Set(), map={};
+  const map={};
   const normh=x=>String(x==null?"":x).trim().replace(/^#/,"").slice(0,6).toUpperCase();
-  need.forEach(n=>{
-    let bestD=1e9, bestIdx=-1;
-    heads.forEach((h,hi)=>{
-      if(!h||!h.loaded||taken.has(hi)) return;
-      const d=(n.hex&&h.hex)?colorDist(n.hex,h.hex):1e9;
-      if(d<bestD){ bestD=d; bestIdx=hi; }
+  if(need.length<=MAP_EXACT_MAX){
+    const cost=need.map(n=>heads.map(h=>mapCost(n,h)));
+    let best=Infinity, bestPick=null;
+    const pick=new Array(need.length).fill(-1), used=new Set();
+    const go=(k, total)=>{
+      if(total>=best) return;                       // cannot beat what we have
+      if(k===need.length){ best=total; bestPick=pick.slice(); return; }
+      for(let hi=0; hi<heads.length; hi++){
+        const c=cost[k][hi];
+        if(c===Infinity || used.has(hi)) continue;
+        used.add(hi); pick[k]=hi; go(k+1, total+c); used.delete(hi); pick[k]=-1;
+      }
+      go(k+1, total+MAP_UNPLACED);                  // or leave this color without a head
+    };
+    go(0, 0);
+    if(bestPick) need.forEach((n,k)=>{ if(bestPick[k]>=0) map[n.i]=bestPick[k]; });
+  } else {
+    const taken=new Set();
+    need.forEach(n=>{
+      let bestD=Infinity, bestIdx=-1;
+      heads.forEach((h,hi)=>{ if(taken.has(hi)) return; const d=mapCost(n,h); if(d<bestD){ bestD=d; bestIdx=hi; } });
+      if(bestIdx>=0){ map[n.i]=bestIdx; taken.add(bestIdx); }
     });
-    if(bestIdx>=0){ map[n.i]=bestIdx; taken.add(bestIdx); }
-  });
+  }
   need.forEach(n=>{
     if(map[n.i]!=null || !n.hex) return;
-    const twin=need.find(o=>o!==n && map[o.i]!=null && normh(o.hex)===normh(n.hex));
+    // Two tools can share one head only if they are the same roll: same color
+    // AND, when both name one, the same material.
+    const twin=need.find(o=>o!==n && map[o.i]!=null && normh(o.hex)===normh(n.hex) && !matMismatch(o.type, n.type));
     if(twin) map[n.i]=map[twin.i];
   });
   return map;
 }
+
+// v2.42 "Print on best printer" (forum request, 2026-10-11: a farm owner wants
+// to pick a model, press print, and have the Hub choose an idle printer that
+// already has the right filaments loaded - not queue automation, just the
+// printer choice on a manual print).
+//
+// Pure: takes the needed colors and the printers on screen, returns the pick.
+// A printer qualifies only if it is online, idle (not printing, paused or in
+// error), not out of service, has the color API, and the same mapping
+// its card would pre-fill puts EVERY needed color on a head that is close in
+// color (under MATCH_THRESHOLD) and not a different material. Among those the
+// closest total color wins; a tie goes to the printer listed first. When none
+// qualifies the reason says what is missing, so nothing is ever sent on a
+// guess.
+function pickBestPrinter(need, fleet){
+  const idle=(fleet||[]).filter(p=>p && p.online && !p.maintenance &&
+    !["printing","paused","error"].includes(p.state) && (!p.caps || p.caps.multiColor!==false));
+  if(!need || !need.length) return { printer:null, reason:"This file has no colors to match." };
+  if(!idle.length) return { printer:null, reason:"No printer is idle and in service right now." };
+  let best=null;
+  const shortBy=[];                       // per idle printer: the colors it can't cover
+  idle.forEach((p,order)=>{
+    const heads=p.heads||[];
+    const map=defaultMapping(need, heads);
+    let total=0; const miss=[];
+    need.forEach(n=>{
+      const hi=map[n.i], h=hi!=null?heads[hi]:null;
+      const d=(h && h.loaded && n.hex && h.hex) ? colorDist(n.hex,h.hex) : 1e9;
+      if(d>=MATCH_THRESHOLD || matMismatch(n.type, h && h.material)) miss.push(n);
+      else total+=d;
+    });
+    if(!miss.length){ if(!best || total<best.total) best={ printer:p.id, name:p.name, map, total, order }; }
+    else shortBy.push({ p, miss, map, total });
+  });
+  if(best) return { printer:best.printer, name:best.name, map:best.map, total:best.total };
+  // Fewest missing colors first, then the closest of what does match.
+  shortBy.sort((a,b)=>a.miss.length-b.miss.length || a.total-b.total);
+  const c=shortBy[0];
+  const what=c.miss.map(n=>(n.hex||"a color")+(n.type?" "+normMat(n.type):"")).join(", ");
+  // v2.41 "Send anyway" (owner, 2026-10-12): the owner's eye beats a fixed
+  // threshold - light blue standing in for cyan is a call he can make. The
+  // closest printer is offered when it misses at most SEND_ANYWAY_MAX colors
+  // and every color still has a head to go to; what each stand-in is, and
+  // any material mismatch, is spelled out before anything is sent.
+  const heads=c.p.heads||[];
+  const subs=c.miss.map(n=>{
+    const hi=c.map[n.i], h=hi!=null?heads[hi]:null;
+    return { i:n.i, hex:n.hex||"", type:normMat(n.type), head:hi!=null?hi:null, headHex:h&&h.hex||"", headMat:normMat(h&&h.material),
+             matWarn:matWarnText(n.type, h&&h.material) };
+  });
+  const sendable=c.miss.length<=SEND_ANYWAY_MAX && subs.every(x=>x.head!=null);
+  return { printer:null, reason:"No idle printer has every color loaded. Closest is "+c.p.name+", missing "+what+".",
+           closest:{ printer:c.p.id, name:c.p.name, map:c.map, subs, sendable } };
+}
+const SEND_ANYWAY_MAX = 2;
 
 // "14h26m" / "9m" — compact remaining-time formatting for the fleet cards.
 function fmtDur(sec){
@@ -923,7 +1088,7 @@ function tickCameras(){
     }
   }
 }
-setInterval(tickCameras, CAM_POLL_MS);
+setInterval(()=>{ if(document.hidden) return; tickCameras(); }, CAM_POLL_MS);   // H11: no frames while hidden
 // Tap-to-enlarge lightbox — lives outside #fleet so renderFleet never wipes it.
 function ensureCamModal(){
   if(document.getElementById("cammodal")) return;
@@ -1154,6 +1319,11 @@ window.HubModules = {
     for (const def of Object.values(this._mods))
       if (def.onFleet) { try { def.onFleet(fleet); } catch(e){} }
   },
+  // S4 (2.44): named server events (the Dispatch plan today) reach the module that wants them.
+  event(name, data){
+    for (const def of Object.values(this._mods))
+      if (def.onEvent) { try { def.onEvent(name, data); } catch(e){} }
+  },
   // A module may claim the currently-selected file ("Send to X"). First one
   // wins; core shows the button only when something offers it.
   fileAction(){
@@ -1244,7 +1414,7 @@ function renderScanCtl(){
     ? "Camera access needs HTTPS. Open the Hub through its tunnel address (Settings → Remote access), or on this computer as http://localhost:" + (location.port || 80) + "."
     : "This browser has no camera API.";
   const qrBtn = camOk
-    ? `<button class="scanbtn" id="qrscan" style="background:var(--panel-2);color:var(--ink);border:1px solid var(--line)">⌗ Scan QR label</button>`
+    ? `<button class="scanbtn" id="qrscan" style="background:var(--panel-2);color:var(--ink);border:1px solid var(--field)">⌗ Scan QR label</button>`
     : `<button class="scanbtn" id="qrscan-off" disabled title="${esc(qrWhy)}" style="background:var(--panel-2);color:var(--ink-faint);border:1px dashed var(--line)">⌗ Scan QR label</button>`;
   const qrNote = camOk ? "" : `<div class="subnote" style="margin-top:6px">QR scanning is off here: ${esc(qrWhy)}</div>`;
   const labelLink = `<a class="gear" href="/labels.html" target="_blank" style="text-decoration:none">🏷 Print QR labels</a>`;
@@ -1253,7 +1423,7 @@ function renderScanCtl(){
   // optional and mints a tagless spool_id without it — but the ONLY caller was
   // handleUid(), so every route in started with a tag you don't have. This is
   // that missing door: identity first, printed QR label second, no NFC anywhere.
-  const newBtn = `<button class="scanbtn" id="newroll" style="background:var(--panel-2);color:var(--ink);border:1px solid var(--line)">＋ New roll (no tag)</button>`;
+  const newBtn = `<button class="scanbtn" id="newroll" style="background:var(--panel-2);color:var(--ink);border:1px solid var(--field)">＋ New roll (no tag)</button>`;
   if(nfcSupported()){
     ctl.innerHTML=`<div class="row" style="gap:10px;flex-wrap:wrap"><button class="scanbtn" id="nfcscan">📶 Tap to scan a spool tag</button>${qrBtn}${newBtn}${labelLink}</div>
       <div class="subnote" style="margin-top:8px">NFC: hold the tag to the back of the phone (HTTPS + Android Chrome). QR: point the camera at a printed spool label. No tag at all? <b>New roll</b> makes the record first and prints its own label.</div>${qrNote}
@@ -1860,14 +2030,20 @@ function klipperTitle(p){
 
 function renderFleet(){
   const need=neededColors();
-  const wrap=$("fleet"); wrap.innerHTML="";
+  const wrap=$("fleet");
+  // H5 (2.44): cards with a push in flight survive the rebuild untouched.
+  const keep=new Map();
+  if(PUSHING.size) wrap.querySelectorAll(".pcard[data-printer]").forEach(el=>{ const i=parseInt(el.dataset.printer,10); if(PUSHING.has(i)) keep.set(i, el); });
+  wrap.innerHTML="";
   let online=0;
   // Only the active type's instances render — cross-class targets are hidden,
   // so a file can't even be OFFERED to the wrong printer class.
   const fleetShown=(FLEET||[]).filter(p=>(p.ptype||"u1")===activeType().slug);
   fleetShown.forEach(p=>{
     if(p.online) online++;
+    if(keep.has(p.id)){ wrap.appendChild(keep.get(p.id)); return; }
     const card=document.createElement("div");
+    card.dataset.printer=String(p.id);
     card.className="pcard"+(p.online?"":" offline")+(p.maintenance?" maint":"");
     // status pill
     let pillCls="off", pillTxt="Offline";
@@ -1971,11 +2147,14 @@ function renderFleet(){
             // subtle dot marks the head the matcher recommends (greedy nearest)
             const rec=(dft[n.i]!==undefined && String(dft[n.i])===String(hi))?" rec":"";
             const tip=`T${hi+1}${h.hex?(" · "+h.hex):""}${h.material?(" "+esc(h.material)):""}`;
-            return `<button type="button" class="cmsw${sel}${rec}" data-card="${p.id}" data-pi="${n.i}" data-hi="${hi}" style="background:${bg}" title="${esc(tip)}"><span class="cmswt">T${hi+1}</span></button>`;
+            return `<button type="button" class="cmsw${sel}${rec}" data-card="${p.id}" data-pi="${n.i}" data-hi="${hi}" data-mat="${esc(h.material||'')}" style="background:${bg}" title="${esc(tip)}"><span class="cmswt">T${hi+1}</span></button>`;
           }).join("");
-          return `<div class="cmaprow" data-card="${p.id}"><span class="fsw" style="background:${n.hex||'#3a3f49'}"></span>`+
-                 `<span class="flab">P${n.i+1} ${n.hex||''}</span><span class="arrow">→</span>`+
-                 `<div class="cmswatches">${sws}</div></div>`;
+          // v2.40.2: say so when the chosen head holds a different material.
+          const warn=matWarnText(n.type, heads[+chosen] && heads[+chosen].material);
+          return `<div class="cmaprow" data-card="${p.id}" data-need="${esc(n.type||'')}"><span class="fsw" style="background:${n.hex||'#3a3f49'}"></span>`+
+                 `<span class="flab">P${n.i+1} ${n.hex||''}${n.type?(" "+esc(n.type)):""}</span><span class="arrow">→</span>`+
+                 `<div class="cmswatches">${sws}</div>`+
+                 `<span class="cmwarn" style="color:var(--bad);font-size:11.5px;margin-left:6px${warn?"":";display:none"}">${esc(warn)}</span></div>`;
         }).join("");
         mapHtml=`<div class="cmap"><div class="cmaphdr">Send each color from →</div>${rows}</div>`;
       }
@@ -2039,6 +2218,8 @@ function renderFleet(){
       const row=sw.closest(".cmaprow");
       if(row){ row.querySelectorAll(".cmsw").forEach(x=>x.classList.remove("sel")); }
       sw.classList.add("sel");
+      const w=row && row.querySelector(".cmwarn");
+      if(w){ const t=matWarnText(row.dataset.need, sw.dataset.mat); w.textContent=t; w.style.display=t?"":"none"; }
     });
   });
   wrap.querySelectorAll("button[data-bed]").forEach(b=>{
@@ -2071,14 +2252,19 @@ function renderFleet(){
 }
 
 let PUSHES=0;
-async function pushTo(printer, start, force){
+// H5 (2.44): the printers with a push in flight. renderFleet keeps THEIR cards
+// as they are (progress bar, listeners) and rebuilds every other card, so one
+// upload no longer freezes the whole dashboard for its duration.
+const PUSHING=new Set();
+async function pushTo(printer, start, force, mapOverride){
   if(!SELECTED){ return; }
   const map={};
-  document.querySelectorAll('.cmaprow[data-card="'+printer+'"] .cmsw.sel').forEach(sw=>{ map[sw.dataset.pi]=parseInt(sw.dataset.hi,10); });
+  if(mapOverride) Object.entries(mapOverride).forEach(([k,v])=>{ map[k]=v; });
+  else document.querySelectorAll('.cmaprow[data-card="'+printer+'"] .cmsw.sel').forEach(sw=>{ map[sw.dataset.pi]=parseInt(sw.dataset.hi,10); });
   const mapped=Object.keys(map).length;
   const st=$("pst-"+printer);
   if(st){ st.className="pstatus work"; st.innerHTML=pushBar(0,"Starting upload…"); }
-  PUSHES++;
+  PUSHES++; PUSHING.add(printer);
   try{
     const r=await fetch("/api/print",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({file:SELECTED,printer,start,map,type:activeType().slug,force:!!force})});
     const d=await r.json();
@@ -2086,24 +2272,37 @@ async function pushTo(printer, start, force){
     // printer's detected capabilities and wants a human decision.
     if(r.status===409 && d.classWarning){
       if(st){ st.className="pstatus"; st.textContent=""; }
-      if(confirm(d.error)) return await pushTo(printer, start, true);
+      if(confirm(d.error)) return await pushTo(printer, start, true, mapOverride);
       return;
     }
     if(!r.ok||d.error||!d.jobId) throw new Error(d.error||("HTTP "+r.status));
     if(d.note && st){ st.className="pstatus work"; st.innerHTML=pushBar(0,d.note); }
     await pollJob(d.jobId, st, start, mapped);
   }catch(e){ if(st){ st.className="pstatus err"; st.textContent=e.message; } }
-  finally{ PUSHES=Math.max(0,PUSHES-1); }
+  finally{ PUSHES=Math.max(0,PUSHES-1); PUSHING.delete(printer); }
   loadFleet(); loadQueue();
 }
 function pushBar(pct, label){
   return `<div class="pushbar"><div class="pushlabel">${esc(label)}</div><div class="pbar"><i style="width:${pct}%"></i></div></div>`;
 }
+// H5 (2.44): a poll that cannot reach the Hub stops after 15 misses in a row
+// (about 6 s) instead of spinning forever - a Hub restart or a dropped tunnel
+// mid-upload used to leave the card at "Uploading 37%" and, through PUSHES,
+// block every fleet re-render until the page was reloaded.
+const POLL_MAX_MISSES=15;
 async function pollJob(jobId, st, start, mapped){
+  let misses=0;
   for(;;){
     await new Promise(r=>setTimeout(r,400));
     let d;
-    try{ d=await (await fetch("/api/print-status?job="+encodeURIComponent(jobId))).json(); }catch(e){ continue; }
+    try{ d=await (await fetch("/api/print-status?job="+encodeURIComponent(jobId))).json(); misses=0; }
+    catch(e){
+      if(++misses>=POLL_MAX_MISSES){
+        if(st){ st.className="pstatus err"; st.textContent="Lost contact with the Hub while sending - the upload may still finish; check the printer's card once the Hub is back."; }
+        return;
+      }
+      continue;
+    }
     if(d.error){ if(st){ st.className="pstatus err"; st.textContent=d.error; } return; }
     if(st){
       if(d.phase==="upload" && d.total){ const pct=Math.min(100,Math.round(d.sent/d.total*100)); st.className="pstatus work"; st.innerHTML=pushBar(pct,"Uploading "+pct+"%"); }
@@ -2135,6 +2334,7 @@ function diskChip(p){
 // sentinel pre-fills distinguish "invalid input" from a real parse.
 let PICKOPEN=null; // {id, slot, val}
 const COMMON_COLORS=[["White","FFFFFF"],["Silver","C0C0C0"],["Gray","808080"],["Black","000000"],["Red","FF0000"],["Orange","FFA500"],["Gold","FFD700"],["Yellow","FFFF00"],["Tan","D2B48C"],["Brown","8B4513"],["Lime","00FF00"],["Green","008000"],["Teal","008080"],["Cyan","00FFFF"],["Blue","0000FF"],["Navy","000080"],["Purple","800080"],["Magenta","FF00FF"],["Pink","FFC0CB"],["Beige","F5F5DC"]];
+const CP_MATS=["PLA","PETG","ABS","ASA","TPU","PVA","PA","PC"];   // the base types core/filament.js may send
 function resolveColor(str){
   str=String(str||"").trim();
   if(!str) return null;
@@ -2154,12 +2354,19 @@ function colorPopHtml(p){
   const val=(PICKOPEN.val!==undefined)?PICKOPEN.val:cur;
   const res=resolveColor(val);
   const grid=COMMON_COLORS.map(([n,h])=>`<span class="cpsw" data-pickswatch="#${h}" title="${n}" style="background:#${h}"></span>`).join("");
+  // v2.41.1: the material rides with the color, the way the touchscreen does
+  // it. Without one the printer keeps the head's vendor at NONE and resets
+  // the color to white at its next spool read (see core/filament.js).
+  const curMat=String((p.heads&&p.heads[PICKOPEN.slot]&&p.heads[PICKOPEN.slot].material)||"").toUpperCase();
+  const matSel=(PICKOPEN.mat!==undefined)?PICKOPEN.mat:(CP_MATS.includes(curMat)?curMat:"PLA");
+  const matOpts=CP_MATS.map(m=>`<option value="${m}"${m===matSel?" selected":""}>${m}</option>`).join("");
   return `<div class="cpop">
     <div class="cpophdr">T${PICKOPEN.slot+1} color — tap one, or type a hex / name (e.g. tan)</div>
     <div class="cpgrid">${grid}</div>
     <div class="cprow">
       <input class="cpin" id="cpin" value="${esc(val)}" placeholder="#RRGGBB or name" spellcheck="false" autocomplete="off">
       <input type="color" class="cpprev${res?"":" dim"}" id="cpprev" value="${res||"#888888"}" title="Open full color picker">
+      <select class="cpmat" id="cpmat" title="Material - the printer only keeps the color when the head has one">${matOpts}</select>
       <button class="btn primary" id="cpapply" ${res?"":"disabled"}>Apply</button>
       <button class="btn ghost" id="cpcancel">Cancel</button>
     </div>
@@ -2186,6 +2393,8 @@ function wirePickPopover(wrap){
     if(e.key==="Enter") commitPick();
     else if(e.key==="Escape"){ PICKOPEN=null; renderFleet(); }
   });
+  const cpmat=document.getElementById("cpmat");
+  if(cpmat) cpmat.addEventListener("change",()=>{ if(PICKOPEN) PICKOPEN.mat=cpmat.value; });
   wrap.querySelectorAll("[data-pickswatch]").forEach(s=>{
     s.addEventListener("click",()=>{ cpin.value=s.dataset.pickswatch; cpin.dispatchEvent(new Event("input")); cpin.focus(); });
   });
@@ -2239,20 +2448,25 @@ function commitPick(){
   const hex=inp?resolveColor(inp.value):null;
   if(!hex) return;
   const {id,slot}=PICKOPEN;
+  const ms=document.getElementById("cpmat");
+  const mat=ms?ms.value:"";
   PICKOPEN=null;
-  setColor(id,slot,hex);
+  setColor(id,slot,hex,mat);
 }
 
 // ---- Filament color: tap a swatch on an idle printer to change it ----
 // Server verifies the write against print_task_config before reporting ok,
 // so a green status here means the printer itself confirmed the new color.
-async function setColor(printer, slot, hex){
+async function setColor(printer, slot, hex, material){
   const st=$("pst-"+printer);
   if(st){ st.className="pstatus work"; st.textContent="Setting T"+(slot+1)+" color…"; }
   try{
-    const r=await fetch("/api/setcolor",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({printer,slot,hex})});
+    const r=await fetch("/api/setcolor",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({printer,slot,hex,material:material||undefined})});
     const d=await r.json(); if(!r.ok||d.error) throw new Error(d.error||("HTTP "+r.status));
-    if(st){ st.className="pstatus ok"; st.textContent="T"+(slot+1)+" set to "+d.hex+" — confirmed by printer"; }
+    // v2.41.1: a warning means the color is on the head now but will not
+    // survive the printer's next spool read - show it, never a bare tick.
+    if(st && d.warning){ st.className="pstatus err"; st.textContent=d.warning; }
+    else if(st){ st.className="pstatus ok"; st.textContent="T"+(slot+1)+" set to "+d.hex+" — confirmed by printer"; }
     loadFleet();
   }catch(e){ if(st){ st.className="pstatus err"; st.textContent=e.message; } }
 }
@@ -2375,7 +2589,7 @@ async function refreshPower(){
 // live readings tick independently of the fleet poll (only if a plug exists)
 function startPowerPoll(){
   if(POWER_TIMER) return;
-  POWER_TIMER = setInterval(()=>{ if(FLEET.some(p=>p.plug)) refreshPower(); }, 6000);
+  POWER_TIMER = setInterval(()=>{ if(document.hidden) return; if(FLEET.some(p=>p.plug)) refreshPower(); }, 6000);
 }
 
 async function setPower(id, on){
@@ -2569,7 +2783,7 @@ async function loadConfigUI(){
     if(Array.isArray(c.types)&&c.types.length) TYPES=c.types;
     renderTypeRows();
     $("setPrinters").innerHTML="";
-    (c.printers||[]).forEach(p=>addPrinterRow(p.name,p.url,p.plug,p.type));
+    (c.printers||[]).forEach(p=>addPrinterRow(p.name,p.url,p.plug,p.type,p.id));
     if(!c.configured){ $("setup").classList.add("show"); $("setupmsg").textContent="welcome — add your printers to begin"; if(!$("setPrinters").children.length) addPrinterRow("",""); }
   }catch(e){}
 }
@@ -2650,12 +2864,13 @@ function refreshPrinterTypeSelects(){
     if(!TYPES.find(t=>t.slug===sel.value)) sel.value="u1";
   });
 }
-function addPrinterRow(name,url,plug,ptype){
+function addPrinterRow(name,url,plug,ptype,pid){
   const t = (plug && plug.type) || "";
   const ip  = esc((plug && plug.ip)  || "");
   const on  = esc((plug && plug.on)  || "");
   const off = esc((plug && plug.off) || "");
   const block=document.createElement("div"); block.className="pblock";
+  if(pid) block.dataset.pid=pid;   // H2: the stable id rides along so a reorder or rename keeps it
   block.innerHTML=
     `<div class="prow">`+
       `<input class="field pname" placeholder="U1" value="${esc(name||"")}">`+
@@ -2695,6 +2910,7 @@ function gatherPrinters(){
   return [...$("setPrinters").querySelectorAll(".pblock")].map(b=>{
     const rec={ name:b.querySelector(".pname").value.trim(), url:b.querySelector(".purl").value.trim(),
                 type:(b.querySelector(".ptype")||{}).value||"u1" };
+    if(b.dataset.pid) rec.id=b.dataset.pid;
     const t=b.querySelector(".plugtype").value;
     if(t==="shelly"){
       const ip=b.querySelector(".plugip").value.trim();
@@ -2741,4 +2957,80 @@ async function saveConfig(){
     $("setupmsg").textContent="";
     loadFiles(); loadFleet();
   }catch(e){ s.className="pstatus err"; s.textContent=e.message; }
+}
+
+
+// ---- v2.42: Print on best printer ------------------------------------------
+// Announce, then send: the choice shows with a 5-second Cancel before anything
+// is uploaded, because a wrong guess costs a plate. The pick is re-run on fresh
+// fleet data at send time, so a printer that started something else in those
+// seconds is never used.
+let AUTOPICK=null;   // { timer, file }
+function autoPickSay(cls, html){ const st=$("autopickst"); if(st){ st.className="pstatus "+cls; st.innerHTML=html; } }
+function autoPickCancel(msg){
+  if(AUTOPICK){ clearInterval(AUTOPICK.timer); AUTOPICK=null; }
+  autoPickSay("", msg||"");
+}
+function autoPickFleet(){ return (FLEET||[]).filter(p=>(p.ptype||"u1")===activeType().slug); }
+function autoPickStart(){
+  if(!SELECTED) return;
+  if(AUTOPICK){ autoPickCancel("Cancelled - nothing was sent."); return; }
+  const pick=pickBestPrinter(neededColors(), autoPickFleet());
+  if(pick.printer==null){ autoPickRefused(pick); return; }
+  autoPickCountdown(pick, false);
+}
+// The refusal, and - when the closest printer only misses a color or two -
+// a "Send to U4 anyway" that says what each stand-in head holds.
+function autoPickRefused(pick){
+  const c=pick.closest;
+  if(!c || !c.sendable){ autoPickSay("err", esc(pick.reason)); return; }
+  const subs=c.subs.map(x=>'<span style="white-space:nowrap"><i style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;background:'+esc(x.hex)+'"></i> '+esc(x.hex)+
+    " → T"+(x.head+1)+' <i style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;background:'+esc(x.headHex)+'"></i> '+esc(x.headHex)+
+    (x.matWarn?' <b style="color:var(--bad)">('+esc(x.matWarn)+")</b>":"")+"</span>").join(", ");
+  autoPickSay("err", esc(pick.reason)+"<br>On "+esc(c.name)+" that would print "+subs+". "+
+    '<button class="btn ghost" id="autopickforce" style="font-size:12px;padding:3px 10px">Send to '+esc(c.name)+" anyway</button>");
+  const b=$("autopickforce");
+  if(b) b.onclick=()=>autoPickCountdown({ printer:c.printer, name:c.name, map:c.map, note:subs }, true);
+}
+// Announce, count down against the clock, re-check on fresh fleet data, send.
+// anyway=true: the printer was chosen by the owner, so the re-check asks only
+// that it is still idle and still loaded the same way (its mapping unchanged).
+function autoPickCountdown(pick, anyway){
+  const file=SELECTED;
+  // Counted against the clock, not by ticks: on a busy page (live fleet
+  // renders) a 1 s interval can fire every 2 s, and "5s" must mean 5 s.
+  const deadline=Date.now()+5000;
+  let left=5;
+  const show=()=>autoPickSay("work", "Sending to <b>"+esc(pick.name)+"</b> in "+left+"s"+(anyway?", printing "+pick.note+". ":", every color already loaded. ")+
+    '<button class="btn ghost" id="autopickx" style="font-size:12px;padding:3px 10px">Cancel</button>');
+  show();
+  const wireX=()=>{ const x=$("autopickx"); if(x) x.onclick=()=>autoPickCancel("Cancelled - nothing was sent."); };
+  wireX();
+  AUTOPICK={ file, timer:setInterval(async ()=>{
+    if(SELECTED!==file){ autoPickCancel("Cancelled - a different file was selected."); return; }
+    const now=Math.ceil((deadline-Date.now())/1000);
+    if(now>0){ if(now!==left){ left=now; show(); wireX(); } return; }
+    clearInterval(AUTOPICK.timer); AUTOPICK=null;
+    autoPickSay("work", "Checking "+esc(pick.name)+" is still free…");
+    try{ await loadFleet(); }catch(e){}
+    let target=null;
+    if(anyway){
+      const fresh=autoPickFleet().find(p=>p.id===pick.printer);
+      const idle=fresh && fresh.online && !fresh.maintenance && !["printing","paused","error"].includes(fresh.state);
+      const map=idle ? defaultMapping(neededColors(), fresh.heads||[]) : null;
+      if(!idle) { autoPickSay("err", esc(pick.name)+" is no longer idle. Nothing was sent."); return; }
+      if(JSON.stringify(map)!==JSON.stringify(pick.map)){ autoPickSay("err", esc(pick.name)+"'s rolls changed while counting down - press Print on best printer again to see the new match. Nothing was sent."); return; }
+      target={ printer:pick.printer, name:pick.name, map };
+    } else {
+      const again=pickBestPrinter(neededColors(), autoPickFleet());
+      if(again.printer!==pick.printer){
+        autoPickSay("err", esc(pick.name)+" is no longer a match"+(again.printer!=null?" - press again to send to "+esc(again.name):" - "+esc(again.reason))+". Nothing was sent.");
+        return;
+      }
+      target=again;
+    }
+    Object.entries(target.map).forEach(([pi,hi])=>{ MAPSEL[target.printer+":"+pi]=String(hi); });
+    autoPickSay("ok", "Sent to <b>"+esc(target.name)+"</b> - progress is on its card.");
+    pushTo(target.printer, true, false, target.map);
+  }, 250) };
 }

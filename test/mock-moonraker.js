@@ -38,8 +38,14 @@ function createMock(profile) {
     configfile: null,              // fork (ryvin/u1hub): Klipper configfile.settings the SME reads; null = empty
     configRequests: [],            // fork (ryvin/u1hub): every objects/query that asked for configfile, { at }
     ace: null,                     // fork (ryvin/u1hub): multiACE's `ace` status object (objects/query?ace); null = no multiACE
-    multiace: null                 // fork (ryvin/u1hub): (req, res, url) handler for /multiace/* (test/mock-multiace.js); null = 404
+    multiace: null,                // fork (ryvin/u1hub): (req, res, url) handler for /multiace/* (test/mock-multiace.js); null = 404
+    stallUpload: false,            // 2.42 (H3): accept an upload, then stop reading it and never answer
+    stallScripts: false,           // 2.42 (H3): accept a gcode script and never answer
+    stallDownload: false,          // 2.43 (H20): start sending a stored file, then stop mid-body
+    held: []                       // requests parked by the two knobs above
   };
+  // Let go of every parked request (the harness calls this after a stall test).
+  state.releaseHeld = () => { for (const r of state.held.splice(0)) { try { r.socket && r.socket.destroy(); } catch {} } };
 
   const objectsList = profile === "u1"
     ? ["print_stats", "display_status", "virtual_sdcard", "heater_bed", "exclude_object", "print_task_config", "extruder", "extruder1", "extruder2", "extruder3"]
@@ -105,18 +111,27 @@ function createMock(profile) {
     if (u.pathname === "/server/files/list")
       return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: Date.now() / 1000, permissions: "rw" })) });
 
-    // Fork (ryvin/u1hub): serve a stored file's bytes, the way Moonraker does
-    // for the printer-sync pull. Files pushed by upload carry no body (only a
-    // byte count), so a test that wants a downloadable file sets `data` itself.
+    // v2.40.2: download a stored file (copy-to-Hub). Bytes are the file's own
+    // `data` when the test gave one, else `size` deterministic bytes.
     if (u.pathname.startsWith("/server/files/gcodes/") && req.method === "GET") {
       const name = decodeURIComponent(u.pathname.slice("/server/files/gcodes/".length));
       const f = state.files.find(x => x.name === name);
-      if (!f) return send(404, { error: "mock: no such file " + name });
-      const body = Buffer.isBuffer(f.data) ? f.data : Buffer.alloc(f.size || 0, 0x20);
+      if (!f) return send(404, { error: "not found" });
+      const body = f.data || Buffer.alloc(f.size || 0, 0x47);
       res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": body.length });
+      if (state.stallDownload) {                 // a printer that goes quiet mid-download
+        res.write(body.subarray(0, Math.min(65536, body.length)));
+        state.held.push(req); return;
+      }
       return res.end(body);
     }
 
+    if (u.pathname === "/server/files/upload" && req.method === "POST" && state.stallUpload) {
+      req.pause(); state.held.push(req); return;     // a printer that stops reading
+    }
+    if (u.pathname === "/printer/gcode/script" && req.method === "POST" && state.stallScripts) {
+      state.held.push(req); return;                  // a printer that never answers
+    }
     if (u.pathname === "/server/files/upload" && req.method === "POST") {
       let bytes = 0;
       let head = Buffer.alloc(0);
@@ -162,7 +177,25 @@ function createMock(profile) {
           if (ptc.filament_exist[i] && ptc.filament_edit[i] !== false) {
             ptc.filament_type[i] = tm[2].toUpperCase();
             if (sm) ptc.filament_sub_type[i] = sm[2] || "NONE";
+            const vm = /(^|\s)VENDOR=('?)([^' ]+)\2/.exec(script);
+            if (vm) ptc.filament_vendor[i] = vm[3];
           }
+        }
+      }
+      // v2.41.1: the spool-tag re-read the firmware runs on a reboot, a load
+      // or unload and feeder events (filament_detect.request_update_filament_info,
+      // also reachable as FILAMENT_DT_UPDATE). For a head with no RFID tag,
+      // print_task_config._rfid_filament_info_update_cb keeps the head's
+      // settings ONLY if its vendor is not 'NONE'; otherwise the blank read
+      // overwrites them with white / NONE. This is the rule that made Hub-set
+      // colors "not save to the machine".
+      if (profile === "u1" && /^FILAMENT_DT_UPDATE\b/.test(script)) {
+        const ch = /CHANNEL=(\d)/.exec(script);
+        const i = ch ? Number(ch[1]) : -1;
+        if (i >= 0 && ptc.filament_exist[i] && !ptc.filament_official?.[i] && (ptc.filament_vendor[i] || "NONE") === "NONE") {
+          ptc.filament_color_rgba[i] = "FFFFFFFF";
+          ptc.filament_type[i] = "NONE";
+          ptc.filament_vendor[i] = "NONE";
         }
       }
       if (/^SDCARD_PRINT_FILE/.test(script)) {
