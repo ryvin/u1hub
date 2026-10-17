@@ -45,10 +45,10 @@ Switch any of them from Settings → Features, or in `config.json`:
 | `modules/sme.js` | `loadoutLines()` appends the ACE slots from `ctx.use("multiace.loadout")`; `outcomeLines()` names prints that went via multiACE (fork-owned) |
 | `Dockerfile`, `test/run-tests.js` `stageHub()` | `COPY sme ./sme` and its mirror in the harness: `modules/sme.js` requires `sme/core/` |
 | `modules/resources.js` | +1 line in `deductFor()`: `ctx.events.emit("filament.deducted", rec)` after the deduction is saved, so the costing ledger prices a print from the record resources already made instead of deducting again; +1 line at the end of `register()`: `ctx.provide("resources.priceFor", …)`, the shelf's matched roll and its $/g for one colour, so costing prices a multiACE print colour by colour. Reasoning in [costing.md](costing.md#rebase-footprint). |
-| `test/mock-moonraker.js` | +4 routes and 6 state fields: `GET /server/files/gcodes/<name>` serves a stored file's bytes (printer-sync); `GET /server/files/metadata` answers from `state.metadata` and logs `state.metaRequests` when a test sets them (costing), placed before upstream's blank answer so every other test is unchanged; `GET /server/history/list` honours `start`, `order`, `since` and `before` and logs `state.historyRequests` (costing import paging) - with none of those parameters the answer is upstream's; `objects/query?configfile` answers `state.configfile` and logs `state.configRequests`, `GET /printer/info` answers `state.softwareVersion`, `GET /server/files/list?root=config` answers `state.configFiles` (sme), all three absent/empty for every other test; `objects/query?ace` answers `state.ace` and `/multiace/*` is delegated to `state.multiace` (test/mock-multiace.js) when a test sets them, 404 as before otherwise (multiace) |
+| `test/mock-moonraker.js` | +3 routes and 6 state fields (`GET /server/files/gcodes/<name>`, which printer-sync's tests download from, is upstream's own route since 2.40.2; the fork's copy of it was dropped in the 2.44.0 merge); `GET /server/files/metadata` answers from `state.metadata` and logs `state.metaRequests` when a test sets them (costing), placed before upstream's blank answer so every other test is unchanged; `GET /server/history/list` honours `start`, `order`, `since` and `before` and logs `state.historyRequests` (costing import paging) - with none of those parameters the answer is upstream's; `objects/query?configfile` answers `state.configfile` and logs `state.configRequests`, `GET /printer/info` answers `state.softwareVersion`, `GET /server/files/list?root=config` answers `state.configFiles` (sme), all three absent/empty for every other test; `objects/query?ace` answers `state.ace` and `/multiace/*` is delegated to `state.multiace` (test/mock-multiace.js) when a test sets them, 404 as before otherwise (multiace) |
 | `test/run-tests.js` | `U1HUB_HARNESS_SKIP_SLICE=1` lets a clone without upstream's private slice fixtures run the rest of the harness. The skip is printed. |
 | `package.json` | the fork suites are appended to `test:standalone` |
-| `.gitignore` | `docker-compose.override.yml`, `data/` (Docker deploy state); `projects.json`, `prints.json` (costing state); `sme.json`, `sme-lessons.json`, `sme-runner.*`, `sme/knowledge.md.bak` (sme state); `multiace.json` (multiace state); `estimates.json`, `estimate-calibration.json`, `estimates/` (estimate state and uploads; public quotes live there too); `quote/.env` (the quote service's key and Turnstile secret); `.playwright-mcp/` (browser-test scratch) |
+| `.gitignore` | `docker-compose.override.yml`, `data/` (Docker deploy state); `projects.json`, `prints.json` (costing state); `sme.json`, `sme-lessons.json`, `sme-runner.*`, `sme/knowledge.md.bak` (sme state); `multiace.json` (multiace state); `estimate-store.json`, `estimates.json` (upstream Dispatch's since 2.44, ignored there too), `estimate-calibration.json`, `estimates/` (estimate state and uploads; public quotes live there too); `quote/.env` (the quote service's key and Turnstile secret); `.playwright-mcp/` (browser-test scratch) |
 
 `git diff origin/main..ryvin --stat` is the source of truth. If this table and
 that command disagree, the command is right.
@@ -89,6 +89,15 @@ node scripts/check-core.js && node scripts/check-index-js.js
 git push --force-with-lease fork ryvin
 git push fork origin/main:main          # keep the mirror current
 ```
+
+**Or merge, when the rebase would stop on many commits.** 2.44.0 (36 upstream
+commits against 55 fork commits) was taken with `git merge origin/main` on a
+branch, because the rebase stopped on the first fork commit and many later ones
+touch the same mock lines. A merge needs no force-push and leaves the conflicts
+in one place: that time `modules/resources.js` (keep the fork's
+`filament.deducted` emit *and* upstream's `resources.deducted` emit) and the
+state block of `test/mock-moonraker.js` (keep both sides' fields). Run the same
+checks, then fast-forward `ryvin` and push it without force.
 
 Harness totals move with every upstream release, so this file does not record
 them. Record the number the command printed in the commit that took the release.

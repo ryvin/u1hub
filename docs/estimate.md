@@ -105,7 +105,7 @@ printer type not listed is "size unchecked".
 
 | File | What |
 |---|---|
-| `estimates.json` | estimates (files' measured facts, slice info, candidates, inputs, source, saved, links) |
+| `estimate-store.json` | estimates (files' measured facts, slice info, candidates, inputs, source, saved, links). Until the 2.44.0 merge this was `estimates.json`; that name is now upstream Dispatch's learned-estimates file, so on first boot the module copies its estimates out of it once and never touches it again |
 | `estimates/<id>/<file_id>.<ext>` | the uploads, stored by generated id, never by the uploaded name; unsaved estimates are pruned after 30 days |
 | `estimate-calibration.json` | the live time fits and grams `k` |
 

@@ -117,7 +117,9 @@ sme/knowledge.md.bak
 multiace.json
 
 # Fork (ryvin/u1hub) estimate module state: saved estimates, the calibration
-# fits and the uploaded models. Never commit.
+# fits and the uploaded models. Never commit. (estimates.json, kept ignored,
+# is upstream Dispatch's learned-estimates file since 2.44.)
+estimate-store.json
 estimates.json
 estimate-calibration.json
 estimates/

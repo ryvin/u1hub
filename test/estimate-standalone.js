@@ -328,6 +328,27 @@ async function main() {
     ok(r.status === 413, "over the cap -> 413", r.status);
     ok(fs.readdirSync(path.join(tmp, "estimates")).length === before, "the refused upload left no directory behind");
     ok(((await jget("/api/estimate/" + ID)).body || {}).saved === true, "the saved estimate survives a restart");
+    // 2.44.0 merge: upstream's Dispatch learned-estimates owns estimates.json ({files, printers}) and
+    // rewrites it whole on every completion, so this module keeps its state in estimate-store.json.
+    console.log("\n-- own state file (estimates.json is upstream Dispatch's) --");
+    const STORE = path.join(tmp, "estimate-store.json"), LEGACY = path.join(tmp, "estimates.json");
+    const stored = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
+    ok(stored.estimates && stored.estimates[ID] && stored.estimates[ID].saved === true, "estimates are saved in estimate-store.json", Object.keys(stored));
+    ok(!fs.existsSync(LEGACY), "the module never writes estimates.json (upstream Dispatch's file)", fs.existsSync(LEGACY));
+    await stopHub();
+    const dispatchShape = { files: { "u1/x.gcode": [{ at: 1, actual: 93, est: 62, printer_id: null }] }, printers: {} };
+    fs.writeFileSync(LEGACY, JSON.stringify({ ...dispatchShape, estimates: stored.estimates }));
+    const legacyBytes = fs.readFileSync(LEGACY, "utf8");
+    fs.unlinkSync(STORE);
+    await startHub(tmp, {});
+    ok(((await jget("/api/estimate/" + ID)).body || {}).saved === true, "an install from before the split: estimates in estimates.json are carried over", ID);
+    ok(fs.existsSync(STORE) && (JSON.parse(fs.readFileSync(STORE, "utf8")).estimates || {})[ID], "…into estimate-store.json, written at boot", fs.existsSync(STORE));
+    ok(fs.readFileSync(LEGACY, "utf8") === legacyBytes, "…and estimates.json is left exactly as it was for Dispatch", null);
+    await stopHub();
+    fs.writeFileSync(LEGACY, JSON.stringify({ files: {}, printers: {}, estimates: { stale: { id: "stale", saved: true } } }));
+    await startHub(tmp, {});
+    ok(((await jget("/api/estimate/stale")).status) === 404 && ((await jget("/api/estimate/" + ID)).body || {}).saved === true, "once estimate-store.json exists, estimates.json is never read again", null);
+    fs.unlinkSync(LEGACY);
     console.log("\n-- a 3MF too big to measure, with slice info (the live Dragon Dynasty 3MF: 48 MB, meshes past the 160 MB budget) --");
     await stopHub(); await startHub(tmp, { U1HUB_ESTIMATE_MESH_MAX_MB: "0.0001" });
     r = await up("box.3mf", tmf);

@@ -81,11 +81,25 @@ function sha1File(fp) {
 }
 
 function register(ctx) {
-  const STATE = path.join(ctx.baseDir, "estimates.json"), CALF = path.join(ctx.baseDir, "estimate-calibration.json");
+  // estimate-store.json, not estimates.json: upstream 2.44's Dispatch learned
+  // estimates own estimates.json ({files, printers}) and rewrite it whole on
+  // every completion. An install from before the split has its estimates in
+  // estimates.json; they are copied over once, and that file is left alone.
+  const STATE = path.join(ctx.baseDir, "estimate-store.json"), LEGACY = path.join(ctx.baseDir, "estimates.json");
+  const CALF = path.join(ctx.baseDir, "estimate-calibration.json");
   const DIR = path.join(ctx.baseDir, "estimates");
   // Prototype-free, and looked up by own keys only: "__proto__" or "constructor" is no estimate (final review).
   let S = { estimates: Object.create(null) };
-  try { const j = JSON.parse(fs.readFileSync(STATE, "utf8")); if (j && j.estimates) S = { ...j, estimates: Object.assign(Object.create(null), j.estimates) }; } catch {}
+  const fromFile = f => { const j = JSON.parse(fs.readFileSync(f, "utf8")); return j && j.estimates ? { estimates: Object.assign(Object.create(null), j.estimates) } : null; };
+  if (fs.existsSync(STATE)) { try { S = fromFile(STATE) || S; } catch {} }
+  else {
+    let old = null; try { old = fromFile(LEGACY); } catch {}
+    if (old) {
+      S = old;
+      try { fs.writeFileSync(STATE, JSON.stringify(S, null, 2)); ctx.hublog("info", "estimate: moved " + Object.keys(S.estimates).length + " estimates from estimates.json to estimate-store.json (estimates.json is Dispatch's now)"); }
+      catch (e) { ctx.hublog("warn", "estimate: could not write estimate-store.json - " + e.message); }
+    }
+  }
   let CALS = { fits: {}, k: null, at: null };
   try { const j = JSON.parse(fs.readFileSync(CALF, "utf8")); if (j && j.fits) CALS = j; } catch {}
   const JOBS = new Map();
