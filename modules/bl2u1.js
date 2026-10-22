@@ -30,6 +30,7 @@
 "use strict";
 
 const fs = require("fs");
+const { stripSlash } = require("../core/util.js");   // H19 (2.45): shared helper
 
 const TIMEOUT_MS = 10 * 60 * 1000;          // a big multi-plate project can take minutes
 const PROBE_MS = 3000;
@@ -74,7 +75,7 @@ function register(ctx) {
     const c = (ctx.cfg && typeof ctx.cfg.bl2u1 === "object" && ctx.cfg.bl2u1) || {};
     const roots = Array.isArray(c.roots) && c.roots.length ? c.roots.filter(x => x && typeof x.host === "string").map(x => ({ rel: String(x.rel || ""), host: String(x.host) })) : DEFAULT_ROOTS;
     const url = c.url ? String(c.url) : (IN_DOCKER ? DEFAULT_URL : "");
-    return { url: url.replace(/\/+$/, ""), roots, configured: !!url };
+    return { url: stripSlash(url), roots, configured: !!url };
   };
 
   async function call(method, p, body, ms) {

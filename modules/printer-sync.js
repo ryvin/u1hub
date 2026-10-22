@@ -44,6 +44,7 @@
 "use strict";
 
 const fs = require("fs");
+const { printerUrl } = require("../core/util.js");   // H19 (2.45): shared helper
 const fsp = fs.promises;
 const path = require("path");
 const http = require("http");
@@ -123,7 +124,7 @@ function register(ctx) {
   }
 
   async function listOnboard(p) {
-    const base = String(p.url).replace(/\/+$/, "");
+    const base = printerUrl(p);
     const d = await fetchJson(base + "/server/files/list?root=gcodes", LIST_TIMEOUT_MS);
     return (d.result || [])
       .filter(f => GCODE_RE.test(f.path || "") && !String(f.path).includes("/"))
@@ -145,12 +146,12 @@ function register(ctx) {
   async function busyNow(idx, p) {
     try { S.fleet = await ctx.fleet(); } catch { S.fleet = []; }
     if (busy(idx)) return true;
-    return BUSY_STATES.has(await livePrintState(String(p.url).replace(/\/+$/, "")));
+    return BUSY_STATES.has(await livePrintState(printerUrl(p)));
   }
 
   // -> "ok" | "failed" | "busy" (the printer started printing; copy abandoned)
   async function pullOne(p, f, dir) {
-    const base = String(p.url).replace(/\/+$/, "");
+    const base = printerUrl(p);
     const dest = path.join(dir, f.name), part = dest + ".part";
     const ctl = {};
     let startedPrinting = false, checking = false;

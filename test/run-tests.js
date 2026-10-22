@@ -5305,9 +5305,13 @@ async function stopHub() {
 
     // H3. A printer that stops reading mid-upload must not hold the push
     // forever. The harness runs with a 1.5 s idle limit (production: 30 s).
-    const UID = (((await jget("/api/fleet")).body || []).find(p => String(p.url || "").endsWith(":" + portU1)) || {}).id;
+    // fork (ryvin/u1hub): the 48 MB write comes BEFORE the fleet read. Written
+    // after it, a slow disk can keep the client idle past the Hub's 5 s
+    // keep-alive, and the POST below lands on a socket the server is closing
+    // ("fetch failed: other side closed", reproduced 4/4 under load).
     const stallName = "stall-test.gcode";
     fs.writeFileSync(path.join(gcodeDir, stallName), Buffer.concat([Buffer.from(GCODE_SINGLE + "\n"), Buffer.alloc(48 * 1024 * 1024, "G1 X1\n")]));
+    const UID = (((await jget("/api/fleet")).body || []).find(p => String(p.url || "").endsWith(":" + portU1)) || {}).id;
     mockU1.state.stallUpload = true;
     let t0 = Date.now();
     r = await jpost("/api/print", { file: stallName, printer: UID, type: "u1" });

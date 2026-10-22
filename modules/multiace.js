@@ -55,6 +55,7 @@
 "use strict";
 
 const fs = require("fs");
+const { printerUrl } = require("../core/util.js");   // H19 (2.45): shared helper
 const fsp = fs.promises;
 const http = require("http");
 const path = require("path");
@@ -567,7 +568,7 @@ function register(ctx) {
   const save = () => { saving = saving.then(writeState).catch(e => ctx.hublog("warn", "multiace: state write failed - " + e.message)); return saving; };
 
   const printers = () => ctx.printers || [];
-  const baseOf = idx => { const p = printers()[idx]; return p && p.url ? String(p.url).replace(/\/+$/, "") : null; };
+  const baseOf = idx => { const p = printers()[idx]; return p && p.url ? printerUrl(p) : null; };
   const conf = () => {
     const c = (ctx.cfg && typeof ctx.cfg.multiace === "object" && ctx.cfg.multiace) || {};
     const sec = num(c.swap_seconds);

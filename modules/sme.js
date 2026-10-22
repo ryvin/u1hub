@@ -47,6 +47,7 @@
 "use strict";
 
 const fs = require("fs");
+const { printerUrl } = require("../core/util.js");   // H19 (2.45): shared helper
 const fsp = fs.promises;
 const path = require("path");
 const crypto = require("crypto");
@@ -357,7 +358,7 @@ function register(ctx) {
   const KL = new Map();   // idx -> { at, lines, values, sections, ok, error }
   async function klipperFor(idx, force) {
     const p = printers()[idx];
-    const base = p && String(p.url || "").replace(/\/+$/, "");
+    const base = p && printerUrl(p);
     if (!base) return { ok: false, error: "no url", lines: [], values: {} };
     const hit = KL.get(idx);
     if (!force && hit && Date.now() - hit.at < KLIPPER_TTL_MS) return hit;

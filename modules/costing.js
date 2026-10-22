@@ -68,6 +68,7 @@
 "use strict";
 
 const fs = require("fs");
+const { printerUrl } = require("../core/util.js");   // H19 (2.45): shared helper
 const fsp = fs.promises;
 const path = require("path");
 const { parseGcodeMap, estMinutes } = require("../parser.js");
@@ -607,7 +608,7 @@ function register(ctx) {
 
   // ---- Moonraker, read-only: tiny JSON GETs, bounded, never a gcode body ------------
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const baseOf = idx => { const p = printers()[idx]; const b = p && String(p.url || "").replace(/\/+$/, ""); return b || null; };
+  const baseOf = idx => { const p = printers()[idx]; const b = p && printerUrl(p); return b || null; };
   let GETS = 0;                                   // every Moonraker GET this module made (the harness reads it)
   async function moonGet(base, pathq) {
     const ac = new AbortController();

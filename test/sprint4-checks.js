@@ -97,6 +97,7 @@ module.exports = async function sprint4Checks(ok) {
     // the client, test/ and scripts/ are tooling - they keep their own copies.
     const walk = (dir, out = []) => { for (const e of fs.readdirSync(path.join(REPO, dir), { withFileTypes: true })) {
       if (e.name === "node_modules" || e.name === "public" || e.name === "test" || e.name === "scripts" || e.name === "docs" || e.name === ".git" || e.name === "dist") continue;
+      if (!dir && e.name === "quote") continue;   // fork (ryvin/u1hub): quote/ is a separate service in its own image, not the Hub process; it cannot require core/util.js
       const rel = dir ? dir + "/" + e.name : e.name;
       if (e.isDirectory()) walk(rel, out); else if (/\.js$/.test(e.name)) out.push(rel);
     } return out; };
