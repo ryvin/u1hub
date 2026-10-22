@@ -136,6 +136,24 @@ function reprintGcode() {
     ok(JSON.stringify(plan.heads) === "[0,1,2,3]", "heads used: 0-3", plan.heads);
     ok(MA.processedPlan(gcode().split("\n")).processed === false, "an unprocessed file is not a reprint");
   }
+  console.log("\n== CLIENT: colours from the printer never reach a style attribute raw ==");
+  {
+    // slot.color comes straight from the printer's livedata; esc() leaves ';' and 'url(' alone,
+    // so a label like "red;background-image:url(//x)" would become CSS. Every background goes
+    // through cssHex (#rrggbb / #rrggbbaa or nothing).
+    const src = fs.readFileSync(path.join(REPO, "public", "modules", "multiace-ui.js"), "utf8");
+    const raw = (src.match(/background:'\s*\+\s*esc\(/g) || []).length;
+    ok(raw === 0, "no style background is built from esc() alone (" + raw + " found)", raw);
+    const m = /const cssHex = (s => \{[^\n]*\});/.exec(src);
+    ok(!!m, "the client defines cssHex on one line", null);
+    if (m) {
+      const cssHex = eval("(" + m[1] + ")");
+      const cases = [["#FC8200", "#fc8200"], ["fc8200", "#fc8200"], ["#fc8200ff", "#fc8200ff"], [" #000000 ", "#000000"], ["red;background-image:url(//x)", ""], ["#fc8200;x", ""], ["url(x)", ""], ["#fff", ""], [null, ""], [undefined, ""], [123456, ""]];
+      const bad = cases.filter(([i, want]) => cssHex(i) !== want).map(([i, want]) => [i, want, cssHex(i)]);
+      ok(bad.length === 0, "cssHex keeps #rrggbb / #rrggbbaa, rejects everything else", bad);
+    }
+  }
+
   console.log("\n== PURE: the estimators against known answers ==");
   {
     const M = MA.parseFlushMatrix("; flush_multiplier = 1\n; flush_volumes_matrix = " + MATRIX.join(","));
@@ -402,6 +420,17 @@ function reprintGcode() {
     ok(await refused("nozzle06.gcode", 0, 400, "nozzle"), "a 0.6 mm file on 0.4 mm heads is refused");
     r = await jpost("/api/multiace/preflight", { file: "../etc/passwd", printer: 0, type: "u1" });
     ok(r.status === 400, "a path in the file name is refused");
+    {
+      // printerOf: "", false, true, " ", "abc", 1.5 are not printer 0 (or 1) - Number("") and Number(false) are 0
+      const bads = ["", false, true, " ", "abc", 1.5, [], {}];
+      const got = [];
+      for (const v of bads) { const x = await jpost("/api/multiace/preflight", { file: "../nope", printer: v, type: "u1" }); got.push([JSON.stringify(v), x.status, x.body && x.body.error]); }
+      ok(got.every(g => g[1] === 400 && g[2] === "Unknown printer"), "a printer that is not a whole number (empty, false, true, blank, text, 1.5, [], {}) is 400 Unknown printer, never printer 0", got);
+      const q = await jget("/api/multiace/loadout?printer=");
+      ok(q.status === 400 && q.body.error === "Unknown printer", "?printer= (empty) is 400, not printer 0", q);
+      const q2 = await jget("/api/multiace/loadout?printer=0");
+      ok(q2.status === 200, "?printer=0 still means printer 0", q2.status);
+    }
     ok(ma.state.preflights.length === 2, "none of the refusals reached the engine", ma.state.preflights.length);
 
     console.log("\n-- print via multiACE (as sliced): identity map first, then the engine --");
@@ -497,6 +526,19 @@ function reprintGcode() {
     }
     moonA.state.printState = "standby"; moonA.state.filename = "";
     ok(await waitState(0, "standby") === "standby", "idle again");
+    {
+      // the printer starts printing after the route's check and before the identity map: the
+      // re-check right before the first gcode command catches it (the mock flips on the 2nd livedata read)
+      const n0 = ma.state.livedataCalls, sc0 = moonA.state.gcodeScripts.length, pr0n = ma.state.prints.length;
+      ma.state.onLivedata = n => { if (n === n0 + 2) { moonA.state.printState = "printing"; moonA.state.filename = "someone else.gcode"; } };
+      r = await jpost("/api/multiace/print", { printer: 0, token: TOKEN, mode: "slicer" });
+      pj = r.body && r.body.jobId ? await pollJob(r.body.jobId) : { error: "no job: " + JSON.stringify(r.body) };
+      ma.state.onLivedata = null;
+      ok(pj.done && pj.phase === "error" && /became busy/.test(pj.error || ""), "printer became busy before the first command: the job errors 'printer became busy'", pj);
+      ok(moonA.state.gcodeScripts.length === sc0 && ma.state.prints.length === pr0n, "...and NO gcode script and no engine print reached the printer", moonA.state.gcodeScripts.slice(sc0));
+      moonA.state.printState = "standby"; moonA.state.filename = "";
+      ok(await waitState(0, "standby") === "standby", "idle again");
+    }
     r = await jpost("/api/multiace/print", { printer: 0, token: "0".repeat(32), mode: "slicer" });
     ok(r.status === 404, "an unknown token is refused");
     ma.state.failPrint = "rewrite failed: no feasible head assignment";
@@ -539,6 +581,19 @@ function reprintGcode() {
       ok(r.body.sent[0].plan === "reprint" && r.body.sent[0].file === "reprint.gcode" && r.body.sent[0].started === true, "the reprint is recorded (costing reads it)", r.body.sent[0]);
       moonA.state.printState = "standby"; moonA.state.filename = "";
       ok(await waitState(0, "standby") === "standby", "idle again");
+      {
+        // someone starts a print on the touchscreen while the library copy uploads (up to 15 min on a big file)
+        const sc0 = moonA.state.gcodeScripts.length, up0 = moonA.state.uploads.length, sent0 = (await jget("/api/multiace/sent")).body.sent.length;
+        moonA.state.onUpload = (fn, st) => { st.printState = "printing"; st.filename = "touchscreen.gcode"; };
+        r = await jpost("/api/multiace/reprint", { printer: 0, type: "u1", file: "reprint.gcode" });
+        moonA.state.onUpload = null;
+        ok(moonA.state.uploads.length === up0 + 1, "the upload happened (the printer was idle when it began)", moonA.state.uploads.length - up0);
+        ok(r.status === 409 && /became busy/.test(r.body.error || ""), "printer became busy during the upload: reprint refused with 'printer became busy'", r.body);
+        ok(moonA.state.gcodeScripts.length === sc0, "...and no SET_PRINT_EXTRUDER_MAP / SDCARD_PRINT_FILE was sent", moonA.state.gcodeScripts.slice(sc0));
+        ok((await jget("/api/multiace/sent")).body.sent.length === sent0, "...and nothing was recorded as started");
+        moonA.state.printState = "standby"; moonA.state.filename = "";
+        ok(await waitState(0, "standby") === "standby", "idle again");
+      }
       r = await jpost("/api/multiace/preflight", { file: "reprint.gcode", printer: 0, type: "u1" });
       ok(r.status === 400 && /Reprint via multiACE/.test(r.body.error || ""), "Check with multiACE on a processed file points at Reprint via multiACE, never at the normal Print button", r.body);
     }
@@ -561,9 +616,27 @@ function reprintGcode() {
     ok(r.status === 200 && /MULTIACE LOADOUT \(web 1\.00\.1b\+mock, engine api_version 1, mode multi, 2 ACE/.test(r.body.text) && /ACE 1 slot 2: PLA #000000 \(feeding T3\)/.test(r.body.text) && /Air Print Detection off/.test(r.body.text), "the printer context lists the ACE slots, which head each feeds, and Air Print", r.body && (r.body.text || "").split("\n").filter(l => /MULTIACE|ACE 1 slot 2|Air Print/.test(l)));
     r = await jget("/api/sme/context?kind=printer&key=Plain-mock");
     ok(r.status === 200 && !/MULTIACE LOADOUT/.test(r.body.text), "the plain printer's brief has no multiACE section");
+    {
+      const saved = JSON.parse(fs.readFileSync(path.join(tmp, "multiace.json"), "utf8"));
+      ok(Array.isArray(saved.sent) && saved.sent.length > 0 && !fs.readdirSync(tmp).some(n => /^multiace\.json\..*tmp/.test(n)), "multiace.json is whole JSON after the writes, no temp file left behind", fs.readdirSync(tmp).filter(n => /multiace/.test(n)));
+    }
     r = await jget("/api/sme/context?kind=gcode&key=" + encodeURIComponent("u1:" + FILE));
     ok(r.status === 200 && /via multiACE on Davinci-mock .*plan slicer, 5 swaps \(~\+13 min est\.\), ~1\.31 g purge top-up est\., outcome done/.test(r.body.text), "the file's outcome history names the multiACE print", r.body && (r.body.text || "").split("\n").filter(l => /multiACE/.test(l)));
     await stopHub();
+
+    console.log("\n== a corrupt multiace.json is kept aside, not silently reset ==");
+    {
+      const stf = path.join(tmp, "multiace.json"), garbage = '{"sent": [ {"id": "x", truncated';
+      fs.writeFileSync(stf, garbage);
+      await startHub(tmp);
+      const kept = fs.readdirSync(tmp).filter(n => /^multiace\.json\.corrupt-\d+$/.test(n));
+      ok(kept.length === 1 && fs.readFileSync(path.join(tmp, kept[0]), "utf8") === garbage, "the unreadable file is kept as multiace.json.corrupt-<ts>, byte for byte", fs.readdirSync(tmp).filter(n => /multiace/.test(n)));
+      const hl = await hubLog();
+      ok(/multiace: multiace\.json is not valid JSON.*corrupt-\d+/.test(hl), "the Hub log says so and names the copy", hl.split("\n").filter(l => /multiace/.test(l)).slice(-3));
+      r = await jget("/api/multiace/sent");
+      ok(r.status === 200 && Array.isArray(r.body.sent) && r.body.sent.length === 0, "the module starts empty and keeps working", r.body);
+      await stopHub();
+    }
 
     console.log("\n== LITE: multiace stays out of the Lite profile ==");
     await startHub(tmp, { U1HUB_PROFILE: "lite" });

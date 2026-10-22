@@ -42,7 +42,10 @@ function createMock(profile) {
     stallUpload: false,            // 2.42 (H3): accept an upload, then stop reading it and never answer
     stallScripts: false,           // 2.42 (H3): accept a gcode script and never answer
     stallDownload: false,          // 2.43 (H20): start sending a stored file, then stop mid-body
-    held: []                       // requests parked by the two knobs above
+    held: [],                      // requests parked by the two knobs above
+    downloads: [],                 // fork (ryvin/u1hub): every stored-file GET, { name, at } (printer-sync)
+    onDownload: null,              // fork (ryvin/u1hub): (name, state) called as a stored-file GET arrives; null = nothing
+    onUpload: null                 // fork (ryvin/u1hub): (filename, state) called once an upload is stored, before the answer (multiace)
   };
   // Let go of every parked request (the harness calls this after a stall test).
   state.releaseHeld = () => { for (const r of state.held.splice(0)) { try { r.socket && r.socket.destroy(); } catch {} } };
@@ -109,7 +112,7 @@ function createMock(profile) {
       return send(200, { result: { state: "ready", software_version: state.softwareVersion || "v0.12.0-mock", hostname: profile + "-mock", cpu_info: "mock" } });
 
     if (u.pathname === "/server/files/list")
-      return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: Date.now() / 1000, permissions: "rw" })) });
+      return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: f.modified != null ? f.modified : Date.now() / 1000, permissions: "rw" })) });   // fork (ryvin/u1hub): a test may pin modified (printer-sync)
 
     // v2.40.2: download a stored file (copy-to-Hub). Bytes are the file's own
     // `data` when the test gave one, else `size` deterministic bytes.
@@ -117,6 +120,8 @@ function createMock(profile) {
       const name = decodeURIComponent(u.pathname.slice("/server/files/gcodes/".length));
       const f = state.files.find(x => x.name === name);
       if (!f) return send(404, { error: "not found" });
+      state.downloads.push({ name, at: Date.now() });                  // fork (ryvin/u1hub): printer-sync
+      if (typeof state.onDownload === "function") state.onDownload(name, state);   // fork (ryvin/u1hub)
       const body = f.data || Buffer.alloc(f.size || 0, 0x47);
       res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": body.length });
       if (state.stallDownload) {                 // a printer that goes quiet mid-download
@@ -141,6 +146,7 @@ function createMock(profile) {
         const filename = m ? m[1] : "unknown";
         state.uploads.push({ filename, bytes });
         state.files.push({ name: filename, size: bytes });
+        if (typeof state.onUpload === "function") state.onUpload(filename, state);   // fork (ryvin/u1hub)
         send(201, { result: { item: { path: filename } } });
       });
       return;

@@ -18,10 +18,19 @@
 //   3. Never overwrite. A library file with the same name but different bytes
 //      is left alone and listed under `skipped` with the reason, once.
 //   4. Verify the byte count against the printer's listing before the file
-//      takes its final name; a short or long copy is deleted, not kept.
+//      takes its final name; a short or long copy is deleted, not kept. After
+//      SIZE_FAIL_MAX such failures for one (printer, file, listed size,
+//      modified) it is skipped, listed under `skipped`, until that listing
+//      changes (in memory only; a restart tries it twice more).
 //   5. Files in printer subfolders are ignored, the same as the transfer
 //      route: the library is flat.
-//   6. No synchronous fs calls. The pass runs off a timer, and upstream's
+//   6. The printer is asked again, directly (print_stats, no cache), before
+//      EVERY file, and watched while a file streams: a printer that starts
+//      printing mid-pass gets no further request, and a copy in flight is
+//      abandoned (connection closed, .part deleted) within WATCH_MS. A pass can
+//      run for tens of minutes on 100+ MB files; the state at its start says
+//      nothing about the state at its end.
+//   7. No synchronous fs calls. The pass runs off a timer, and upstream's
 //      2026-09-26 finding (CLAUDE.md "feels dead") was a timer doing statSync
 //      on a share: every disk touch here is fs.promises.
 //
@@ -44,6 +53,8 @@ const SYNC_MS = Math.max(5000, parseInt(process.env.U1HUB_SYNC_MS, 10) || 60000)
 const PAUSE_MS = Math.max(0, parseInt(process.env.U1HUB_SYNC_PAUSE_MS, 10) || 2000);
 const LIST_TIMEOUT_MS = 2500;      // same ceiling core/library.js gives a listing
 const FILE_TIMEOUT_MS = 10 * 60 * 1000;
+const WATCH_MS = Math.max(100, parseInt(process.env.U1HUB_SYNC_WATCH_MS, 10) || 5000);   // print-state check while a file streams
+const SIZE_FAIL_MAX = 2;            // size-verified failures before a file is skipped until its listing changes
 const KEEP = 200;                  // synced/error history kept for /api/printer-sync
 const GCODE_RE = /\.(gcode|gco|g)$/i;
 const BUSY_STATES = new Set(["printing", "paused", "unknown"]);
@@ -58,28 +69,50 @@ function fetchJson(url, ms) {
     .finally(() => clearTimeout(to));
 }
 
-// Stream one printer file to `dest`, resolving with the byte count written.
-function download(base, name, dest) {
+// The printer's own print_stats.state, uncached; "unknown" when it does not
+// answer within LIST_TIMEOUT_MS.
+async function livePrintState(base) {
+  try {
+    const d = await fetchJson(base + "/printer/objects/query?print_stats", LIST_TIMEOUT_MS);
+    const ps = d && d.result && d.result.status ? d.result.status.print_stats : null;
+    return ps && ps.state ? String(ps.state) : "unknown";
+  } catch { return "unknown"; }
+}
+
+// Stream one printer file to `dest`, resolving with the byte count written
+// once the file is closed. `ctl.abort(err)` (set here) closes the connection
+// and the file and rejects with `err`; every failure path closes the file
+// before rejecting, so the caller can delete the .part straight away.
+function download(base, name, dest, ctl) {
   return new Promise((resolve, reject) => {
+    let out = null, settled = false, finished = false, bytes = 0, req = null;
+    const fail = e => {
+      if (settled) return;
+      settled = true;
+      try { if (req) req.destroy(); } catch {}
+      if (out && !out.closed) { out.once("close", () => reject(e)); out.destroy(); }
+      else reject(e);
+    };
     const u = new URL(base + "/server/files/gcodes/" + encPath(name));
     const mod = u.protocol === "https:" ? https : http;
-    const req = mod.get(u, res => {
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error("HTTP " + res.statusCode)); }
-      const out = fs.createWriteStream(dest);
-      let bytes = 0;
+    req = mod.get(u, res => {
+      if (res.statusCode !== 200) { res.resume(); return fail(new Error("HTTP " + res.statusCode)); }
+      out = fs.createWriteStream(dest);
       res.on("data", c => { bytes += c.length; });
-      res.on("error", reject);
-      out.on("error", reject);
-      out.on("finish", () => resolve(bytes));
+      res.on("error", fail);
+      out.on("error", fail);
+      out.on("finish", () => { finished = true; });
+      out.on("close", () => { if (finished && !settled) { settled = true; resolve(bytes); } });
       res.pipe(out);
     });
-    req.setTimeout(FILE_TIMEOUT_MS, () => req.destroy(new Error("timeout")));
-    req.on("error", reject);
+    req.setTimeout(FILE_TIMEOUT_MS, () => fail(new Error("timeout")));
+    req.on("error", fail);
+    if (ctl) ctl.abort = fail;
   });
 }
 
 function register(ctx) {
-  const S = { lastRun: 0, running: null, fleet: [], synced: [], errors: [], skipped: {} };
+  const S = { lastRun: 0, running: null, fleet: [], synced: [], errors: [], skipped: {}, sizeFails: new Map() };   // sizeFails: in memory only
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   function fleetRec(idx) { return (S.fleet || []).find(p => p && p.id === idx) || null; }
@@ -94,7 +127,7 @@ function register(ctx) {
     const d = await fetchJson(base + "/server/files/list?root=gcodes", LIST_TIMEOUT_MS);
     return (d.result || [])
       .filter(f => GCODE_RE.test(f.path || "") && !String(f.path).includes("/"))
-      .map(f => ({ name: f.path, size: f.size || 0 }));
+      .map(f => ({ name: f.path, size: f.size || 0, modified: f.modified || 0 }));
   }
 
   // { size } when the library has the file, null when it does not. The
@@ -108,25 +141,45 @@ function register(ctx) {
   }
   async function exists(p) { try { await fsp.access(p); return true; } catch { return false; } }
 
+  // Before every file: a fresh fleet snapshot AND the printer's own answer.
+  async function busyNow(idx, p) {
+    try { S.fleet = await ctx.fleet(); } catch { S.fleet = []; }
+    if (busy(idx)) return true;
+    return BUSY_STATES.has(await livePrintState(String(p.url).replace(/\/+$/, "")));
+  }
+
+  // -> "ok" | "failed" | "busy" (the printer started printing; copy abandoned)
   async function pullOne(p, f, dir) {
     const base = String(p.url).replace(/\/+$/, "");
     const dest = path.join(dir, f.name), part = dest + ".part";
+    const ctl = {};
+    let startedPrinting = false, checking = false;
+    // Only a definite printing/paused aborts: a status query that times out
+    // while the printer is busy serving this very file is no reason to drop it.
+    const watch = setInterval(async () => {
+      if (checking || startedPrinting) return;
+      checking = true;
+      try {
+        const st = await livePrintState(base);
+        if ((st === "printing" || st === "paused") && ctl.abort) { startedPrinting = true; ctl.abort(new Error("printer started printing (" + st + ") - copy abandoned")); }
+      } finally { checking = false; }
+    }, WATCH_MS);
     try {
-      const got = await download(base, f.name, part);
-      if (got !== f.size) throw new Error("size " + got + " != listed " + f.size);
+      const got = await download(base, f.name, part, ctl);
+      if (got !== f.size) { const e = new Error("size " + got + " != listed " + f.size); e.sizeMismatch = true; throw e; }
       if (await exists(dest)) throw new Error("appeared locally mid-copy");
       await fsp.rename(part, dest);
       S.synced.push({ name: f.name, printer: p.name, size: got, at: Date.now() });
       if (S.synced.length > KEEP) S.synced.splice(0, S.synced.length - KEEP);
       ctx.hublog("info", "printer-sync: copied '" + f.name + "' from " + p.name + " (" + got + " bytes)");
-      return true;
+      return "ok";
     } catch (e) {
       try { await fsp.unlink(part); } catch {}
       S.errors.push({ name: f.name, printer: p.name, error: String(e.message || e), at: Date.now() });
       if (S.errors.length > KEEP) S.errors.splice(0, S.errors.length - KEEP);
       ctx.hublog("warn", "printer-sync: '" + f.name + "' from " + p.name + " failed - " + String(e.message || e));
-      return false;
-    }
+      return startedPrinting ? "busy" : (e && e.sizeMismatch ? "size" : "failed");
+    } finally { clearInterval(watch); }
   }
 
   async function pass() {
@@ -151,7 +204,32 @@ function register(ctx) {
           }
           continue;
         }
-        if (await pullOne(p, f, dir)) out.copied.push(f.name);
+        // a file whose download never matches its listed size is tried
+        // SIZE_FAIL_MAX times, then left alone until the printer's listing
+        // for it (size or modified time) changes
+        const fk = idx + "\u0000" + p.name + "\u0000" + f.name;
+        let sf = S.sizeFails.get(fk);
+        if (sf && (sf.size !== f.size || sf.modified !== f.modified)) {
+          S.sizeFails.delete(fk); sf = null;
+          if (S.skipped[f.name] && S.skipped[f.name].sizeNeverMatches) delete S.skipped[f.name];
+        }
+        if (sf && sf.n >= SIZE_FAIL_MAX) {
+          if (!S.skipped[f.name]) {
+            S.skipped[f.name] = { printer: p.name, reason: "size never matches listing (" + sf.n + " attempts)", sizeNeverMatches: true, at: Date.now() };
+            out.skipped.push(f.name);
+          }
+          continue;
+        }
+        if (await busyNow(idx, p)) {
+          out.busy.push(p.name);
+          ctx.hublog("info", "printer-sync: " + p.name + " is busy now - no more files from it this pass (next was '" + f.name + "')");
+          break;
+        }
+        const got = await pullOne(p, f, dir);
+        if (got === "size") S.sizeFails.set(fk, { size: f.size, modified: f.modified, n: (sf ? sf.n : 0) + 1 });
+        else if (got === "ok") S.sizeFails.delete(fk);
+        if (got === "ok") out.copied.push(f.name);
+        if (got === "busy") { out.busy.push(p.name); break; }
         await sleep(PAUSE_MS);
       }
     }

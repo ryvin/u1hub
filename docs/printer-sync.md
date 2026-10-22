@@ -17,9 +17,21 @@ Feature flag `printer-sync`. It ships **on** since its live gate passed on
 3. It never overwrites. If the library already has a file with the same name but
    different bytes, that file is left alone and reported once under `skipped`.
 4. The byte count is checked against the printer's listing before the copy takes
-   its final name. A short or long copy is deleted, not kept.
+   its final name. A short or long copy is deleted, not kept. After 2 such failures
+   for the same printer, file name, listed size and modified time, the file is no
+   longer requested and is listed under `skipped` ("size never matches listing (2
+   attempts)") until the printer's listing for it changes. Remembered in memory only,
+   so a Hub restart allows two more attempts.
 5. Files in printer subfolders are ignored, because the library is flat.
-6. No synchronous filesystem calls. The pass runs off a timer, and upstream found on
+6. The print state is asked again before **every** file: a fresh fleet snapshot and
+   the printer's own `print_stats.state` (uncached; no answer counts as busy). A
+   printer that starts printing mid-pass gets no further request that pass. While a
+   file streams, `print_stats` is polled every `U1HUB_SYNC_WATCH_MS` (default 5 s);
+   `printing` or `paused` closes the connection, deletes the `.part` and records the
+   error `printer started printing … copy abandoned` (a status query that merely times
+   out does not abort, since the printer may be slow serving that very file). Added
+   2026-10-21: a pass can run for tens of minutes on 100+ MB files.
+7. No synchronous filesystem calls. The pass runs off a timer, and upstream found on
    2026-09-26 that a timer doing `statSync` on a share can stall the whole Hub.
 
 ## API

@@ -532,10 +532,39 @@ function register(ctx) {
   const ACE = new Map();       // idx -> { at, ace }
   const REPORTS = new Map();   // token -> { idx, file, fp, name, slug, report, facts, at }
   const JOBS = new Map();      // hub job id -> { kind, phase, sent, total, done, error, result, ts, ... }
+  // Boot read (sync, once, local state). A file that does not parse is NOT
+  // silently replaced by the next save: it is moved aside as
+  // multiace.json.corrupt-<ts> (copied if the rename is refused) and logged,
+  // so the send history it held can still be recovered by hand.
   let S = { sent: [] };
-  try { S = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) || S; if (!Array.isArray(S.sent)) S.sent = []; } catch {}
+  let raw = null;
+  try { raw = fs.readFileSync(STATE_FILE, "utf8"); }
+  catch (e) { if (e.code !== "ENOENT") ctx.hublog("warn", "multiace: could not read multiace.json - " + e.message); }
+  if (raw != null) {
+    try { const j = JSON.parse(raw); if (j && typeof j === "object" && !Array.isArray(j)) S = j; }
+    catch (e) {
+      const keep = STATE_FILE + ".corrupt-" + Date.now();
+      try { fs.renameSync(STATE_FILE, keep); } catch { try { fs.writeFileSync(keep, raw); } catch {} }
+      ctx.hublog("warn", "multiace: multiace.json is not valid JSON (" + e.message + "); kept it as " + path.basename(keep) + " and started empty");
+    }
+  }
+  if (!Array.isArray(S.sent)) S.sent = [];
+  // Same shape as costing.js writeState / dispatch.js save(): tmp+rename where
+  // the filesystem allows it, a direct write where it refuses
+  // rename-over-existing (a share), latched so the warning prints once.
+  // Serialised: one write at a time, in call order.
+  let SAVE_FALLBACK = false;
+  async function writeState() {
+    const data = JSON.stringify(S, null, 2), tmp = STATE_FILE + ".tmp";
+    if (!SAVE_FALLBACK) {
+      try { await fsp.writeFile(tmp, data); await fsp.rename(tmp, STATE_FILE); return; }
+      catch (e) { SAVE_FALLBACK = true; ctx.hublog("warn", "multiace: atomic save failed (" + e.code + " " + e.message + ") - direct writes for the rest of this run"); }
+    }
+    await fsp.writeFile(STATE_FILE, data);
+    try { await fsp.unlink(tmp); } catch {}
+  }
   let saving = Promise.resolve();
-  const save = () => { saving = saving.then(() => fsp.writeFile(STATE_FILE, JSON.stringify(S, null, 2))).catch(e => ctx.hublog("warn", "multiace: state write failed - " + e.message)); return saving; };
+  const save = () => { saving = saving.then(writeState).catch(e => ctx.hublog("warn", "multiace: state write failed - " + e.message)); return saving; };
 
   const printers = () => ctx.printers || [];
   const baseOf = idx => { const p = printers()[idx]; return p && p.url ? String(p.url).replace(/\/+$/, "") : null; };
@@ -620,7 +649,41 @@ function register(ctx) {
 
   // ---- routes ----
   const bad = (res, code, error, extra) => res.status(code).json({ error, ...(extra || {}) });
-  const printerOf = req => { const idx = Number((req.body || {}).printer ?? (req.query || {}).printer); return Number.isInteger(idx) && printers()[idx] ? idx : null; };
+  // A printer index is a whole number or a string of digits, nothing else:
+  // Number("") / Number(false) / Number(" ") are 0, which used to make an
+  // empty field mean "printer 0".
+  const printerOf = req => {
+    const b = req.body || {}, q = req.query || {};
+    const v = b.printer !== undefined && b.printer !== null ? b.printer : q.printer;
+    let idx = null;
+    if (typeof v === "number") idx = v;
+    else if (typeof v === "string" && /^\d{1,4}$/.test(v)) idx = Number(v);
+    return Number.isInteger(idx) && idx >= 0 && printers()[idx] ? idx : null;
+  };
+  // The printer's own print_stats.state, uncached ("unknown" when it does not
+  // answer). The fleet snapshot can be seconds old; this is what a command is
+  // gated on right before it goes out.
+  async function livePrintState(base) {
+    try {
+      const r = await jget(base + "/printer/objects/query?print_stats", TIMEOUT_MS);
+      const ps = r.status === 200 && r.body && r.body.result && r.body.result.status ? r.body.result.status.print_stats : null;
+      return ps && ps.state ? String(ps.state) : "unknown";
+    } catch { return "unknown"; }
+  }
+  const LIVE_BUSY = new Set(["printing", "paused", "unknown"]);
+  // Re-read everything and re-run the checks right before a state-changing
+  // command (an upload or the engine can take minutes; someone may start a
+  // print on the touchscreen meanwhile). -> null when clear, else the refusal.
+  async function stillClear(idx, facts) {
+    const s = await snapshot(idx, true);
+    if (!s.multiace) return "printer state changed since the check: it no longer answers as multiACE";
+    const reasons = checks(s, facts);
+    const live = await livePrintState(s.probe.url);
+    if (LIVE_BUSY.has(live)) reasons.unshift({ code: "busy", text: live === "unknown" ? "the printer did not report its print state" : "the printer is " + live });
+    if (!reasons.length) return null;
+    const busy = reasons.some(r => r.code === "busy" || r.code === "offline");
+    return (busy ? "printer became busy" : "printer state changed since the check") + " - nothing sent: " + reasons.map(r => r.text).join("; ");
+  }
   const fileOf = (req) => {
     const b = req.body || {};
     const slug = String(b.type || "u1"), name = path.basename(String(b.file || ""));
@@ -773,6 +836,9 @@ function register(ctx) {
     (async () => {
       const base = s.probe.url;
       try {
+        // the route's check ran before the answer went out; check again right before the first command
+        const why = await stillClear(idx, rec.facts);
+        if (why) throw new Error(why);
         if (conf().identity_map) {
           const lines = [0, 1, 2, 3].map(i => "SET_PRINT_EXTRUDER_MAP CONFIG_EXTRUDER=" + i + " MAP_EXTRUDER=" + i);
           lines.push("SET_PRINT_USED_EXTRUDERS EXTRUDERS=" + (heads.length ? heads : [0, 1, 2, 3]).join(","));
@@ -780,6 +846,8 @@ function register(ctx) {
           if (!r.ok) throw new Error("identity extruder map refused (" + r.status + "): " + (await r.text()).slice(0, 160));
         }
         job.phase = "engine";
+        const live = await livePrintState(base);
+        if (LIVE_BUSY.has(live)) throw new Error("printer became busy - nothing sent to the engine: " + (live === "unknown" ? "the printer did not report its print state" : "the printer is " + live));
         const body = { token: report.token, mode, bed_mesh: !!b.bed_mesh, camera: !!b.camera, flow_cal: !!b.flow_cal };
         if (remap) body.remap = remap;
         const r = await jpost(base + "/multiace/api/preflight/print", body, 30000);
@@ -891,11 +959,23 @@ function register(ctx) {
         if (up.status !== 200 && up.status !== 201) throw new Error("upload refused (" + up.status + ")");
         uploaded = true;
       }
+      // the upload can take minutes: re-read the printer and re-run the checks before any command
+      const why = await stillClear(idx, null);
+      if (why) {
+        ctx.hublog("warn", "multiace[" + p.name + "]: reprint " + f.name + " - " + why);
+        return res.status(409).json({ error: why, uploaded });
+      }
       const heads = view.heads.length ? view.heads : [0, 1, 2, 3];
       const lines = [0, 1, 2, 3].map(i => "SET_PRINT_EXTRUDER_MAP CONFIG_EXTRUDER=" + i + " MAP_EXTRUDER=" + i);
       lines.push("SET_PRINT_USED_EXTRUDERS EXTRUDERS=" + heads.join(","));
       const r1 = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent(lines.join("\n")), { method: "POST" });
       if (!r1.ok) throw new Error("identity extruder map refused (" + r1.status + ")");
+      const live = await livePrintState(base);
+      if (LIVE_BUSY.has(live)) {
+        const msg = "printer became busy - the file was not started: " + (live === "unknown" ? "the printer did not report its print state" : "the printer is " + live);
+        ctx.hublog("warn", "multiace[" + p.name + "]: reprint " + f.name + " - " + msg);
+        return res.status(409).json({ error: msg, uploaded });
+      }
       const r2s = await fetch(base + "/printer/gcode/script?script=" + encodeURIComponent('SDCARD_PRINT_FILE FILENAME="' + f.name.replace(/"/g, "") + '"'), { method: "POST" });
       if (!r2s.ok) throw new Error("start refused (" + r2s.status + "): " + (await r2s.text()).slice(0, 160));
       const sent = { id: newJobId(), printer_id: idx, printer: p.name, file: f.name, type: f.slug, plan: "reprint", swaps: null, tool_changes: 0, est_added_sec: 0,

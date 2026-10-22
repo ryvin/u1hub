@@ -217,11 +217,21 @@ escalate once → merge lessons) → `POST /api/sme/reviews` (with
   the queue for 6 h (`U1HUB_SME_ERROR_BACKOFF_MS`); nothing is stored.
 - **Log**: `sme-runner.log`; state `sme-runner.json`; all three beside the
   repo (`SME_STATE_DIR`), gitignored.
-- **Token**: `SME_TOKEN`, else `GET /api/sme/token` from the Hub on the same
-  PC. The token is generated at first boot into `config.json` → `sme.token`
-  (never echoed by `/api/config`), shown in Settings → 3D-printing SME, and
-  required on every write (`POST /api/sme/reviews|errors|runs|lessons/sync`),
-  because the Hub is reachable on the LAN without a login.
+- **Token**: `SME_TOKEN`, else `sme.token` read from the Hub's `config.json`
+  (`SME_HUB_CONFIG`, else `$U1HUB_DIR/config.json`, `data/config.json` — the
+  Docker deploy — then `config.json` beside the repo), else
+  `GET /api/sme/token`, which answers only while the Hub has no login. The
+  token is generated at first boot into `config.json` → `sme.token` (never
+  echoed by `/api/config`), shown in Settings → 3D-printing SME, and the
+  runner sends it as `X-SME-Token` on **every** request. It is required on
+  every write (`POST /api/sme/reviews|errors|runs|lessons/sync`) in any mode.
+  **With a Hub password** (or proxy / forward auth) the runner has no session,
+  so `auth.js` lets exactly the runner's routes through on a valid token
+  (constant-time, checked by `modules/sme.js`): `GET status, queue, context,
+  lessons/feedback` and the four POSTs above. Nothing else opens with it —
+  not `/api/sme/token` (needs a login), not the SME tab's own routes, not any
+  other Hub route. A runner without a valid token logs that the Hub has a
+  login and how to give it the token, and exits 0. Open mode is unchanged.
 
 ### Local sources (runner-side, read-only, optional)
 
@@ -307,7 +317,7 @@ All under `/api/sme`; absent (404) when the feature is off. Writes need
 | GET | `/lessons/feedback?after` | outcome feedback the Hub queued for the shared store |
 | POST | `/lessons/sync` | `{ lessons, feedback_through }` replaces the mirror, acknowledges feedback |
 | GET | `/status` | counts, totals, last run(s), last error, pause, tier thresholds, schedule lines |
-| GET | `/token` | the runner token (behind the Hub login like every route) |
+| GET | `/token` | the runner token (behind the Hub login like every route; never opened by the token itself) |
 
 ## State
 

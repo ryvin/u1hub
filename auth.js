@@ -174,10 +174,12 @@ module.exports = function mountAuth(app, express, baseDir, assetDir) {
   const ALLOW = new Set(["/auth.html", "/manifest.json", "/sw.js",
                          "/icon-192.png", "/icon-512.png", "/favicon.ico",
                          "/api/models/print-request"]);
+  const SME_RUNNER = new Set(["GET /api/sme/status", "GET /api/sme/queue", "GET /api/sme/context", "GET /api/sme/lessons/feedback", "POST /api/sme/reviews", "POST /api/sme/errors", "POST /api/sme/runs", "POST /api/sme/lessons/sync"]);   // fork (ryvin/u1hub): the SME runner's routes, exact method + path
   app.use((req, res, next) => {
     const p = req.path;
     if (ALLOW.has(p) || p.startsWith("/api/auth/") || (p.startsWith("/api/quote-backend/") && !/\.\.|%2e/i.test(req.originalUrl) && req.get("X-Quote-Key"))) return next();   // fork (ryvin/u1hub): the public quote service; modules/estimate/quote-backend.js checks the key; no dot-segments, so the header never reaches express.static
     if (isAuthed(req)) return next();
+    if (SME_RUNNER.has(req.method + " " + p) && !/\.\.|%2e/i.test(p) && typeof req.app.locals.smeTokenOk === "function" && req.app.locals.smeTokenOk(req)) return next();   // fork (ryvin/u1hub): the scheduled SME runner has no session; a valid X-SME-Token (checked constant-time by modules/sme.js, absent when it is off) opens those routes only, never /api/sme/token
     if (p.startsWith("/api/")) return res.status(401).json({ error: "Not logged in" });
     res.redirect(302, "/auth.html");
   });
