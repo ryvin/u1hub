@@ -184,7 +184,7 @@ skips it).
 ## The runner (`scripts/sme-runner.js`)
 
 ```
-node scripts/sme-runner.js                          # the next SME_BATCH targets (4 by hand; the scheduled task passes SME_BATCH=1 since 2026-10-05: 24/day, to save tokens)
+node scripts/sme-runner.js                          # the next SME_BATCH targets (4 by hand; the scheduled task runs once a day with SME_BATCH=4 since 2026-10-21)
 node scripts/sme-runner.js --dry-run                # build the prompts, call and store nothing
 node scripts/sme-runner.js --kind gcode --key "u1:file.gcode" [--force]
 node scripts/sme-runner.js --refresh-knowledge      # monthly: rewrite knowledge.md with web research
@@ -257,9 +257,10 @@ powershell -ExecutionPolicy Bypass -File scripts\sme-schedule-install.ps1 -Unins
 ```
 
 Two tasks as the current user, only while logged on (the subscription login
-lives in that user's WSL home): **"U1 Hub SME review"** hourly at :50 (a minute no other task on this PC uses;
-the Channel-* and Snapmaker-* Claude jobs sit on :00-:45), running
-`wsl.exe -e bash -lc "cd /mnt/e/Code/u1hub && node scripts/sme-runner.js"`,
+lives in that user's WSL home): **"U1 Hub SME review"** once a day at 02:50
+with 4 reviews per run (since 2026-10-21; `-Every hourly` restores the old
+hourly-at-:50 schedule with 1 per run, `-At HH:mm` and `-Batch N` override),
+running `wsl.exe -e bash -lc "cd /mnt/e/Code/u1hub && SME_BATCH=4 node scripts/sme-runner.js"`,
 and **"U1 Hub SME knowledge refresh"** on the 1st of every month at 03:50
 with `--refresh-knowledge`. Written, not run, in the commit that introduced
 it (**UNVERIFIED** on Windows — to confirm: run the install line, then
