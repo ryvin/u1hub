@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- U1 Print Hub — index v2.44.0 -->
+<!-- U1 Print Hub — index v2.45.4 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -397,6 +397,14 @@
   .btn.primary{background:var(--signal); color:var(--on-accent);} .btn.primary:hover{filter:brightness(1.06);}
   .btn.ghost{background:transparent; color:var(--ink); border-color:var(--field);} .btn.ghost:hover{border-color:var(--ink-dim);}
   .btn:disabled{opacity:.4; cursor:default;}
+  /* H14 (2.45): a command in flight. The tapped button keeps its own color and shows a
+     spinner drawn in currentColor; no new token. */
+  .btn.busy{position:relative; color:transparent !important; opacity:.8;}
+  .btn.busy::after{content:""; position:absolute; left:50%; top:50%; width:12px; height:12px; margin:-7px 0 0 -7px; border-radius:50%;
+    border:2px solid var(--ink); border-right-color:transparent; animation:btnspin .7s linear infinite;}
+  .btn.primary.busy::after{border-color:var(--on-accent); border-right-color:transparent;}
+  .btn.danger.busy::after{border-color:var(--bad); border-right-color:transparent;}
+  @keyframes btnspin{to{transform:rotate(360deg);}}
   .pstatus{font-family:var(--mono); font-size:11px; min-height:14px;}
   .pstatus.ok{color:var(--ok);} .pstatus.err{color:var(--bad);} .pstatus.work{color:var(--signal);}
   .progress{height:4px; border-radius:3px; background:var(--panel-2); overflow:hidden;}
@@ -651,7 +659,15 @@
         <label class="fl" style="margin-top:18px">Access <span class="hint" id="authHint">checking…</span></label>
         <div class="row" style="margin-top:6px">
           <button class="btn ghost" id="manageAuth">Manage access</button>
+          <button class="btn ghost" id="authSignoutAll" title="Retire every session on every device, this one included">Sign out everywhere</button>
+          <span class="pstatus" id="authMsg"></span>
         </div>
+        <!-- H24 (2.45): the proxies whose forwarded headers the Hub believes -->
+        <div class="row" style="margin-top:8px">
+          <input class="field" id="authProxies" placeholder="trusted proxies, e.g. 127.0.0.1, 10.0.0.0/24 (blank = loopback only)" style="max-width:420px" />
+          <button class="btn ghost" id="authProxiesSave">Save proxies</button>
+        </div>
+        <div class="hint" style="margin-top:5px">Only a connection from one of these addresses may claim a visitor address (cf-connecting-ip, x-forwarded-for) or a forward-auth identity header. Leave blank unless your tunnel or proxy runs on another machine.</div>
 
         <label class="fl" style="margin-top:18px">Remote access <span class="hint" id="tunHint">checking…</span></label>
         <div class="row" id="tunUrlRow" style="margin-top:6px; display:none">
@@ -790,7 +806,7 @@
 })();
 </script>
 
-<script>const VERSION = "2.44.0";</script>
+<script>const VERSION = "2.45.4";</script>
 <script src="app.js"></script>
 <!-- @client-modules -->
 </body>

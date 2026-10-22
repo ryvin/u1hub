@@ -87,5 +87,19 @@ check("gold.css: .topbar wraps at desktop widths", rulesFor(desktopCss, ".topbar
 check("gold.css: .viewtabs wraps at desktop widths", rulesFor(desktopCss, ".viewtabs").some(b => /flex-wrap\s*:\s*wrap/.test(b)));
 check("gold.css: .viewtabs may shrink below its content (min-width:0)", rulesFor(desktopCss, ".viewtabs").some(b => /min-width\s*:\s*0/.test(b)));
 
+// ---- 3. 2.45 config schema and nightly backups know the fork's state --------
+// core/config.js CONFIG_SCHEMA warns on unknown top-level keys; core/health.js
+// STATE_FILES is what the nightly backup copies. Both are upstream lists with
+// a marked fork touch point.
+const CFGSRC = fs.readFileSync(path.join(ROOT, "core", "config.js"), "utf8").replace(/\r\n/g, "\n");
+const sm = /const CONFIG_SCHEMA = (\{[\s\S]*?\});/.exec(CFGSRC);
+check("config.js CONFIG_SCHEMA found", !!sm);
+const SCHEMA = sm ? vm.runInNewContext("(" + sm[1] + ")") : {};
+for (const k of ["costing", "estimate", "multiace", "sme", "bl2u1"])
+  check("config schema knows the fork key \"" + k + "\" as an object (no unknown-key warning at boot)", SCHEMA[k] === "object", String(SCHEMA[k]));
+const { STATE_FILES } = require(path.join(ROOT, "core", "health.js"));
+for (const f of ["prints.json", "projects.json", "estimate-store.json", "estimate-calibration.json", "multiace.json", "sme-lessons.json"])
+  check("nightly backup copies the fork state file " + f, STATE_FILES.includes(f));
+
 console.log(`\nfork-ui: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

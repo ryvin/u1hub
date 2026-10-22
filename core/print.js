@@ -5,6 +5,8 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { Transform } = require("stream");
+const { printerUrl } = require("./util.js");
+const { readSpools } = require("./spools.js");
 
 module.exports = function (hub) {
 const { BASE_DIR, app, dequeueFile, detectCaps, fileContentHash, fmem, hublog, paletteForFile, reqTypeOf, safeFile } = hub;
@@ -155,6 +157,28 @@ const JOBS = new Map();   // jobId -> { phase, sent, total, done, error, result,
 
 const newJobId = () => "j" + Date.now() + Math.random().toString(16).slice(2, 6);
 
+// H12 (2.45): the map only ever shrank when /api/print-status read a finished
+// job, so a page that closed mid-push, or one that never polled (Dispatch's
+// clear-bed, the harness), left its record forever. Sweep: a finished job
+// older than JOB_TTL_MS goes; one still "running" after JOB_STUCK_MS is marked
+// failed first (every printer call is bounded, so that long means a lost
+// handler) and goes on the next pass. Env-tunable so the harness can watch it.
+const JOB_TTL_MS = Math.max(1000, Number(process.env.U1HUB_JOB_TTL_MS) || 30 * 60000);
+const JOB_STUCK_MS = Math.max(JOB_TTL_MS, 6 * 3600000);
+const JOB_SWEEP_MS = Math.max(200, Math.min(60000, Math.round(JOB_TTL_MS / 2)));
+function sweepJobs(now) {
+  now = now || Date.now();
+  let swept = 0;
+  for (const [id, j] of JOBS) {
+    const age = now - (j.ts || 0);
+    if (j.done && age > JOB_TTL_MS) { JOBS.delete(id); swept++; continue; }
+    if (!j.done && age > JOB_STUCK_MS) { j.done = true; j.error = j.error || "gave up - no result after " + Math.round(JOB_STUCK_MS / 3600000) + " h"; }
+  }
+  return swept;
+}
+const jobSweeper = setInterval(() => sweepJobs(), JOB_SWEEP_MS);
+if (jobSweeper.unref) jobSweeper.unref();
+
 
 // v2.10 — filament memory recall. Hashes the local file's CONTENT and looks
 // up the last completed loadout for those bytes. Rename-proof: the same file
@@ -172,8 +196,7 @@ app.get("/api/filament-memory", async (req, res) => {
   catch (e) { return res.status(500).json({ error: "Could not hash file: " + e.message }); }
   const rec = fmem()[hash];
   if (!rec) return res.json({ known: false, hash });
-  let cur = {};
-  try { cur = (JSON.parse(fs.readFileSync(path.join(BASE_DIR, "spools.json"), "utf8")) || {}).spools || {}; } catch {}
+  const cur = readSpools(BASE_DIR).spools;
   const spools = (rec.spools || []).map(s => {
     const live = cur[s.spool_id];
     return live
@@ -270,7 +293,7 @@ app.post("/api/print", async (req, res) => {
     }
   } catch {} // guard is advisory — never let sniffing break a legitimate send
 
-  const base = String(p.url).replace(/\/+$/, "");
+  const base = printerUrl(p);
   const name = path.basename(fp);
   const gcode = async script => {
     const r = await fetchWithTimeout(base + "/printer/gcode/script?script=" + encodeURIComponent(script), { method: "POST" });
@@ -358,7 +381,7 @@ app.post("/api/printctl", async (req, res) => {
   if (!p) return res.status(400).json({ error: "Unknown printer" });
   const cmd = { pause: "PAUSE", resume: "RESUME", cancel: "CANCEL_PRINT" }[action];
   if (!cmd) return res.status(400).json({ error: "Bad action" });
-  const base = String(p.url).replace(/\/+$/, "");
+  const base = printerUrl(p);
   try {
     const r = await fetchWithTimeout(base + "/printer/gcode/script?script=" + encodeURIComponent(cmd), { method: "POST" });
     if (!r.ok) return res.status(502).json({ error: "Moonraker " + r.status + ": " + (await r.text()).slice(0, 160) });
@@ -373,7 +396,7 @@ app.post("/api/printctl", async (req, res) => {
 app.get("/api/plate", async (req, res) => {
   const p = hub.PRINTERS[req.query.printer];
   if (!p) return res.status(400).json({ error: "Unknown printer" });
-  const base = String(p.url).replace(/\/+$/, "");
+  const base = printerUrl(p);
   try {
     const r = await fetchWithTimeout(base + "/printer/objects/query?exclude_object", { method: "GET" });
     if (!r.ok) return res.status(502).json({ error: "Moonraker " + r.status });
@@ -394,7 +417,7 @@ app.post("/api/exclude", async (req, res) => {
   const p = hub.PRINTERS[printer];
   if (!p) return res.status(400).json({ error: "Unknown printer" });
   if (!name || /["\r\n]/.test(name)) return res.status(400).json({ error: "Bad object name" });
-  const base = String(p.url).replace(/\/+$/, "");
+  const base = printerUrl(p);
   try {
     const r = await fetchWithTimeout(base + "/printer/gcode/script?script=" + encodeURIComponent(`EXCLUDE_OBJECT NAME=${name}`), { method: "POST" });
     if (!r.ok) return res.status(502).json({ error: "Moonraker " + r.status + ": " + (await r.text()).slice(0, 160) });

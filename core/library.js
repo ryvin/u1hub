@@ -5,6 +5,7 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { parseGcodeMap } = require("../parser");
+const { printerUrl } = require("./util.js");
 
 module.exports = function (hub) {
 const { ACCENT_PRESETS, app, onModule, plogOf, reqTypeOf, safeFile, saveConfigFile, savePrintLog, saveQueue, slugify, typeBySlug, typeFolder } = hub;
@@ -46,7 +47,9 @@ app.post("/api/types", (req, res) => {
     return res.status(400).json({ error: "Type folder must be a direct subfolder of the gcode base" });
   try { fs.mkdirSync(dir, { recursive: true }); }
   catch (e) { return res.status(500).json({ error: "Could not create folder " + dir + " — " + e.message }); }
-  hub.TYPES.push(rec); hub.CFG.types = hub.TYPES; saveConfigFile();
+  hub.TYPES.push(rec); hub.CFG.types = hub.TYPES;
+  // H15 (2.45): a type that did not land on disk is not "ok".
+  if (!saveConfigFile()) return res.status(500).json({ error: hub.saveConfigError() });
   res.json({ ok: true, type: { ...rec, folder: dir } });
 });
 
@@ -59,7 +62,8 @@ app.post("/api/types/update", (req, res) => {
   const b = req.body || {};
   if (typeof b.label === "string" && b.label.trim()) t.label = b.label.trim();
   if (typeof b.accent === "string" && /^#[0-9a-fA-F]{6}$/.test(b.accent.trim())) t.accent = b.accent.trim().toUpperCase();
-  hub.CFG.types = hub.TYPES; saveConfigFile();
+  hub.CFG.types = hub.TYPES;
+  if (!saveConfigFile()) return res.status(500).json({ error: hub.saveConfigError() });
   res.json({ ok: true, type: t });
 });
 
@@ -78,7 +82,7 @@ app.post("/api/types/delete", (req, res) => {
   hub.QUEUE = hub.QUEUE.filter(e => e.type !== slug);
   if (hub.QUEUE.length !== qBefore) saveQueue();
   delete hub.TYPE_WARNINGS[slug];
-  saveConfigFile();
+  if (!saveConfigFile()) return res.status(500).json({ error: hub.saveConfigError() });
   res.json({ ok: true, note: "Folder and gcode files were preserved on disk." });
 });
 }); // end onModule("types-beta")
@@ -198,7 +202,7 @@ app.get("/api/files", async (req, res) => {
 // upload 201 / move 200 / delete 200) come in a later slice and will honor
 // each file's `permissions` flag rather than assuming everything is writable.
 async function listOnboard(p) {
-  const base = String(p.url).replace(/\/+$/, "");
+  const base = printerUrl(p);
   const ctrl = new AbortController();
   // v2.23 PERF: 2.5 s, was 5. One slow printer held the whole nine-printer
   // listing (and a browser connection) to the full timeout on every poll.
@@ -402,7 +406,7 @@ async function printerFileOpGuard(req, res) {
   if (!p) { res.status(400).json({ error: "Unknown printer" }); return null; }
   const name = cleanRel((req.body || {}).name);
   if (!name) { res.status(400).json({ error: "Bad file name" }); return null; }
-  const base = String(p.url).replace(/\/+$/, "");
+  const base = printerUrl(p);
   const ps = await queryPrintStats(base);
   if ((ps.state === "printing" || ps.state === "paused") && ps.filename === name) {
     res.status(409).json({ error: "REFUSED: '" + name + "' is the ACTIVE print on " + p.name + " (state: " + ps.state + "). The Hub will not touch a file that is printing." });
@@ -529,8 +533,8 @@ app.post("/api/printer-files/transfer", async (req, res) => {
   const name = cleanRel((req.body || {}).name);
   if (!name) return res.status(400).json({ error: "Bad file name" });
   if (name.includes("/")) return res.status(400).json({ error: "Files in subfolders can't be transferred yet" });
-  const srcBase = String(src.url).replace(/\/+$/, "");
-  const dstBase = String(dst.url).replace(/\/+$/, "");
+  const srcBase = printerUrl(src);
+  const dstBase = printerUrl(dst);
   try {
     const [srcFiles, dstFiles] = await Promise.all([listOnboard(src), listOnboard(dst)]);
     const f = srcFiles.find(x => x.name === name);
@@ -593,7 +597,7 @@ app.post("/api/printer-files/to-hub", async (req, res) => {
   const part = dest + ".u1hub-part";
   (async () => {
     try {
-      const srcBase = String(src.url).replace(/\/+$/, "");
+      const srcBase = printerUrl(src);
       // 2.43 (H20): same bounds as a printer-to-printer transfer. On a stall
       // the request is torn down and the .u1hub-part handle closed BEFORE the
       // catch below deletes it (Windows refuses to delete an open file).

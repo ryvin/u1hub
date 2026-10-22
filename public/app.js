@@ -2193,9 +2193,9 @@ function renderFleet(){
       <div class="foot">
         ${busy
           ? (p.state==="paused"
-                ? `<button class="btn ghost" data-ctl="${p.id}" data-act="resume">Resume</button>`
-                : `<button class="btn ghost" data-ctl="${p.id}" data-act="pause">Pause</button>`)
-            + `<button class="btn danger" data-ctl="${p.id}" data-act="cancel">Cancel</button>`
+                ? ctlBtn(p.id,"resume","Resume","ghost")
+                : ctlBtn(p.id,"pause","Pause","ghost"))
+            + ctlBtn(p.id,"cancel","Cancel","danger")
             + (p.plate&&p.plate.total>1?`<button class="btn ghost" data-plate="${p.id}">Plate ${p.plate.total-p.plate.excluded}/${p.plate.total}</button>`:"")
           : `<button class="btn ghost" ${canSend?"":"disabled"} data-id="${p.id}" data-start="0">Upload</button>`
             + `<button class="btn primary" ${canSend?"":"disabled"} data-id="${p.id}" data-start="1">Print</button>`
@@ -2480,16 +2480,40 @@ async function setColor(printer, slot, hex, material){
   }catch(e){ if(st){ st.className="pstatus err"; st.textContent=e.message; } }
 }
 
+// H14 (2.45): a pause/resume/cancel in flight is remembered per printer, so
+// the card's buttons stay disabled (and the tapped one keeps its spinner)
+// across the fleet re-renders that happen while the printer answers. A
+// second tap used to send a second command.
+const CTLBUSY=new Map();   // printer id -> action in flight
+function ctlBtn(id, act, label, kind){
+  const cur=CTLBUSY.get(id);
+  const mine=cur===act;
+  return `<button class="btn ${kind}${mine?" busy":""}" data-ctl="${id}" data-act="${act}"${cur?" disabled":""}>${label}</button>`;
+}
+function ctlSetBusy(printer, act){
+  const card=document.querySelector('.pcard[data-printer="'+printer+'"]'); if(!card) return;
+  card.querySelectorAll("button[data-ctl]").forEach(b=>{
+    b.disabled=!!act;
+    b.classList.toggle("busy", !!act && b.dataset.act===act);
+  });
+}
 async function ctl(printer, act){
   if(act==="cancel" && !confirm("Cancel this print? This can't be undone.")) return;
+  if(CTLBUSY.has(printer)) return;
   const st=$("pst-"+printer);
   if(st){ st.className="pstatus work"; st.textContent={pause:"Pausing…",resume:"Resuming…",cancel:"Cancelling…"}[act]; }
+  CTLBUSY.set(printer, act); ctlSetBusy(printer, act);
   try{
     const r=await fetch("/api/printctl",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({printer,action:act})});
     const d=await r.json(); if(!r.ok||d.error) throw new Error(d.error||("HTTP "+r.status));
+    CTLBUSY.delete(printer);
     if(st){ st.className="pstatus ok"; st.textContent={pause:"Paused",resume:"Resumed",cancel:"Cancelled"}[act]; }
     loadFleet();
-  }catch(e){ if(st){ st.className="pstatus err"; st.textContent=e.message; } }
+  }catch(e){
+    // Re-enable on error and say why on the card's own status line.
+    CTLBUSY.delete(printer); ctlSetBusy(printer, null);
+    if(st){ st.className="pstatus err"; st.textContent=e.message; }
+  }
 }
 
 // ---- Plate map (exclude-object) ----
@@ -2695,8 +2719,39 @@ async function refreshAuthLine(){
       a.mode === "proxy"    ? "proxy mode — gate off, your reverse proxy handles auth" :
       a.mode === "forward"  ? "forward-auth — identity comes from your proxy" :
                               "open — anyone who can reach this Hub can use it";
+    // H24: the trusted-proxy list is editable here; "sign out everywhere"
+    // only means something when the Hub itself holds the sessions.
+    if (Array.isArray(a.trusted_proxies) && document.activeElement !== $("authProxies")) $("authProxies").value = a.trusted_proxies.join(", ");
+    $("authSignoutAll").disabled = a.mode !== "password";
+    $("authSignoutAll").title = a.mode === "password" ? "Retire every session on every device, this one included" : "Only in password mode - the Hub holds no sessions in " + a.mode + " mode";
   }catch{ $("authHint").textContent = ""; }
 }
+// H24 (2.45): trusted proxies, saved through the setup route without a mode
+// so nothing else about access changes.
+$("authProxiesSave").addEventListener("click", async ()=>{
+  const st = $("authMsg");
+  const list = $("authProxies").value.split(/[,\s]+/).map(x=>x.trim()).filter(Boolean);
+  st.className="pstatus"; st.textContent="Saving…";
+  try{
+    const r = await fetch("/api/auth/setup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ trusted_proxies: list })});
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.error || ("HTTP "+r.status));
+    st.className="pstatus ok"; st.textContent = list.length ? "Saved - " + list.length + " trusted" : "Saved - loopback only";
+  }catch(e){ st.className="pstatus err"; st.textContent = e.message; }
+});
+// H24: every session on every device, this one included - so the page lands
+// on the sign-in form right after. A confirm first: there is no undo.
+$("authSignoutAll").addEventListener("click", async ()=>{
+  if(!confirm("Sign out everywhere?\nEvery device signed in to this Hub, including this one, will have to enter the password again.")) return;
+  const st = $("authMsg");
+  st.className="pstatus"; st.textContent="Signing out…";
+  try{
+    const r = await fetch("/api/auth/signout-everywhere",{method:"POST"});
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.error || ("HTTP "+r.status));
+    location.replace("/auth.html");
+  }catch(e){ st.className="pstatus err"; st.textContent = e.message; }
+});
 // ---- remote access (Cloudflare tunnel) ----
 let tunTimer = null, tunState = null;
 async function refreshTunnelLine(){

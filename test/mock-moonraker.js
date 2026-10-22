@@ -42,6 +42,9 @@ function createMock(profile) {
     stallUpload: false,            // 2.42 (H3): accept an upload, then stop reading it and never answer
     stallScripts: false,           // 2.42 (H3): accept a gcode script and never answer
     stallDownload: false,          // 2.43 (H20): start sending a stored file, then stop mid-body
+    queries: 0,                    // 2.45 (H10): /printer/objects/query hits - proves one snapshot loop, not four
+    statsOnlyQueries: 0,           // 2.45 (H10): ...of which asked for print_stats alone (the old watcher's own probe)
+    metaFetches: 0,                // 2.45 (H17): /server/files/metadata hits - proves thumbnails do not evict the fleet's cache
     held: [],                      // requests parked by the two knobs above
     downloads: [],                 // fork (ryvin/u1hub): every stored-file GET, { name, at } (printer-sync)
     onDownload: null,              // fork (ryvin/u1hub): (name, state) called as a stored-file GET arrives; null = nothing
@@ -74,7 +77,9 @@ function createMock(profile) {
       return send(200, { result: { objects: objectsList } });
 
     if (u.pathname === "/printer/objects/query") {
+      state.queries++;
       const want = [...u.searchParams.keys()];
+      if (want.length === 1 && want[0] === "print_stats") state.statsOnlyQueries++;
       const status = {};
       if (want.some(k => k.startsWith("print_stats"))) {
         status.print_stats = { state: state.printState, filename: state.filename, message: state.printMessage || "",
@@ -86,7 +91,10 @@ function createMock(profile) {
       if (want.some(k => k.startsWith("print_task_config")) && profile === "u1")
         status.print_task_config = ptc;
       if (want.some(k => k.startsWith("display_status"))) status.display_status = { progress: 0 };
-      if (want.some(k => k.startsWith("virtual_sdcard"))) status.virtual_sdcard = { progress: 0 };
+      // 2.45 (H17): a real printer reports the running file's size and byte
+      // position; the Hub's progress math keys its metadata cache on the size.
+      if (want.some(k => k.startsWith("virtual_sdcard"))) status.virtual_sdcard = state.printState === "printing" || state.printState === "paused"
+        ? { progress: 0, file_size: 123456, file_position: 0, file_path: state.filename } : { progress: 0 };
       if (want.some(k => k.startsWith("heater_bed"))) status.heater_bed = { temperature: 25, target: 0 };
       if (want.some(k => k.startsWith("exclude_object"))) status.exclude_object = {};
       // Fork (ryvin/u1hub): Klipper's configfile.settings, when a test stores
@@ -223,14 +231,17 @@ function createMock(profile) {
     // answer below stays for every test that never sets state.metadata.
     if (u.pathname === "/server/files/metadata" && state.metadata) {
       const fn = u.searchParams.get("filename") || "";
+      state.metaFetches++;
       state.metaRequests.push({ filename: fn, at: Date.now() });
       const m = state.metadata[fn];
       if (!m) return send(404, { error: { code: 404, message: "mock: no metadata for " + fn } });
       return send(200, { result: { filename: fn, ...m } });
     }
 
-    if (u.pathname === "/server/files/metadata")
+    if (u.pathname === "/server/files/metadata") {
+      state.metaFetches++;
       return send(200, { result: {} });
+    }
 
     // v2.35: the chamber camera's frame, as Snapmaker's plugin writes it. A
     // minimal JPEG (SOI ... EOI) after a delay, counted, so the harness can

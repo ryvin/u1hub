@@ -22,6 +22,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { atomicWrite, isoWeekKey } = require("../core/util.js");   // H19 (2.45): shared helpers
 
 const JS_SUNDAY = 0, JS_SATURDAY = 6;           // getDay(); Python's weekday() is 0=Monday
 const BED_CLEAR_BUFFER_MIN = 5;                  // gap between planned jobs on one machine
@@ -188,6 +189,59 @@ function pickStart(first, estMin, strict, cal) {
   return strict ? null : { start: first, end: first + dur, hops: 0, overruns: true };
 }
 
+// ---- bed clearing is a queue (S6, 2.45) -------------------------------------
+// readyAfter() makes every print that ends while nobody is around "ready"
+// BED_CLEAR_BUFFER_MIN after the next attended moment, so three prints ending
+// at 02:00 all showed ready at 08:05 and the timeline promised three starts
+// at once. One person clears one bed at a time: within one attended moment
+// the clears are staggered by BED_CLEAR_BUFFER_MIN (08:05, 08:10, 08:15) in
+// the order the plan placed the slots, which is the plan's own priority.
+//
+// One pass over the placed slots, in place. For each slot the previous print
+// on its lane (the running print, else the slot placed before it) ends at
+// some moment; readyAfter() of that end names the bed-clear moment. Slots
+// whose bed clears at the same moment form a queue. The first in it is never
+// moved (a single finish is unchanged, and the lane after a running print
+// keeps starting where it always did); each later one takes its turn
+// BED_CLEAR_BUFFER_MIN after the one before, counted from the first slot's
+// start or the ready moment, whichever is earlier - so a first slot that
+// waits for a later window does not hold the others back. A slot pushed to
+// its turn moves start, end and the bed wait together, re-reads its deadline
+// verdict, and its `why` says whose bed is cleared first. Nothing here
+// touches the deadline-over-priority order, sticky tolerance or the finish
+// policy: only ready times inside an attended window shift.
+function queueBedClears(slots, lanes, readyAfter) {
+  const BUF = BED_CLEAR_BUFFER_MIN * 60000;
+  const lastEnd = new Map();                     // lane idx -> end of the previous print on it
+  for (const l of lanes || []) if (l.busyUntil) lastEnd.set(l.idx, l.busyUntil);
+  const clears = new Map();                      // clear moment -> { anchor, names: printers queued there }
+  let shifted = 0;
+  for (const s of slots) {
+    if (!s || s.unplannable || typeof s.est_start !== "number") continue;
+    const prevEnd = lastEnd.get(s.printer);
+    if (prevEnd != null) {
+      const ready = readyAfter(prevEnd);
+      const at = ready - BUF;
+      let q = clears.get(at);
+      if (!q) { q = { anchor: Math.min(s.est_start, ready), names: [] }; clears.set(at, q); }
+      else {
+        const turn = q.anchor + q.names.length * BUF;
+        if (s.est_start < turn) {
+          const d = turn - s.est_start;
+          s.est_start += d; s.est_end += d;
+          if (s.delay) s.delay.bed = (s.delay.bed || 0) + Math.round(d / 60000);
+          if (s.deadline) s.misses_deadline = s.est_end > s.deadline;
+          s.why = { ...(s.why || {}), bed_clear: "bed clear queued behind " + q.names[q.names.length - 1] };
+          shifted++;
+        }
+      }
+      q.names.push(s.printerName);
+    }
+    lastEnd.set(s.printer, s.est_end);
+  }
+  return shifted;
+}
+
 function register(ctx) {
   const FILE = path.join(ctx.baseDir, "dispatch.json");
 
@@ -287,14 +341,8 @@ function register(ctx) {
   // at all. Maintenance is a decision a human made, and the two must never be
   // rendered or reported as the same thing.
   const maintOf = idx => D.maintenance[String(idx)] || null;
-  // ISO week key, local time (Thursday-anchored per ISO 8601).
-  function isoWeekKey(ms) {
-    const dt = new Date(ms); dt.setHours(0, 0, 0, 0);
-    dt.setDate(dt.getDate() + 3 - ((dt.getDay() + 6) % 7));
-    const jan4 = new Date(dt.getFullYear(), 0, 4);
-    const wk = 1 + Math.round(((dt - jan4) / 86400000 - 3 + ((jan4.getDay() + 6) % 7)) / 7);
-    return dt.getFullYear() + "-W" + String(wk).padStart(2, "0");
-  }
+  // ISO week key, local time (Thursday-anchored per ISO 8601): isoWeekKey
+  // from core/util.js (H19).
   function dayWindow(ms) {                        // the effective window for that calendar day
     const dt = new Date(ms);
     const ov = D.settings.weekOverrides[isoWeekKey(ms)];
@@ -323,11 +371,9 @@ function register(ctx) {
     // written with everything else and keyed by printer id (toDisk).
     if (typeof markPlanDirty === "function") markPlanDirty();   // S4: every state change replans once
     const data = JSON.stringify(toDisk(), null, 2);
-    const tmp = FILE + ".tmp";
     if (!SAVE_FALLBACK) {
       try {
-        fs.writeFileSync(tmp, data);
-        fs.renameSync(tmp, FILE);                // atomic on a local volume
+        atomicWrite(FILE, data);                 // atomic on a local volume (H19: core/util.js)
         return;
       } catch (e) {
         SAVE_FALLBACK = true;
@@ -337,7 +383,6 @@ function register(ctx) {
       }
     }
     fs.writeFileSync(FILE, data);                // fallback: not atomic, but it lands
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
   }
   const newId = p => p + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   // Sticky placement, in TWO layers (fixed v2.12). A plan is something a human
@@ -379,7 +424,7 @@ function register(ctx) {
   let EST = { files: {}, printers: {} };
   try { const raw = JSON.parse(fs.readFileSync(EST_FILE, "utf8")); if (raw && typeof raw === "object") EST = { files: raw.files || {}, printers: raw.printers || {} }; } catch {}
   function saveEst() {
-    try { const tmp = EST_FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify(EST, null, 2)); fs.renameSync(tmp, EST_FILE); }
+    try { atomicWrite(EST_FILE, JSON.stringify(EST, null, 2)); }
     catch (e) { ctx.hublog("warn", "dispatch: could not save estimates.json - " + e.message); }
   }
   const median = a => { const v = a.filter(Number.isFinite).sort((x, y) => x - y); if (!v.length) return null; const m = v.length >> 1; return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2; };
@@ -881,9 +926,18 @@ function register(ctx) {
     // executor has not seen it printing yet (upload + the 10 s tick). Without
     // this the lane looked free for a minute or two and a second clear-bed
     // could be handed the same copy.
+    // H18 (2.45): the hand-off is attributed to its job for the whole window,
+    // including the seconds between the printer first reporting the print and
+    // the executor claiming it (up to one 10 s tick). The lane's cursor is
+    // only moved when the printer still looks idle; once it reports the print
+    // its own remaining time is the better number.
     for (const l of lanes) {
       const sj = D.jobs.find(j => j.starting_on && j.printing_on == null && j.starting_on.printer === l.idx && now - (j.starting_on.at || 0) < STARTING_TTL_MS);
-      if (sj && l.cursor <= now) { l.cursor = now + learnedFor(sj, l.idx).min * 60000; l.busyUntil = l.cursor; l.startingFile = sj.file; l.startingJob = sj.id; }
+      if (!sj) continue;
+      const idle = l.cursor <= now;
+      if (!idle && !sameFile(sj, l.fp, l.idx)) continue;   // it is running something else - not this hand-off
+      l.startingFile = sj.file; l.startingJob = sj.id;
+      if (idle) { l.cursor = now + learnedFor(sj, l.idx).min * 60000; l.busyUntil = l.cursor; }
     }
     // Bundle deadlines tighten members'.
     const bundleDeadline = {};
@@ -1142,6 +1196,8 @@ function register(ctx) {
     // not keep a lane reserved in the map - it would grow without bound and
     // resurrect a stale placement if the qty went back up.
     for (const k of PLACEMENT.keys()) if (!seen.has(k)) PLACEMENT.delete(k);
+    // S6 (2.45): one bed clear at a time within an attended moment.
+    queueBedClears(slots, lanes, readyAfter);
     } // end fluid placement (locked branch served the frozen snapshot above)
     // Report the whole fleet, not just the machines that got work: an idle
     // printer vanishing from the timeline hides exactly the capacity problem
@@ -1318,9 +1374,12 @@ function register(ctx) {
 
   // ---- executor: completion watcher (never a starter) -----------------------
   const STARTING_TTL_MS = 5 * 60000;             // S5: a hand-off that never became a print
-  async function tick() {
+  // H10 (2.45): `given` is the fleet loop's snapshot. Without one (the manual
+  // /api/dispatch/tick route) a fresh snapshot is taken on demand.
+  async function tick(given) {
     ensureMapped();
-    let fleet; try { fleet = await ctx.fleet(); } catch { return; }
+    let fleet = given;
+    if (!fleet) { try { fleet = await ctx.fleet(); } catch { return; } }
     let dirty = false;
     // S5: a copy handed to a printer at "Bed cleared -> start next" is in
     // flight until the executor sees it printing. If it never does, say so.
@@ -1408,16 +1467,24 @@ function register(ctx) {
   // full day, firing every 10 s with nobody the wiser. Log it, rate-limited so a
   // persistent fault does not flood the ring buffer.
   let LAST_TICK_ERR = 0;
-  const timer = setInterval(() => {
-    tick().catch(e => {
-      const now = Date.now();
+  // H10 (2.45): no snapshot of its own. The fleet loop (core/fleet.js, 5 s)
+  // emits "fleet:tick" with the one snapshot; the executor acts on every
+  // other one, so its cadence is what it was: first pass 10 s after boot,
+  // then every ~10 s. The slack keeps a late tick from pushing a pass out
+  // to the one after.
+  const EXEC_SLACK_MS = 1500;
+  let NEXT_EXEC = Date.now() + EXEC_TICK_MS;
+  if (ctx.events) ctx.events.on("fleet:tick", t => {
+    const now = Date.now();
+    if (now < NEXT_EXEC) return;
+    NEXT_EXEC = now + EXEC_TICK_MS - EXEC_SLACK_MS;
+    tick(t.fleet).catch(e => {
       if (now - LAST_TICK_ERR > 60000) {
         LAST_TICK_ERR = now;
-        ctx.hublog("error", "dispatch: executor tick failed — " + (e && e.message || e));
+        ctx.hublog("error", "dispatch: executor tick failed - " + (e && e.message || e));
       }
     });
-  }, EXEC_TICK_MS);
-  if (timer.unref) timer.unref();
+  });
   // Manual tick: "recheck the fleet now". Makes completions show up instantly
   // after you clear a bed by hand, and makes the harness deterministic instead
   // of racing the 10 s interval.
@@ -2050,4 +2117,4 @@ function register(ctx) {
   ctx.provide("dispatch.maintenance", () => { ensureMapped(); return D.maintenance; });
 }
 
-module.exports = { register, pickStart };
+module.exports = { register, pickStart, queueBedClears, BED_CLEAR_BUFFER_MIN };

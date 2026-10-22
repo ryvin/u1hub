@@ -37,6 +37,7 @@ const REPO = path.join(__dirname, "..");
 // expected version from package.json once and asserts everything else
 // (server.js, index.html, live routes) against it.
 const EXPECTED_VERSION = JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8")).version;
+process.env.U1HUB_NO_BACKUP = "1";   // F9: the harness boots many Hubs; none should write a backups/ folder
 const HUB_PORT = 45990;
 const HUB = "http://127.0.0.1:" + HUB_PORT;
 
@@ -1037,6 +1038,7 @@ async function stopHub() {
     // Reset the tray the setcolor-honesty section painted, so the swap math
     // below asserts against a known loadout (red + green on T1/T2).
     mockU1.state.ptc.filament_color_rgba[0] = "FF0000FF";
+    await sleep(450);   // H10 (2.45): one loop period, so the next snapshot carries the reset tray
     r = await jpost("/api/dispatch/jobs", { again: true, file: "multi.gcode", type: "u1", qty: 2, deadline: Date.now() + 60 * 60000 });
     ok(r.status === 200 && r.body.job.colors.length === 3 && r.body.job.est_minutes === 62 && r.body.job.multi === true,
       "job captures USED palette (3 colors — the 0 g white is defined-but-unused) + estimate (1h 2m → 62) + multi class",
@@ -2810,6 +2812,7 @@ async function stopHub() {
     // --- the executor and adopt both respect it --------------------------------
     // Put a print on the DOWN machine and make sure nothing claims it.
     mockU1.state.printState = "printing"; mockU1.state.filename = "single.gcode";
+    await sleep(450);   // H10 (2.45): one loop period, so the snapshot shows the print
     await jpost("/api/dispatch/tick", {});
     r = await jget("/api/dispatch");
     let mj = (r.body.jobs || []).find(j => j.id === MJOB);
@@ -2921,10 +2924,16 @@ async function stopHub() {
       // gcodeFolder is resolved against BASE_DIR, which is now altDir — point
       // it back at the real fixture folder so the job below has a file to find.
       altCfg.gcodeFolder = path.join(hubDir, "gcode");
+      // H16 (2.45): a relative models folder resolves against the state dir
+      // too, not against the process's working directory (the install dir here).
+      altCfg.models = { folder: "./shelf" };
       fs.writeFileSync(path.join(altDir, "config.json"), JSON.stringify(altCfg, null, 2));
       await startHub(hubDir, { U1HUB_DIR: altDir });
       const rv = await jget("/api/version");
       ok(rv.status === 200, "U1HUB_DIR: the Hub still runs from its install dir", rv.status);
+      const rm = await jget("/api/models");
+      ok(rm.status === 200 && rm.body.folder === path.join(altDir, "shelf"),
+        "H16: models.folder './shelf' resolves against the state dir, like gcodeFolder", rm.body && rm.body.folder);
       const rj = await jpost("/api/dispatch/jobs", { again: true, file: "single.gcode", type: "u1", qty: 1 });
       ok(rj.status === 200, "U1HUB_DIR: it accepts work normally", rj.status);
       await stopHub();
@@ -5631,6 +5640,11 @@ async function stopHub() {
     ok(mine.length === 1, "S5: the plan holds one copy back for the hand-off and places only the other", mine.length);
     const run = (pl.running || []).find(x => x.printer === u1);
     ok(run && run.starting === true && run.file === "multi.gcode", "S5: the running list shows it as starting on that printer", run);
+    // H18 (2.45): the printer already reports the print here (the mock starts
+    // on SDCARD_PRINT_FILE and the loop's snapshot is fresh), the executor has
+    // not claimed it yet - and the running entry still names the job. On
+    // 2.44.1 this window showed the print as untracked with no job.
+    ok(run && run.job_id === J4 && run.tracked === false, "H18: between the printer reporting the print and the executor claiming it, the running entry still names the hand-off's job", run);
     mockU1.state.printState = "printing"; mockU1.state.filename = "multi.gcode";
     await settle();
     tj = await jobById(J4);
@@ -5702,6 +5716,240 @@ async function stopHub() {
     ok(/raw\.split\("\?"\)\[0\]/.test(appSrc), "H22: a deep link with view state after ? still opens the right view");
   }
 
+  console.log("\n== 2.44.1: the phone tools button shows, the scan line moves (hand test on 2.44.0) ==");
+  {
+    const ui = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8");
+    // The base "display:none" has to precede the media rule that turns the button on;
+    // the two share a specificity, so whichever is later wins (2.44.0 had them reversed).
+    const base = ui.indexOf('"#mdl-toolsbtn{display:none;}"'), media = ui.indexOf("#mdl-toolsbtn{display:inline-flex;}");
+    ok(base >= 0 && media >= 0 && base < media, "2.44.1: the collapsed-tools button is hidden by the base rule and shown by the later media rule, in that order", { base, media });
+    ok(/sp\.dirs \|\| 0\) \+ " folder"/.test(ui) && /" so far"/.test(ui), "2.44.1: the rescan line counts folders walked as well as files found, so it moves from the first second");
+    // and the server side still reports dirs for it
+    const mroot = path.join(tmp, "models");
+    await jpost("/api/models/settings", { folder: mroot });
+    const r = await jget("/api/models?refresh=1");
+    ok(!r.body.scan_progress || typeof r.body.scan_progress.dirs === "number", "2.44.1: scan_progress carries a dirs count when a walk is running", r.body.scan_progress);
+  }
+
+  console.log("\n== 2.45.1: the Models grid stays put while a rescan polls (phone: flash and bounce) ==");
+  {
+    const ui = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8").replace(/\r\n/g, "\n");
+    // A render that would draw the same cards in the same order leaves the DOM
+    // alone; the 4 s poll during a walk only moves the count line.
+    ok(/const sameGrid = gridSig === GRID_SIG && items\.length > 0 && !d\.missing;/.test(ui) && /\} else if \(sameGrid\) \{/.test(ui),
+      "2.45.1: the grid is rebuilt only when the cards it would show changed");
+    ok(/it\.requested \? it\.requested\.status/.test(ui) && /:" \+ \(it\.prints \|\| 0\)/.test(ui) && /\+ REQ_ONLY \+ "\|" \+ CREATOR/.test(ui),
+      "2.45.1: the grid signature covers what a card draws (file, mtime, prints, filed, request state) and the view switches");
+    ok(/if \(railSig !== RAIL_SIG \|\| !rail\.querySelector\("#mdl-railq"\)\)/.test(ui), "2.45.1: the designer rail is rebuilt only when designers or counts changed, so its typeahead survives a poll");
+    // The chips row used to grow from one line to two when it filled in on a
+    // narrow column, pushing everything below it down under a scrolling thumb.
+    ok(/\.mdl-chips\{[^}]*height:16px;[^}]*flex-wrap:nowrap;[^}]*overflow:hidden;/.test(ui), "2.45.1: the chips row has a fixed one-line height, so filling it in cannot move the cards below");
+    ok(/if \(!grid\.querySelector\("\.mdl-skel"\)\) grid\.innerHTML = skeletons\(12\);/.test(ui), "2.45.1: skeletons are not redrawn over skeletons on every poll of an empty scan");
+  }
+
+  console.log("\n== 2.45.2: a background poll never dims the Models grid ==");
+  {
+    const ui = fs.readFileSync(path.join(REPO, "public", "modules", "models-ui.js"), "utf8").replace(/\r\n/g, "\n");
+    ok(/async function load\(refresh, append, quiet\)/.test(ui) && /else if \(!append && !quiet\) grid\.classList\.add\("stale"\);/.test(ui),
+      "2.45.2: the stale fade is skipped for a quiet load");
+    ok((ui.match(/if \(!BUSY\) load\(false, false, true\);/g) || []).length === 2, "2.45.2: both rescan polls are quiet loads");
+  }
+
+  console.log("\n== 2.45.3: the Dispatch timeline pans from anywhere ==");
+  {
+    const ui = fs.readFileSync(path.join(REPO, "public", "modules", "dispatch-ui.js"), "utf8").replace(/\r\n/g, "\n");
+    ok(/\.dsp-guide\{[^}]*overflow-y:auto;[^}]*max-height:calc\(100vh - 150px\);/.test(ui) && /\.dsp-gruler\{position:sticky;top:0;/.test(ui),
+      "2.45.3: the guide is bounded to the viewport with its ruler pinned, so its scrollbar is always on screen");
+    ok(/id="dsp-gprevbtn"/.test(ui) && /id="dsp-gnextbtn"/.test(ui) && /pb\.onclick = \(\) => page\(-1\)/.test(ui) && /nb\.onclick = \(\) => page\(1\)/.test(ui),
+      "2.45.3: earlier / later buttons page the guide");
+    ok(/if \(Math\.abs\(dx\) < 6 && Math\.abs\(dy\) < 6\) return; drag\.on = true;/.test(ui) && /e\.target\.closest\("button, \[data-slot\], \[data-run\], a, input"\)/.test(ui) && /if \(swallow\) \{ e\.stopPropagation\(\); e\.preventDefault\(\); \}/.test(ui),
+      "2.45.3: a mouse drag on the lanes pans after 6 px, never starts on a block or button, and its ending click opens nothing");
+    ok(/e\.key === "ArrowLeft"/.test(ui) && /e\.key === "Home"\) \{ e\.preventDefault\(\); toNow\(\); \}/.test(ui) && /id="dsp-guide" tabindex="0"/.test(ui),
+      "2.45.3: the guide is focusable and the arrow keys, Page Up/Down and Home move it");
+    // 2.45.4: the guide scrolls vertically inside itself now, so the plan
+    // reload must carry scrollTop across the rebuild, not just scrollLeft -
+    // otherwise it snaps back to U1 every reload and a phone never reaches U9.
+    ok(/if \(prev\) \{ GSCROLL = prev\.scrollLeft; GSCROLLY = prev\.scrollTop; \}/.test(ui) && /g\.scrollTop = GSCROLLY;/.test(ui),
+      "2.45.4: the plan reload keeps the guide's vertical scroll, so it doesn't bounce back to the top");
+  }
+
+  console.log("\n== SPRINT 4: F9 /healthz and nightly state backups (2.45.0) ==");
+  {
+    // /healthz needs no cookie and no disk: a watchdog's view of "is it up".
+    let r = await fetch(HUB + "/healthz"); let b = await r.json();
+    ok(r.status === 200 && b.ok === true && b.version === require(path.join(REPO, "package.json")).version && typeof b.printers === "number" && typeof b.uptime === "number",
+      "F9: GET /healthz answers 200 {ok, version, printers, uptime} from memory", b);
+    const authSrc = fs.readFileSync(path.join(REPO, "auth.js"), "utf8");
+    ok(/"\/healthz"/.test(authSrc.slice(authSrc.indexOf("const ALLOW"), authSrc.indexOf("const ALLOW") + 400)), "F9: /healthz is allow-listed past the sign-in gate");
+    // The backup is a pure function of a state dir: run it on a scratch one
+    // for nine days and look at what it kept.
+    const { runBackup, KEEP_DAYS, STATE_FILES } = require(path.join(REPO, "core", "health.js"));
+    const sdir = path.join(tmp, "f9-state"); fs.mkdirSync(sdir, { recursive: true });
+    for (const f of ["dispatch.json", "spools.json", "config.json"]) fs.writeFileSync(path.join(sdir, f), JSON.stringify({ f }));
+    let last = null;
+    for (let d = 1; d <= 9; d++) last = runBackup(sdir, null, "2026-10-" + String(d).padStart(2, "0"));
+    const kept = fs.readdirSync(path.join(sdir, "backups")).sort();
+    ok(kept.length === KEEP_DAYS && kept[0] === "2026-10-03" && kept[kept.length - 1] === "2026-10-09", "F9: nine nightly runs keep the newest " + KEEP_DAYS + " days", kept);
+    ok(last.copied.length === 3 && last.pruned.includes("2026-10-02") && !fs.existsSync(path.join(sdir, "backups", "2026-10-01")),
+      "F9: only the files that exist are copied (3 of " + STATE_FILES.length + ") and the oldest day is pruned", last);
+    ok(JSON.parse(fs.readFileSync(path.join(sdir, "backups", "2026-10-09", "dispatch.json"), "utf8")).f === "dispatch.json" && !fs.readdirSync(path.join(sdir, "backups", "2026-10-09")).some(n => n.endsWith(".tmp")),
+      "F9: the copy is byte-identical and no .tmp is left behind");
+    const custom = path.join(tmp, "f9-elsewhere");
+    const rc = runBackup(sdir, custom, "2026-10-10");
+    ok(rc.dir === path.resolve(custom) && fs.existsSync(path.join(custom, "2026-10-10", "config.json")), "F9: backupDir in config.json moves the folder", rc.dir);
+    ok(/^backups\/?\s*$/m.test(fs.readFileSync(path.join(REPO, ".gitignore"), "utf8")), "F9: backups/ is ignored by git");
+  }
+
+  console.log("\n== SPRINT 4: F10 CI and the tag check (2.45.0) ==");
+  {
+    const { checkVersion, readVersions } = require(path.join(REPO, "scripts", "check-version.js"));
+    const vs = readVersions(REPO);
+    ok(vs.pkg && vs.pkg === vs.srv && vs.pkg === vs.log, "F10: package.json, server.js and the CHANGELOG's first heading agree on " + vs.pkg, vs);
+    ok(checkVersion("v" + vs.pkg, vs).ok && checkVersion("refs/tags/v" + vs.pkg, vs).ok, "F10: the matching tag passes, with or without refs/tags/");
+    let r = checkVersion("v9.9.9", vs);
+    ok(!r.ok && r.problems.length === 3 && /package\.json says/.test(r.problems[0]) && /server\.js VERSION says/.test(r.problems[1]) && /CHANGELOG/.test(r.problems[2]),
+      "F10: a tag that lies is refused with every mismatch named", r.problems);
+    r = checkVersion("release-1", vs);
+    ok(!r.ok && /not vX\.Y\.Z/.test(r.problems[0]), "F10: a tag that is not vX.Y.Z is refused");
+    const cli = require("child_process").spawnSync(process.execPath, [path.join(REPO, "scripts", "check-version.js"), "v0.0.1"], { encoding: "utf8" });
+    ok(cli.status === 1 && /does not match the code/.test(cli.stderr), "F10: the CLI exits 1 with the reason on stderr", cli.stderr);
+    const cli2 = require("child_process").spawnSync(process.execPath, [path.join(REPO, "scripts", "check-version.js"), "v" + vs.pkg], { encoding: "utf8" });
+    ok(cli2.status === 0, "F10: ...and 0 on the real version", cli2.stdout);
+    const ci = fs.readFileSync(path.join(REPO, ".github", "workflows", "ci.yml"), "utf8");
+    ok(/ubuntu-latest, windows-latest/.test(ci) && /node-version: 22/.test(ci) && /npm ci/.test(ci) && /node test\/run-tests\.js/.test(ci) && /U1HUB_SKIP_SLICE: "1"/.test(ci),
+      "F10: ci.yml runs the harness on Linux and Windows with Node 22, skipping only the fixture-bound SLICE section");
+    ok(/startsWith\(github\.ref, 'refs\/tags\/v'\)/.test(ci) && /scripts\/check-version\.js/.test(ci) && /tags: \["v\*"\]/.test(ci), "F10: tag builds run the version check before anything ships");
+    ok(/EXPLORER_REF: v1\.7\.0/.test(fs.readFileSync(path.join(REPO, ".github", "workflows", "release.yml"), "utf8")), "F10: release.yml is untouched (EXPLORER_REF still v1.7.0; the release checklist bumps it)");
+  }
+
+  console.log("\n== SPRINT 4: H10 one fleet snapshot loop (2.45.0) ==");
+  {
+    // (a) One loop. The print-start watcher used to probe print_stats on its
+    // own every U1HUB_POLL_MS (400 ms here) on top of the SSE and events
+    // snapshots; now every subscriber reads the loop's one snapshot. So the
+    // printer never sees a print_stats-only query, and over 3 s it sees one
+    // loop's worth of full queries, not two pollers' worth.
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+    await sleep(1500);
+    const q0 = mockU1.state.queries, s0 = mockU1.state.statsOnlyQueries;
+    await sleep(3000);
+    const qn = mockU1.state.queries - q0, sn = mockU1.state.statsOnlyQueries - s0;
+    ok(sn === 0, "H10: no second poller - the printer sees no print_stats-only probes (" + sn + ")", sn);
+    ok(qn <= Math.ceil(3000 / 400) + 2, "H10: one snapshot loop - at most one loop's worth of object queries in 3 s (" + qn + ")", qn);
+    // (b) A round with nine printers that never answer finishes well under the
+    // old 15 s interval: the snapshot probes in parallel under one timeout,
+    // where the watcher probed one printer at a time (9 x 3 s = 27 s a round,
+    // so a start took two rounds, ~54 s, to be stamped).
+    const hole = http.createServer((req, res) => { /* accept, never answer */ });
+    await new Promise(r => hole.listen(0, "127.0.0.1", r));
+    const holePort = hole.address().port;
+    const savedCfg = fs.readFileSync(path.join(hubDir, "config.json"), "utf8");
+    await stopHub();
+    const cfgNow = JSON.parse(savedCfg);
+    const holes = Array.from({ length: 9 }, (_, i) => ({ name: "hole-" + i, url: "http://127.0.0.1:" + holePort + "/h" + i, type: "u1" }));
+    const u1Entry = cfgNow.printers.find(p => p.url.includes(":" + portU1)) || cfgNow.printers[0];
+    fs.writeFileSync(path.join(hubDir, "config.json"), JSON.stringify({ ...cfgNow, printers: [u1Entry, ...holes] }, null, 2));
+    await startHub(hubDir);
+    await sleep(4500);                                   // the first pass (3.5 s of timeouts) primes the watcher
+    mockU1.state.printState = "printing"; mockU1.state.filename = "h10-offline.gcode";
+    const tStart = Date.now();
+    let stamped = false;
+    while (Date.now() - tStart < 12000) {
+      try { const pl = JSON.parse(fs.readFileSync(path.join(hubDir, "printlog.json"), "utf8")); if (pl.u1 && pl.u1["h10-offline.gcode"]) { stamped = true; break; } } catch {}
+      await sleep(250);
+    }
+    const tTook = Date.now() - tStart;
+    ok(stamped, "H10: with nine printers that never answer, a print start is still stamped within 12 s (" + (stamped ? tTook + " ms" : "not stamped") + ")", tTook);
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+    await stopHub();
+    hole.closeAllConnections && hole.closeAllConnections();
+    await new Promise(r => hole.close(r));
+    fs.writeFileSync(path.join(hubDir, "config.json"), savedCfg);
+    // The restart carries a short job TTL for the H12 sweep check below.
+    await startHub(hubDir, { U1HUB_JOB_TTL_MS: "1500" });
+    await sleep(600);
+  }
+
+  console.log("\n== SPRINT 4: H12 bounded caches, H15 honest saves, H17 thumbnails leave the fleet cache alone (2.45.0) ==");
+  {
+    const u1Idx = () => JSON.parse(fs.readFileSync(path.join(hubDir, "config.json"), "utf8")).printers.findIndex(p => p.url.endsWith(":" + portU1));
+    // ---- H12: finished print jobs are swept, not kept until a page reads them ----
+    let r = await jpost("/api/print", { file: "single.gcode", printer: u1Idx(), start: false, type: "u1" });
+    ok(r.status === 200 && r.body.jobId, "H12: a push hands back a job id", r.body);
+    const jid = r.body.jobId;
+    for (let i = 0; i < 40; i++) { await sleep(150); const jb = (await jget("/api/print-status?job=" + jid)).body; if (jb && jb.done) break; }
+    ok((await jget("/api/print-status?job=" + jid)).status === 200, "H12: ...readable once it is done");
+    await sleep(2600);                                   // TTL 1.5 s + a sweep period (0.75 s)
+    r = await jget("/api/print-status?job=" + jid);
+    ok(r.status === 404, "H12: a finished job older than the TTL is swept from the map without anyone polling it", r.status);
+    const prn = fs.readFileSync(path.join(REPO, "core", "print.js"), "utf8");
+    ok(/JOB_TTL_MS\) \|\| 30 \* 60000/.test(prn) && /JOB_SWEEP_MS = Math\.max\(200, Math\.min\(60000/.test(prn), "H12: production sweeps 30-minute-old jobs once a minute");
+
+    // ---- H12: the models shelf is decorated once per index, not per request ----
+    const mroot = path.join(tmp, "models");
+    await jpost("/api/models/settings", { folder: mroot });
+    await jget("/api/models?refresh=1"); await sleep(800);
+    const d1 = (await jget("/api/models?limit=5&debug=1")).body;
+    const d2 = (await jget("/api/models?limit=5&offset=5&debug=1")).body;
+    const d3 = (await jget("/api/models?limit=5&sort=name&debug=1")).body;
+    ok(d1.debug && typeof d1.debug.decorations === "number", "H12: ?debug=1 reports how many times the shelf was decorated", d1.debug);
+    ok(d1.debug && d2.debug && d3.debug && d2.debug.decorations === d1.debug.decorations && d3.debug.decorations === d1.debug.decorations,
+      "H12: paging and re-sorting the same index do not decorate it again", [d1.debug, d2.debug, d3.debug]);
+    await jpost("/api/models/aliases", { aliases: { "Bambu Lab": "Bambu" } });
+    const d4 = (await jget("/api/models?limit=5&debug=1")).body;
+    ok(d4.debug && d4.debug.decorations === d1.debug.decorations + 1 && (d4.creators || []).some(c => c.name === "Bambu"),
+      "H12: changing an input of the decoration (an alias) rebuilds it exactly once", [d1.debug, d4.debug]);
+    await jpost("/api/models/aliases", { aliases: {} });
+    const dp1 = (await jget("/api/models?sort=printed&debug=1")).body, dp2 = (await jget("/api/models?sort=printed&limit=3&debug=1")).body;
+    ok(dp1.printed && dp2.printed && dp2.debug.decorations === dp1.debug.decorations, "H12: 'most printed' is served from the same memo on a second request", [dp1.debug, dp2.debug]);
+
+    // ---- H17: a thumbnail request must not evict the running file's metadata ----
+    mockU1.state.printState = "printing"; mockU1.state.filename = "h17-running.gcode";
+    await sleep(900);                                    // the loop fetches the file's metadata once
+    const m0 = mockU1.state.metaFetches;
+    await fetch(HUB + "/api/pthumb?id=" + u1Idx() + "&file=h17-running.gcode");
+    await fetch(HUB + "/api/pthumb?id=" + u1Idx() + "&file=h17-running.gcode");
+    await sleep(900);                                    // two more loop passes with progress math
+    await jget("/api/fleet");
+    const mN = mockU1.state.metaFetches - m0;
+    ok(mN === 0, "H17: two thumbnail requests and the following progress passes fetch the file's metadata 0 more times (" + mN + ")", mN);
+    mockU1.state.printState = "standby"; mockU1.state.filename = "";
+
+    // ---- H15: a settings save that cannot write says so ----
+    const cfgPath = path.join(hubDir, "config.json");
+    const cfgText = fs.readFileSync(cfgPath, "utf8");
+    const cfgObj = JSON.parse(cfgText);
+    // Make the write fail the same way on every platform: the config path's
+    // parent is replaced by a plain file, so the temp file beside it cannot
+    // be created. (chmod does not stop a root or Windows process.)
+    await stopHub();
+    const blockDir = path.join(tmp, "h15");
+    fs.rmSync(blockDir, { recursive: true, force: true }); fs.mkdirSync(blockDir, { recursive: true });
+    fs.writeFileSync(path.join(blockDir, "config.json"), cfgText);
+    const log15 = await startHub(hubDir, { U1HUB_DIR: blockDir });
+    void log15;
+    // Now take the directory away from under the Hub: rename it and put a
+    // file in its place, so the next write hits ENOTDIR / ENOENT.
+    fs.renameSync(blockDir, blockDir + ".moved");
+    fs.writeFileSync(blockDir, "not a directory");
+    r = await jpost("/api/config", { gcodeFolder: cfgObj.gcodeFolder, printers: cfgObj.printers });
+    ok(r.status === 500 && /^could not save settings: /.test(String(r.body && r.body.error)),
+      "H15: /api/config answers 500 'could not save settings: <reason>' when config.json cannot be written", r.body);
+    r = await jpost("/api/notify/settings", { topic: "u1hub-h15" });
+    ok(r.status === 500 && /^could not save settings: /.test(String(r.body && r.body.error)),
+      "H15: a module settings route (notify) answers the same 500 instead of ok", r.body);
+    const diag = (await jget("/api/diagnostics")).body;
+    const warnLine = ((diag && diag.log) || []).find(l => /could not save/.test(JSON.stringify(l)));
+    ok(!!warnLine && /warn/i.test(JSON.stringify(warnLine)), "H15: the failure is in the Hub log as a warn line", warnLine);
+    await stopHub();
+    fs.unlinkSync(blockDir); fs.renameSync(blockDir + ".moved", blockDir);
+    ok(JSON.parse(fs.readFileSync(path.join(blockDir, "config.json"), "utf8")).printers.length === cfgObj.printers.length,
+      "H15: ...and the config on disk is exactly what it was (atomic write, nothing half-written)");
+    ok(!fs.existsSync(path.join(blockDir, "config.json.tmp")), "H15: no temp file left behind");
+    await startHub(hubDir);
+    await sleep(600);
+  }
+
   // H7 runs auth.js on its own bare Express app (the harness Hub is in open
   // mode); see test/h7-auth-checks.js. Shown failing 5 of 12 on 2.42.0.
   console.log("\n== SPRINT 2: H7 auth - proxy allowlist, per-visitor limiter, credential-bound sessions (2.43.0) ==");
@@ -5711,6 +5959,10 @@ async function stopHub() {
   // H23 on bare apps; see test/sprint3-checks.js.
   console.log("\n== SPRINT 3: reliability - pollJob cap, 401 bounce, tunnel supervisor + pinning, shelf hoist, hidden-tab pause (2.44.0) ==");
   await require("./sprint3-checks")(ok);
+
+  // Sprint 4 (2.45.0): source-level checks and bare calls; see test/sprint4-checks.js.
+  console.log("\n== SPRINT 4: source-level - one snapshot loop, bounded caches, client ticks (2.45.0) ==");
+  await require("./sprint4-checks")(ok);
 
   await stopHub();
   await mockU1.close(); await mockSv.close();

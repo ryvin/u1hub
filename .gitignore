@@ -92,6 +92,9 @@ TIMELAPSE-PLAN.md
 # v2.40 print requests (state)
 models-requests.json
 
+# F9 (2.45): nightly state backups live beside the state, never in git
+backups/
+
 # Fork (ryvin/u1hub): Docker deploy state on this host. The compose override is
 # machine-specific (port mode, pinned subnet) and data/ is the U1HUB_DIR bind
 # mount holding config, spools, dispatch, auth and the thumbnail cache.

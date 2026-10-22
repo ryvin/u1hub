@@ -381,6 +381,10 @@
   // and the ruler stay put, because losing track of which machine or which day
   // you are reading is the one thing a guide must never let happen.
   let GSCROLL = null;                              // survive re-render, don't jump the view
+  // 2.45.4: the vertical offset too. Since 2.45.3 the guide is bounded to the
+  // viewport and its lanes scroll inside it, so the plan reload rebuilt it at
+  // the top every few seconds - on a phone you could never reach U9.
+  let GSCROLLY = 0;
   function renderPlan() {
     const box = $$("#dsp-plan");
     const slots = (PLAN && PLAN.slots) || [];
@@ -391,7 +395,7 @@
       box.innerHTML = '<div class="dsp-empty">Nothing planned.</div>'; return;
     }
     const prev = $$("#dsp-guide");
-    if (prev) GSCROLL = prev.scrollLeft;
+    if (prev) { GSCROLL = prev.scrollLeft; GSCROLLY = prev.scrollTop; }
     const HOUR = 3600000, now = Date.now();
     // Round out to whole hours so the ruler's labels are round numbers. v2.22:
     // the axis begins where the WORK begins, not always at the present. A print
@@ -551,7 +555,9 @@
     box.innerHTML = `
       <div class="dsp-gtools">
         <span class="dsp-gsub">detail</span>${zoom}
-        <button class="dsp-gjump" id="dsp-gnowbtn">⊙ now</button>
+        <button class="dsp-gjump" id="dsp-gprevbtn" title="Earlier (also: drag the timeline, Shift+wheel, or arrow keys)">\u25c0 earlier</button>
+        <button class="dsp-gjump" id="dsp-gnowbtn">\u2299 now</button>
+        <button class="dsp-gjump" id="dsp-gnextbtn" title="Later (also: drag the timeline, Shift+wheel, or arrow keys)">later \u25b6</button>
         ${lockBtn}${lockNote}
         <span class="dsp-gkey">
           <span class="dsp-kit"><i class="dsp-krun"></i>printing now</span>
@@ -565,7 +571,7 @@
           </span>
         </span>
       </div>
-      <div class="dsp-guide" id="dsp-guide">
+      <div class="dsp-guide" id="dsp-guide" tabindex="0" aria-label="Schedule timeline. Drag, use the arrow keys, or Shift and the mouse wheel to move through time.">
         <div class="dsp-gtrack" style="width:${LANE_W + W}px">
           <div class="dsp-grow dsp-gruler">
             <div class="dsp-gcell dsp-gcorner"><span class="dsp-gsub">printer</span></div>
@@ -608,6 +614,49 @@
     const toNow = () => { if (g) g.scrollLeft = Math.max(0, x(now) - 48); };
     const jump = $$("#dsp-gnowbtn");
     if (jump) jump.onclick = toNow;
+    // 2.45.3: moving through time without hunting for the scrollbar. The
+    // guide used to be as tall as its nine lanes, so its horizontal scrollbar
+    // sat below the last printer and the only way across the day was Shift +
+    // wheel or a trip to the bottom. Now the guide is bounded to the viewport
+    // (its ruler already sticks to its top and the lanes scroll inside it, so
+    // the scrollbar is always on screen), the tools row has earlier / later,
+    // the arrow keys work when the guide has focus, and a drag on the lanes
+    // pans. A drag only starts after 6 px, so taps on blocks still open them.
+    const page = dir => { if (g) g.scrollBy({ left: dir * Math.max(120, g.clientWidth * 0.6), behavior: "smooth" }); };
+    const pb = $$("#dsp-gprevbtn"), nb = $$("#dsp-gnextbtn");
+    if (pb) pb.onclick = () => page(-1);
+    if (nb) nb.onclick = () => page(1);
+    if (g) {
+      g.onkeydown = e => {
+        if (e.target !== g) return;
+        if (e.key === "ArrowLeft") { e.preventDefault(); g.scrollBy({ left: -PPH * 2 }); }
+        else if (e.key === "ArrowRight") { e.preventDefault(); g.scrollBy({ left: PPH * 2 }); }
+        else if (e.key === "PageUp") { e.preventDefault(); page(-1); }
+        else if (e.key === "PageDown") { e.preventDefault(); page(1); }
+        else if (e.key === "Home") { e.preventDefault(); toNow(); }
+      };
+      let drag = null;
+      g.onpointerdown = e => {
+        if (e.pointerType !== "mouse" || e.button !== 0) return;     // touch pans natively
+        if (e.target.closest("button, [data-slot], [data-run], a, input")) return;
+        drag = { x: e.clientX, y: e.clientY, left: g.scrollLeft, top: g.scrollTop, on: false, id: e.pointerId };
+      };
+      g.onpointermove = e => {
+        if (!drag || e.pointerId !== drag.id) return;
+        const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+        if (!drag.on) { if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return; drag.on = true; g.classList.add("dsp-dragging"); try { g.setPointerCapture(e.pointerId); } catch {} }
+        g.scrollLeft = drag.left - dx; g.scrollTop = drag.top - dy;
+      };
+      let swallow = false;
+      const end = e => {
+        if (!drag) return;
+        if (drag.on) { g.classList.remove("dsp-dragging"); try { g.releasePointerCapture(drag.id); } catch {} swallow = true; setTimeout(() => { swallow = false; }, 0); }
+        drag = null;
+      };
+      g.onpointerup = end; g.onpointercancel = end;
+      // the click that ends a drag must not open whatever the pointer is over
+      g.addEventListener("click", e => { if (swallow) { e.stopPropagation(); e.preventDefault(); } }, true);
+    }
     // v2.22: freeze / unfreeze. The server snapshots (or clears) the plan and
     // we re-read the board so the frozen times — or the live ones — are on
     // screen in one tap. No confirm(): locking is one click to undo.
@@ -618,7 +667,7 @@
       await load();
     };
     // Restore where they were reading; land on "now" only the first time.
-    if (g) { if (GSCROLL != null) g.scrollLeft = GSCROLL; else toNow(); }
+    if (g) { if (GSCROLL != null) g.scrollLeft = GSCROLL; else toNow(); g.scrollTop = GSCROLLY; }
   }
 
   // A running print has no plan to explain — only facts, and one honest gap:
@@ -667,7 +716,9 @@
         : "")],
       // S7 (2.44): why this printer, and what the runners-up would have cost.
       s.why ? ["Why here", ({ "earlier finish": "finishes soonest", "fewer swaps": "fewer spool changes for a similar finish", "sticky": "kept where the last plan had it (moving would not gain much)", "pinned": "you pinned it here" })[s.why.reason] || s.why.reason +
-        (s.why.alternatives && s.why.alternatives.length ? ". Next best: " + s.why.alternatives.map(a => a.printerName + " " + (a.later_min > 0 ? "+" + fmtMin(a.later_min) : "same time") + (a.swaps ? " (" + a.swaps + " swap" + (a.swaps === 1 ? "" : "s") + ")" : "")).join(", ") : ". No other printer could take it.")] : null,
+        (s.why.alternatives && s.why.alternatives.length ? ". Next best: " + s.why.alternatives.map(a => a.printerName + " " + (a.later_min > 0 ? "+" + fmtMin(a.later_min) : "same time") + (a.swaps ? " (" + a.swaps + " swap" + (a.swaps === 1 ? "" : "s") + ")" : "")).join(", ") : ". No other printer could take it.") +
+        // S6 (2.45): one bed clear at a time - this start waits its turn
+        (s.why.bed_clear ? ". " + s.why.bed_clear.charAt(0).toUpperCase() + s.why.bed_clear.slice(1) + "." : "")] : null,
       ["Deadline", dl + (s.misses_deadline ? "   \u26a0 MISSES IT" : "")],
       s.idle_after_min ? ["Then idle", fmtMin(s.idle_after_min) + " waiting for a bed clear"] : null,
       s.contention ? ["\u26a0 Spool clash", s.contention.color + " is also needed by " + s.contention.file +
@@ -1146,7 +1197,10 @@
       .dsp-kblk{background:#274a72;border:1px solid #3a6ca8}
       .dsp-kmiss{background:#6e2020;border:1px solid #c0392b}
       .dsp-kclosed{background:repeating-linear-gradient(45deg,#171a20,#171a20 3px,var(--chassis, #12151a) 3px,var(--chassis, #12151a) 6px);border:1px solid var(--panel-2, #23262d)}
-      .dsp-guide{overflow-x:auto;overflow-y:hidden;border:1px solid var(--line-soft,#2a2d33);border-radius:9px;background:var(--chassis,#12151a);-webkit-overflow-scrolling:touch}
+      .dsp-guide{overflow-x:auto;overflow-y:auto;max-height:calc(100vh - 150px);min-height:260px;border:1px solid var(--line-soft,#2a2d33);border-radius:9px;background:var(--chassis,#12151a);-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;cursor:grab}
+      .dsp-guide:focus-visible{outline:2px solid var(--signal,#FFB200);outline-offset:1px}
+      .dsp-guide.dsp-dragging{cursor:grabbing;user-select:none}
+      .dsp-guide.dsp-dragging *{cursor:grabbing}
       .dsp-gtrack{position:relative}
       .dsp-grow{display:flex;align-items:stretch;border-bottom:1px solid var(--line-soft,#23262d)}
       .dsp-grow:last-child{border-bottom:0}
@@ -1486,12 +1540,28 @@
     if (EL && EL.style.display !== "none" && STATE) { renderReport(); renderChanges(); renderPlan(); }
   }
 
+  // H13 (2.45): the timeline redraws on every fleet tick the page already
+  // receives - running bars and ETAs are drawn against the clock, so a redraw
+  // from the plan in hand is cheap and keeps them moving. A changed awaiting
+  // list (a bed waiting to be cleared) redraws the job list too.
+  const visible = () => !!(EL && EL.style.display !== "none" && STATE && !document.hidden);
   function onFleet() {
-    if (EL && EL.style.display !== "none" && STATE) jget("/api/dispatch").then(d => {
-      if (d.body) { const was = JSON.stringify(STATE.awaiting), now2 = JSON.stringify(d.body.awaiting);
-        STATE = d.body; if (was !== now2) renderPlan(); }
+    if (!visible()) return;
+    renderPlan();
+    jget("/api/dispatch").then(d => {
+      if (!d.body || !visible()) return;
+      const was = JSON.stringify(STATE.awaiting), now2 = JSON.stringify(d.body.awaiting);
+      STATE = d.body;
+      if (was !== now2) { renderJobs(); renderPlan(); }
     });
   }
+  // ...and the plan itself is re-read every 60 s while the tab is showing and
+  // the document is visible (H11: nothing polls from a hidden tab).
+  // A field being edited (the target datetime, a priority) is left alone:
+  // the reload waits for the next minute rather than resetting it mid-edit.
+  const PLAN_RELOAD_MS = 60000;
+  const editing = () => { const a = document.activeElement; return !!(a && EL && EL.contains(a) && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)); };
+  setInterval(() => { if (visible() && !editing()) load().catch(() => {}); }, PLAN_RELOAD_MS);
 
   // Claimed file action: core renders "📋 Send to Dispatch" next to "Add to
   // queue" and calls this. It's the ONLY path on phones and tablets — touch

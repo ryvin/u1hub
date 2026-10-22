@@ -41,7 +41,34 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { spawnSync, spawn } = require("child_process");
+const { spawn, execFile } = require("child_process");
+const { printerUrl, grabFrame, atomicWrite } = require("../core/util.js");
+
+// H12 (2.45): ffprobe, asynchronously, on the file where it sits. This used
+// to copy the whole video into a temp file and run three ffprobe calls with
+// spawnSync, each allowed 15 s - up to 45 s with the event loop stopped and
+// nine printers unanswered. Never rejects: a missing ffprobe, a bad file or a
+// timeout resolves to the same fail-open defaults the old probe returned.
+function ffprobeField(file, args, timeoutMs) {
+  return new Promise((resolve) => {
+    try {
+      execFile("ffprobe", ["-v", "error", ...args, file], { encoding: "utf8", timeout: timeoutMs, windowsHide: true },
+        (err, stdout) => resolve(err ? "" : String(stdout || "")));
+    } catch { resolve(""); }
+  });
+}
+async function probeVideo(file, timeoutMs) {
+  const T = timeoutMs || 15000;
+  const [dur, frm, dim] = await Promise.all([
+    ffprobeField(file, ["-show_entries", "format=duration", "-of", "csv=p=0"], T),
+    ffprobeField(file, ["-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"], T),
+    ffprobeField(file, ["-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"], T)
+  ]);
+  const duration = parseFloat(dur.trim()) || 0;
+  const frames = parseInt(frm.trim(), 10) || 0;
+  const [w, h] = dim.trim().split(",").map((n) => parseInt(n, 10));
+  return { duration, frames, width: w > 0 ? w : 1920, height: h > 0 ? h : 1080 };
+}
 
 const MIN_DURATION_SEC = 1.5;           // guards against a 0-byte/corrupt
                                          // assembly, NOT a "too short to
@@ -312,9 +339,8 @@ function register(ctx) {
   let SAVE_FALLBACK = false;
   function saveQueue(items) {
     const data = JSON.stringify(items, null, 2);
-    const tmp = queuePath + ".tmp";
     if (!SAVE_FALLBACK) {
-      try { fs.writeFileSync(tmp, data); fs.renameSync(tmp, queuePath); return; }
+      try { atomicWrite(queuePath, data); return; }
       catch (e) {
         SAVE_FALLBACK = true;
         ctx.hublog("warn", "timelapse: atomic save failed (" + e.code + " " + e.message +
@@ -322,7 +348,6 @@ function register(ctx) {
       }
     }
     fs.writeFileSync(queuePath, data);
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
   }
 
   // ---- Capture resume state (2026-09-26) ----
@@ -357,9 +382,8 @@ function register(ctx) {
   let STATE_SAVE_FALLBACK = false;
   function saveCaptureState() {
     const data = JSON.stringify(CAPTURE_STATE, null, 2);
-    const tmp = captureStatePath + ".tmp";
     if (!STATE_SAVE_FALLBACK) {
-      try { fs.writeFileSync(tmp, data); fs.renameSync(tmp, captureStatePath); return; }
+      try { atomicWrite(captureStatePath, data); return; }
       catch (e) {
         STATE_SAVE_FALLBACK = true;
         ctx.hublog("warn", "timelapse: atomic capture-state save failed (" + e.code + " " + e.message +
@@ -367,7 +391,6 @@ function register(ctx) {
       }
     }
     fs.writeFileSync(captureStatePath, data);
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
   }
   function persistCaptureState(state) {
     CAPTURE_STATE[state.printer] = {
@@ -391,23 +414,10 @@ function register(ctx) {
   }
 
   // Same fetch-with-timeout-and-JPEG-SOI-check as modules/camera.js's own
-  // /api/camera grab() - deliberately duplicated rather than shared, since
-  // camera.js's version is wired to that module's own idle-reaped socket
-  // lifecycle and importing across modules isn't how this codebase is split.
-  // Returns { buf, lastModified, date } so the caller can tell a new picture
-  // from the last one the camera left on disk (see frameFreshness above).
-  async function grabFrame(base) {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 5000);
-    try {
-      const r = await fetch(base + "/server/files/camera/monitor.jpg", { signal: ctrl.signal, cache: "no-store" });
-      clearTimeout(to);
-      if (!r.ok) return null;
-      const b = Buffer.from(await r.arrayBuffer());
-      if (!(b.length > 2 && b[0] === 0xff && b[1] === 0xd8)) return null; // valid JPEG SOI
-      return { buf: b, lastModified: r.headers.get("last-modified"), date: r.headers.get("date") };
-    } catch { clearTimeout(to); return null; }
-  }
+  // One frame from the camera plugin: grabFrame in core/util.js (H19), shared
+  // with /api/camera. Returns { buf, lastModified, date } so the caller can
+  // tell a new picture from the last one the camera left on disk (see
+  // frameFreshness above).
   const sha1 = (b) => require("crypto").createHash("sha1").update(b).digest("hex");
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -568,7 +578,7 @@ function register(ctx) {
       ctx.hublog("warn", "timelapse: can't start capture for " + printerName + " - it isn't in config.json");
       return;
     }
-    const base = String(p.url).replace(/\/+$/, "");
+    const base = printerUrl(p);
     let dir, frameIdx, lastLayer, startedAtMs;
     if (resume) {
       ({ dir, frameIdx, lastLayer, startedAtMs } = resume);
@@ -633,28 +643,10 @@ function register(ctx) {
   // default to 1920x1080 rather than 0x0, since an all-zero scale target
   // would make ffmpeg reject the compositing filter outright instead of
   // just looking wrong.
-  function probe(bytes) {
-    const tmp = path.join(os.tmpdir(), "tl_" + Date.now() + "_" + Math.random().toString(36).slice(2) + ".mp4");
-    try {
-      fs.writeFileSync(tmp, bytes);
-      const dur = spawnSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", tmp],
-        { encoding: "utf8", timeout: 15000 });
-      const frm = spawnSync("ffprobe", ["-v", "error", "-count_frames", "-select_streams", "v:0",
-        "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", tmp], { encoding: "utf8", timeout: 15000 });
-      const dim = spawnSync("ffprobe", ["-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height", "-of", "csv=p=0", tmp], { encoding: "utf8", timeout: 15000 });
-      const duration = parseFloat((dur.stdout || "").trim()) || 0;
-      const frames = parseInt((frm.stdout || "").trim(), 10) || 0;
-      const [w, h] = (dim.stdout || "").trim().split(",").map((n) => parseInt(n, 10));
-      const width = w > 0 ? w : 1920;
-      const height = h > 0 ? h : 1080;
-      return { duration, frames, width, height };
-    } catch (e) {
-      ctx.hublog("warn", "timelapse: ffprobe failed - " + (e && e.message || e));
-      return { duration: 0, frames: 0, width: 1920, height: 1080 };
-    } finally {
-      try { fs.unlinkSync(tmp); } catch {}
-    }
+  async function probe(file) {
+    const r = await probeVideo(file, 15000);
+    if (!r.duration && !r.frames) ctx.hublog("warn", "timelapse: ffprobe gave no reading for " + path.basename(file) + " (missing ffprobe, or an unreadable file) - using defaults");
+    return r;
   }
 
   // Runs one ffmpeg step to completion, killing it if it runs past
@@ -756,7 +748,7 @@ function register(ctx) {
   // (it's assembled straight from JPEG frames), so the composited output is
   // silent throughout, deliberately, not by omission. Throws on any
   // failure; composeOrFallback below is what fails open.
-  async function composeVideo(bytes, photoBytes, logoBytes, width, height) {
+  async function composeVideo(srcPath, photoBytes, logoBytes, width, height) {
     const stamp = Date.now() + "_" + Math.random().toString(36).slice(2);
     const dir = os.tmpdir();
     const mainIn = path.join(dir, "tlc_main_" + stamp + ".mp4");
@@ -774,9 +766,11 @@ function register(ctx) {
       }
     };
     try {
-      fs.writeFileSync(mainIn, bytes);
-      fs.writeFileSync(photoIn, photoBytes);
-      if (logoIn) fs.writeFileSync(logoIn, logoBytes);
+      // H12 (2.45): the captured video is copied by the file system, not read
+      // into memory and written back on the event loop.
+      await fs.promises.copyFile(srcPath, mainIn);
+      await fs.promises.writeFile(photoIn, photoBytes);
+      if (logoIn) await fs.promises.writeFile(logoIn, logoBytes);
 
       await runFfmpeg(mainEncodeArgs(mainIn, segMain, width, height), COMPOSE_STEP_TIMEOUT_MS);
 
@@ -801,7 +795,7 @@ function register(ctx) {
       await runFfmpeg(["-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", finalOut],
         COMPOSE_STEP_TIMEOUT_MS);
 
-      const out = fs.readFileSync(finalOut);
+      const out = await fs.promises.readFile(finalOut);
       if (!out || out.length < 1000) throw new Error("composed output looked empty/corrupt");
       cleanup();
       return out;
@@ -816,14 +810,14 @@ function register(ctx) {
   // exactly like the old CTA overlay failed open. No photo at all (product
   // not matched, publish_social off, no image on file) skips compositing
   // entirely rather than fading into a blank frame.
-  async function composeOrFallback(bytes, photoBytes, logoBytes, width, height) {
-    if (!photoBytes) return bytes;
-    try {
-      return await composeVideo(bytes, photoBytes, logoBytes, width, height);
-    } catch (e) {
-      ctx.hublog("warn", "timelapse: video compositing failed - posting the plain timelapse instead. " + (e && e.message || e));
-      return bytes;
+  // Returns the bytes to post: the composed video, or the plain capture read
+  // from disk (async) when there is nothing to compose or compositing failed.
+  async function composeOrFallback(srcPath, photoBytes, logoBytes, width, height) {
+    if (photoBytes) {
+      try { return await composeVideo(srcPath, photoBytes, logoBytes, width, height); }
+      catch (e) { ctx.hublog("warn", "timelapse: video compositing failed - posting the plain timelapse instead. " + (e && e.message || e)); }
     }
+    return fs.promises.readFile(srcPath);
   }
 
   // Looks up the finished-print photo for gcodeFilename via the same edge
@@ -859,7 +853,7 @@ function register(ctx) {
   function loadLogoBytes(c) {
     if (!c.logoFile) return null;
     const p = path.isAbsolute(c.logoFile) ? c.logoFile : path.join(ctx.baseDir, c.logoFile);
-    try { return fs.readFileSync(p); } catch { return null; }
+    return fs.promises.readFile(p).catch(() => null);
   }
 
   // Returns true when this job is DONE being tried (uploaded, or given up on
@@ -877,21 +871,23 @@ function register(ctx) {
     }
     const url = c.uploadUrl;
 
-    let bytes;
-    try { bytes = fs.readFileSync(job.rawVideoPath); }
+    // H12 (2.45): a stat, not a read - the video is only read when it is
+    // actually posted, and asynchronously then.
+    let size;
+    try { size = (await fs.promises.stat(job.rawVideoPath)).size; }
     catch (e) {
       ctx.hublog("warn", "timelapse: captured video for " + job.printer + "/" + job.filename +
         " is missing on disk (" + (e && e.code || e.message) + ") - dropping, nothing left to retry");
       return true;
     }
-    if (bytes.length < 1000) {
+    if (size < 1000) {
       ctx.hublog("warn", "timelapse: captured file for " + job.printer + "/" + job.filename +
-        " is only " + bytes.length + " bytes - treating as corrupt, skipping");
+        " is only " + size + " bytes - treating as corrupt, skipping");
       try { fs.unlinkSync(job.rawVideoPath); } catch {}
       return true;
     }
 
-    const { duration, frames, width, height } = probe(bytes);
+    const { duration, frames, width, height } = await probe(job.rawVideoPath);
     if (duration < MIN_DURATION_SEC) {
       ctx.hublog("info", "timelapse: captured clip for " + job.printer + "/" + job.filename +
         " probed at " + duration + "s - shorter than the corruption guard, skipping");
@@ -906,8 +902,8 @@ function register(ctx) {
     // composited output would silently redefine those two columns for just
     // the new rows.
     const photoBytes = await fetchEndPhoto(url, c.passcode, job.filename);
-    const logoBytes = loadLogoBytes(c);
-    const posted = await composeOrFallback(bytes, photoBytes, logoBytes, width, height);
+    const logoBytes = await loadLogoBytes(c);
+    const posted = await composeOrFallback(job.rawVideoPath, photoBytes, logoBytes, width, height);
 
     const printedAt = fmtPrintedAt(job.startAt || job.at);
     const form = new FormData();
@@ -1003,7 +999,7 @@ function register(ctx) {
     const d = String((req.body || {}).saveDir ?? "").trim();
     if (d.length > 400) return res.status(400).json({ error: "that path is too long" });
     ctx.cfg.timelapse = { ...tcfg(), saveDir: d };
-    ctx.saveConfig();
+    if (!ctx.saveConfig()) return res.status(500).json({ error: ctx.saveConfigError() });
     const v = view();
     if (v.resolved) {
       try { await fs.promises.mkdir(v.resolved, { recursive: true }); v.folder_ok = true; }
@@ -1157,7 +1153,7 @@ function register(ctx) {
 }
 
 module.exports = {
-  register, slugify, buildR2Key, fmtPrintedAt, scaleFitFilter, stillSegmentFilter,
+  register, probeVideo, slugify, buildR2Key, fmtPrintedAt, scaleFitFilter, stillSegmentFilter,
   mainSegmentFilter, mainEncodeArgs, stillEncodeArgs, frameFileName, assembleArgs,
   frameFreshness, parseYavg, keepFrames, FRESH_MAX_AGE_MS, DARK_YAVG,
 };

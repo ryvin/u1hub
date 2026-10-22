@@ -3,7 +3,7 @@
 // and pushes the chosen file to the chosen printer via Moonraker (server-side,
 // so no browser CORS headaches).
 
-const VERSION = "2.44.0";
+const VERSION = "2.45.4";
 
 const fs = require("fs");
 const http = require("http");
@@ -12,11 +12,15 @@ const path = require("path");
 // object and runs in this exact order — the order the code had in the old
 // single file, which load-time statements (loadConfig, middleware, listen)
 // depend on. Shared mutable state (CFG, FOLDER, PRINTERS, TYPES, TYPE_WARNINGS, FEATURES, QUEUE, FARM_READY) lives on hub.
-const hub = { VERSION };
+// H10 (2.45): the event bus is born with the hub, not with core/events.js, so
+// core/records.js (loaded before the fleet) can subscribe to fleet:tick.
+const hub = { VERSION, events: new (require("events"))() };
+hub.events.setMaxListeners(50);
 require("./core/log.js")(hub);
 require("./core/config.js")(hub);
 require("./core/records.js")(hub);
 require("./core/app.js")(hub);
+require("./core/health.js")(hub);   // F9 (2.45): /healthz + nightly state backups
 require("./core/library.js")(hub);
 require("./core/print.js")(hub);
 require("./core/fleet.js")(hub);
@@ -31,6 +35,7 @@ const { BASE_DIR, CONFIG_PATH, IS_PKG, PORT, UPGRADE_HANDLERS, app, hublog } = h
 
 
 const SERVER = app.listen(PORT, () => {
+  if (hub.markListening) hub.markListening();
   const url = "http://localhost:" + PORT;
   console.log("\n  U1 Print Hub  v" + VERSION + "  →  " + url);
   console.log("  Folder:   " + hub.FOLDER);
