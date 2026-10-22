@@ -43,10 +43,19 @@ const THUMB_IO = ("IntersectionObserver" in window) ? new IntersectionObserver(e
   for (const e of es) { if (!e.isIntersecting) continue; const img = e.target; THUMB_IO.unobserve(img);
     const u = img.dataset.src; if (u) { THUMB_SEEN.add(u); img.src = u; delete img.dataset.src; } }
 }, { rootMargin: "300px 0px" }) : null;
+// fork (ryvin/u1hub): a thumbnail URL that failed once is not asked for again
+// on every 15 s re-render - three thumbless files made ~520 404s in 20 min.
+// A new file version (?v=mtime) is a new URL and is tried. docs/upstream-issues.md
+const THUMB_MISS = new Set();
+function thumbMiss(img){ THUMB_MISS.add(img.getAttribute("src")); img.style.display="none"; }
+function thumbTag(cls, url){
+  return THUMB_MISS.has(url) ? `<img class="${cls}" alt="" style="display:none">`
+    : `<img class="${cls}" loading="lazy" decoding="async" src="${url}" onerror="thumbMiss(this)">`;
+}
 function lazyImg(cls, url){
-  return (!THUMB_IO || THUMB_SEEN.has(url))
-    ? `<img class="${cls}" loading="lazy" decoding="async" src="${url}" onerror="this.style.display='none'">`
-    : `<img class="${cls}" decoding="async" data-src="${url}" onerror="this.style.display='none'">`;
+  return (!THUMB_IO || THUMB_SEEN.has(url) || THUMB_MISS.has(url))
+    ? thumbTag(cls, url)
+    : `<img class="${cls}" decoding="async" data-src="${url}" onerror="thumbMiss(this)">`;
 }
 function armLazy(root){ if(THUMB_IO && root) root.querySelectorAll("img[data-src]").forEach(i => THUMB_IO.observe(i)); }
 let FILES = [], SELECTED = null, MAP = null, FLEET = [], MAPSEL = {};
@@ -2172,7 +2181,7 @@ function renderFleet(){
         ? `<div class="camtile" data-cam="${p.id}">${CAMMODE==="demand"?`<button class="camclose" data-camclose="${p.id}" title="Hide camera">✕</button>`:""}</div>`
         : `<button class="camopen" data-camopen="${p.id}">📷 Live view</button>`) : ""}
       ${p.state==="printing"?`<div class="progress"><i style="width:${Math.round((p.progress||0)*100)}%"></i></div>`:""}
-      ${(p.state==="printing"||p.state==="paused")&&p.filename?`<div class="fnamerow"><img class="cthumb" loading="lazy" src="/api/pthumb?id=${p.id}&file=${encodeURIComponent(p.filename)}" onerror="this.style.display='none'"><div class="fname" title="${esc(p.filename)}">${esc(p.filename.replace(/\.gcode$/i,""))}${p.layer?` · L${p.layer.cur}/${p.layer.total}`:""}</div></div>`:""}
+      ${(p.state==="printing"||p.state==="paused")&&p.filename?`<div class="fnamerow">${thumbTag("cthumb", `/api/pthumb?id=${p.id}&file=${encodeURIComponent(p.filename)}`)}<div class="fname" title="${esc(p.filename)}">${esc(p.filename.replace(/\.gcode$/i,""))}${p.layer?` · L${p.layer.cur}/${p.layer.total}`:""}</div></div>`:""}
       ${(p.state==="error"||p.state==="paused")&&p.message?`<div class="errline" title="${esc(p.message)}">${p.state==="paused"?"⏸ Paused: ":""}${esc(p.message)}</div>`:""}
       ${heads.length?`<div class="heads">${headsHtml}</div>`:""}
       ${PICKOPEN && PICKOPEN.id===p.id && !busy && heads.length ? colorPopHtml(p) : ""}

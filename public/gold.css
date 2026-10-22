@@ -463,3 +463,17 @@ body{font-size:14px;}
 .totop:focus-visible{outline:2px solid color-mix(in srgb, var(--signal) 65%, transparent); outline-offset:2px;}
 @media (min-width:881px){ .totop{right:28px; bottom:28px;} }
 @media print{ .totop{display:none;} }
+
+/* ---- fork (ryvin/u1hub): the desktop top bar may wrap. ---------------------
+   .topbar is a nowrap flex row with justify-content:flex-end, so when the
+   tabs + version badge + update chip + FS Mixer + Settings are wider than
+   .main, the overflow goes LEFT, under the sticky 312px sidebar: Dash could
+   not be clicked (measured: covered at 1400px with the fork's three extra
+   tabs, and at 1100px with upstream's tabs alone), and the squeezed gear
+   buttons drew "update v2.45.4" over "FS Mixer". Let the row wrap and the
+   tab strip shrink and wrap inside itself, as the phone layout already does.
+   docs/upstream-issues.md. ---- */
+@media (min-width:881px){
+  .topbar{flex-wrap:wrap; row-gap:8px;}
+  .viewtabs{flex-wrap:wrap; row-gap:6px; min-width:0;}
+}
