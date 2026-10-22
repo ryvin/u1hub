@@ -413,7 +413,10 @@ const klipper = (pa, extra) => ({ printer: { kinematics: "corexy", max_velocity:
     // a print.done of v2 (in the family whose review minted the lessons)
     const fleetState = async () => { const f = (await jget("/api/fleet")).body || []; const p = f.find(x => x.id === 0); return p ? p.state : "absent"; };
     const waitState = async want => { let s = null; for (let i = 0; i < 60; i++) { s = await fleetState(); if (s === want) break; await sleep(250); } return s; };
-    const check = async () => ((await jpost("/api/fleet-events/check", {})).body || {}).emitted || [];
+    // 2.45 (H10): the fleet loop now raises edges on its own tick, so the manual check often finds them already
+    // emitted; read the new ones from `recent` as well (each event once).
+    const SEEN_EV = new Set();
+    const check = async () => { const b = (await jpost("/api/fleet-events/check", {})).body || {}; return [...(b.recent || []), ...(b.emitted || [])].filter(e => { const k = JSON.stringify(e); if (SEEN_EV.has(k)) return false; SEEN_EV.add(k); return true; }); };
     ok(await waitState("standby") === "standby", "fleet reports the mock idle");
     await check();
     mock.state.printState = "printing"; mock.state.filename = V2;

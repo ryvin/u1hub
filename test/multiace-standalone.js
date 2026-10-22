@@ -296,7 +296,10 @@ function reprintGcode() {
     fs.writeFileSync(path.join(tmp, "spools.json"), JSON.stringify({ tags: {}, local: [], spools: Object.fromEntries(ROLLS.map(([id, hex]) => [id, { id: Number(id), brand: "TestCo", material: "PLA", material_variant: "PLA", color_name: hex, hex, lab: null, color_source: "user" }])) }));
     fs.writeFileSync(path.join(tmp, "resources.json"), JSON.stringify({ inv: Object.fromEntries(ROLLS.map(([id, , price]) => [id, { remaining_g: 900, net_weight_g: 1000, cost_per_roll: price }])), color_map: {}, settings: { assume_empty_when_unset: false, match_de_max: 7 } }));
     await startHub(tmp);
-    const check = async () => ((await jpost("/api/fleet-events/check", {})).body || {}).emitted || [];
+    // 2.45 (H10): the fleet loop now raises edges on its own tick, so the manual check often finds them already
+    // emitted; read the new ones from `recent` as well (each event once).
+    const SEEN_EV = new Set();
+    const check = async () => { const b = (await jpost("/api/fleet-events/check", {})).body || {}; return [...(b.recent || []), ...(b.emitted || [])].filter(e => { const k = JSON.stringify(e); if (SEEN_EV.has(k)) return false; SEEN_EV.add(k); return true; }); };
     const fleetState = async id => { const f = (await jget("/api/fleet")).body || []; const p = f.find(x => x.id === id); return p ? p.state : "absent"; };
     const waitState = async (id, want) => { let st = null; for (let i = 0; i < 80; i++) { st = await fleetState(id); if (st === want) break; await sleep(250); } return st; };
     const pollJob = async jobId => { for (let i = 0; i < 400; i++) { await sleep(50); const r = await jget("/api/multiace/job?job=" + jobId); if (r.body && r.body.done) return r.body; } return { error: "poll timeout" }; };
