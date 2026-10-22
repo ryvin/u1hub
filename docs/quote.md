@@ -52,7 +52,9 @@ quotes: every quote lives in the Hub.
    paused and refuses uploads.
 
 Prices come from the Projects tab rates (material, machine, energy, overhead,
-markup, minimum fee). With no rates set a quote shows "We'll price this one by
+markup, minimum fee) through costing's `pricing()`, so a quote is never below
+the owner's minimum (break-even with the failure allowance, sales tax and card
+fee, whole dollars per piece; [costing.md](costing.md#the-minimum-price-the-owners-rule)). With no rates set a quote shows "We'll price this one by
 hand" - never $0.
 
 ## The numbers

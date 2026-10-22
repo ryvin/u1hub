@@ -262,7 +262,7 @@ function register(ctx) {
       : (num(I.printer_id) != null && printers[I.printer_id] ? I.printer_id : -1);
     const pid = chosen >= 0 ? chosen : (fits[0] ? fits[0].i : 0);
     const ptype = printers[pid] ? (printers[pid].type || "u1") : "u1";
-    const price = PRICE.priceEstimate({ grams, minutes, qty: I.qty, printer_id: pid, type: ptype, material: I.material, labor_minutes: I.labor_minutes, rush: I.rush, failure_rate, name: (est.files || []).map(f => f.name).join(", ") },
+    const price = PRICE.priceEstimate({ grams, minutes, qty: I.qty, printer_id: pid, type: ptype, material: I.material, labor_minutes: I.labor_minutes, rush: I.rush, success_rate: failure_rate, name: (est.files || []).map(f => f.name).join(", ") },
                                       use("costing.rates", () => ({}))() || {}, (ctx.cfg && ctx.cfg.margin) || {});
     return {
       inputs: { ...I, printer_id: chosen >= 0 ? chosen : null }, source, sources_available: sources, source_label: label,

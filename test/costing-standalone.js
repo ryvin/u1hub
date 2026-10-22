@@ -213,6 +213,75 @@ function pureChecks() {
   const pn = C.pricing(s, {}, null);
   ok(pn && pn.methods.every(x => x.price === null) && pn.breaks.every(b => b.each === null), "no pricing rates: every method blank with a note, none invented", pn);
 
+  console.log("\n== PURE: the owner's minimum price (failure, sales tax, card fee, whole dollars) ==");
+  // Live-style rates: U1 $849 / 5000 h + $0.10/h, 150 W at $0.183/kWh (the suggestions), material $0.02/g,
+  // sales tax 8.25 % (price tax-inclusive), card fee 2.6 % + $0.15 on the whole ticket.
+  const RL = { cost_per_g: 0.02, sales_tax_pct: 8.25, platform_fee_pct: 2.6, platform_fee_fixed: 0.15, suggested: C.SUGGESTED };
+  const big = { id: "big", printer_id: 0, type: "u1", outcome: "done", seconds: 70 * 3600, pieces: 1, material: { grams: 1200, source: "slicer" } };
+  const small = { id: "small", printer_id: 0, type: "u1", outcome: "done", seconds: 10 * 3600, pieces: 1, material: { grams: 20, source: "slicer" } };
+  let so = C.projectSummary({ items: [] }, [big], { ...RL, failure_pct: 0 });
+  let po = C.pricing(so, { ...RL, failure_pct: 0 }, null);
+  ok(so.direct === 44.81 && po && po.break_even === 50.08 && po.minimum === 51, "1200 g / 70 h, failure 0: direct 44.81 -> break-even (44.81 + 0.15) / (1/1.0825 - 0.026) = 50.08 -> minimum $51", po && { direct: so.direct, be: po.break_even, min: po.minimum });
+  ok(po && po.recommended && po.recommended.price === 51 && po.recommended.method === "minimum", "…and with no markup / margin / hour rate set the minimum IS the recommended price", po && po.recommended);
+  so = C.projectSummary({ items: [] }, [big], { ...RL, failure_pct: 24 });
+  po = C.pricing(so, { ...RL, failure_pct: 24 }, null);
+  ok(so.cost === 55.56 && po && po.break_even === 62.05 && po.minimum === 63 && so.failure_pct_used === 24 && so.failure_source === "configured", "failure_pct 24: 44.81 x 1.24 = 55.56 -> (55.56 + 0.15) / 0.89779 = 62.05 -> minimum $63, source 'configured'", po && { cost: so.cost, be: po.break_even, min: po.minimum, f: so.failure_pct_used, src: so.failure_source });
+  so = C.projectSummary({ items: [] }, [small], { ...RL, failure_pct: 0 });
+  po = C.pricing(so, { ...RL, failure_pct: 0 }, null);
+  ok(so.direct === 3.37 && po && po.minimum === 4, "20 g / 10 h, failure 0: direct 3.37 -> minimum $4 (never below cost)", po && { direct: so.direct, be: po.break_even, min: po.minimum });
+  const RM = { ...RL, failure_measured: { pct: 16.7, failed: 3, prints: 40, since: Date.parse("2026-09-01T00:00:00Z") } };
+  so = C.projectSummary({ items: [] }, [big], RM);
+  po = C.pricing(so, RM, null);
+  ok(so.failure === 7.48 && so.failure_pct_used === 16.7 && /^measured: 3 started failures over 40 prints, since 2026-09-01/.test(so.failure_source) && po.minimum === 59,
+    "failure_pct unset: the farm's measured 16.7 % is used and says so; 44.81 x 1.167 = 52.29 -> minimum $59", { f: so.failure, used: so.failure_pct_used, src: so.failure_source, min: po && po.minimum });
+  so = C.projectSummary({ items: [] }, [big], { ...RM, failure_pct: 0 });
+  ok(so.failure === 0 && so.failure_pct_used === 0 && so.failure_source === "configured", "an explicit failure_pct (even 0) overrides the measured rate", { f: so.failure, src: so.failure_source });
+  so = C.projectSummary({ items: [] }, [big], { ...RL, failure_pct: 0, markup_pct: 100 });
+  po = C.pricing(so, { ...RL, failure_pct: 0, markup_pct: 100 }, null);
+  ok(po.recommended.method === "markup" && po.recommended.price === r2((89.62 + 0.15) / (1 / 1.0825 - 0.026)) && po.minimum === 51,
+    "a configured markup above the minimum wins, compared as a ticket price (89.62 grossed up once for tax and fee = 99.99)", po.recommended);
+  const two = { ...small, pieces: 2 };
+  so = C.projectSummary({ items: [] }, [two], { ...RL, failure_pct: 0 });
+  po = C.pricing(so, { ...RL, failure_pct: 0 }, null);
+  ok(po.minimum_each === 2 && po.minimum === 4 && po.pieces === 2, "per piece: break-even 3.92 / 2 pieces = 1.96 -> $2 each -> minimum $4 for the two", po && { each: po.minimum_each, min: po.minimum });
+  so = C.projectSummary({ items: [] }, [big], { cost_per_g: 0.02, suggested: C.SUGGESTED });
+  po = C.pricing(so, { cost_per_g: 0.02, suggested: C.SUGGESTED, markup_pct: 50 }, null);
+  ok(po.break_even === so.cost && po.minimum === Math.ceil(so.cost) && po.methods.find(x => x.key === "markup").gross === po.methods.find(x => x.key === "markup").price,
+    "no tax and no fee set: break-even is the cost and every method's listed price is its price, as before", { be: po.break_even, cost: so.cost });
+  ok(Math.abs(C.netOf(C.grossUp(50, RL), RL) - 50) < 1e-9 && Math.abs(C.grossUp(50, RL) - (50.15 / (1 / 1.0825 - 0.026))) < 1e-9, "one gross-up for tax + card fee, and netOf undoes it exactly", C.grossUp(50, RL));
+  // The Costing UI's selection total is the same arithmetic (public/modules/costing-ui.js selTotals, evaluated here on its own).
+  const uiSrc = fs.readFileSync(path.join(REPO, "public", "modules", "costing-ui.js"), "utf8");
+  const blk = /\/\/ <sel-totals>[\s\S]*?\n([\s\S]*?)\/\/ <\/sel-totals>/.exec(uiSrc);
+  const selTotals = blk ? new Function(blk[1] + "\nreturn selTotals;")() : null;
+  so = C.projectSummary({ items: [] }, [big], { ...RL, failure_pct: 24 });
+  po = C.pricing(so, { ...RL, failure_pct: 24 }, null);
+  const withCost = r => ({ ...r, cost: C.costOf(r, RL) });
+  const st = selTotals ? selTotals([withCost(big), withCost({ ...small, id: "nog", material: { grams: null }, seconds: null })], po.rule) : null;
+  ok(st && st.n === 2 && st.priced === 1 && st.without === 1 && st.cost === 44.81 && st.grams === 1200 && st.hours === 70 && st.minimum === po.minimum && st.minimum === 63,
+    "UI selection total: 1 priced print summed (44.81, 1200 g, 70 h), the one with no cost listed apart, never as $0; its minimum equals the server's ($63)", st);
+
+  console.log("\n== PURE: the failure allowance ignores rows that are not counted; the measured farm rate ==");
+  const good = { id: "g1", printer_id: 0, outcome: "done", seconds: 3600, material: { grams: 50, source: "slicer" } };
+  const cancelledOff = { id: "x1", printer_id: 0, outcome: "cancelled", seconds: 1800, counted: false, material: { grams: 10, source: "slicer" } };
+  const fa1 = C.projectSummary({ items: [] }, [good], { ...R, failure_pct: 10.2 }).failure;
+  const fa2 = C.projectSummary({ items: [] }, [good, cancelledOff], { ...R, failure_pct: 10.2 }).failure;
+  ok(fa1 > 0 && fa1 === fa2, "failure_pct 10.2: a good print alone and the same print beside a cancelled one marked don't-count carry the same allowance", { alone: fa1, withUncounted: fa2 });
+  const T0 = Date.parse("2026-09-01T00:00:00Z");
+  const led = [
+    { id: "d1", at: T0 + 1000, printer_id: 0, type: "u1", outcome: "done", seconds: 7200, material: { grams: 100, source: "slicer" } },
+    { id: "d2", at: T0 + 2000, printer_id: 0, type: "u1", outcome: "done", seconds: 3600, material: { grams: 50, source: "slicer" } },
+    { id: "e1", at: T0 + 3000, printer_id: 0, type: "u1", outcome: "error", seconds: 7200, material: { grams: 60, source: "slicer", partial: true } },
+    { id: "c1", at: T0, printer_id: 0, type: "u1", outcome: "cancelled", seconds: 120, material: { grams: 3, source: "slicer", partial: true } },
+    { id: "c2", at: T0 + 500, printer_id: 0, type: "u1", outcome: "cancelled", seconds: null, material: { grams: 8, source: "slicer", partial: true } },
+    { id: "u1", at: T0 + 4000, printer_id: 0, type: "u1", outcome: "error", seconds: 9000, counted: false, material: { grams: 80, source: "slicer", partial: true } }
+  ];
+  const mf = C.measuredFailure(led, { cost_per_g: 0.02, suggested: C.SUGGESTED });
+  const dc = id => C.costOf(led.find(x => x.id === id), { cost_per_g: 0.02, suggested: C.SUGGESTED }).direct;
+  const wantPct = Math.round(dc("e1") / (dc("d1") + dc("d2")) * 1000) / 10;
+  ok(C.MIN_STARTED_SECONDS === 300 && mf && mf.failed === 1 && mf.prints === 3 && mf.pct === wantPct && mf.since === T0 + 1000,
+    "measured rate: the 2-hour error counts, the 120 s cancel and the one with no seconds do not (under " + (C.MIN_STARTED_SECONDS) + " s), the uncounted row does not; " + wantPct + " % = failed cost / done cost", mf);
+  ok(C.measuredFailure([], {}) === null || C.measuredFailure([], {}).pct === null, "an empty ledger measures nothing (null, never 0 %)", C.measuredFailure([], {}));
+
   console.log("\n== PURE: CSV and the quote page ==");
   const csv = C.projectCsv(proj, [A, E, F], RS);
   const lines = csv.split("\r\n").filter(Boolean);
@@ -345,6 +414,11 @@ function pureChecks() {
   const rhtml = C.reportHtml(C.report(rows, projects, clients, RR, { groupBy: "project", from: T("2026-01-01T00:00:00Z"), to: T("2026-04-01T00:00:00Z") }));
   ok(rhtml.includes("Spring &lt;order&gt;") && !rhtml.includes("Spring <order>") && !/<script/.test(rhtml), "the printable report escapes the project name and carries no script", null);
   ok(rhtml.includes("2026-01-01 to 2026-03-31") && rhtml.includes("$27.21") && rhtml.includes("Cost report by project") && /class="bar"/.test(rhtml), "…and shows the range, the project's cost and a bar per group", null);
+  const rf = C.reportHtml(C.report(rows, projects, clients, { ...RR, failure_pct: 50 }, { groupBy: "project" }));
+  ok(rf.includes("<th class=n>Failure allowance</th><th class=n>Overhead</th>") && rf.includes("<td class=n>$1.00</td><td class=n>$0.20</td>"),
+    "the printable report shows the failure allowance and overhead in their own columns (Signs: 50 % of 2.00 = 1.00, overhead 10 % of 2.00 = 0.20), never summed under one heading", null);
+  const uiR = fs.readFileSync(path.join(REPO, "public", "modules", "costing-ui.js"), "utf8");
+  ok(/<th>Failure allow\.<\/th><th>Overhead<\/th>/.test(uiR) && !/\(g\.overhead \|\| 0\) \+ \(g\.failure \|\| 0\)/.test(uiR), "…and so does the Reports view", null);
 }
 
 // ---- live half ---------------------------------------------------------------------------------
@@ -509,8 +583,24 @@ function pureChecks() {
     ok(S.labor.cost === 15 && S.extras === 6.2 && S.subtotal === r2(S.direct + 15 + 6.2), "labour $15 (30 min at $30/h), extras $6.20, subtotal adds up", S);
     ok(S.failure === 0 && S.overhead === r2(S.subtotal * 0.1) && S.cost === r2(S.subtotal + S.overhead), "no failure allowance (a failed row exists); overhead 10%; cost = subtotal + overhead", S);
     ok(S.charged === 40 && S.margin === r2(40 - S.cost) && S.margin_pct === Math.round(S.margin / 40 * 100), "charged 40 -> margin and margin %", S);
-    ok(full.pricing && full.pricing.methods.find(m => m.key === "markup").price === r2(S.cost * 3) && full.pricing.methods.find(m => m.key === "per_gram").price === r2(S.grams * 0.12),
-      "pricing helper: markup 200% and the per-gram floor from the margin module's sell floor", full.pricing.methods);
+    ok(full.pricing && full.pricing.methods.find(m => m.key === "markup").price === r2(S.cost * 3) && full.pricing.methods.find(m => m.key === "per_gram").price === null,
+      "pricing helper: markup 200%; no per-gram floor while nobody has set a sell floor (margin.js's built-in $0.12 is not the owner's)", full.pricing.methods);
+    ok(full.pricing.break_even === S.cost && full.pricing.pieces === 10 && full.pricing.minimum === Math.ceil(r2(S.cost / 10)) * 10 && full.pricing.recommended.method === "markup" && full.pricing.recommended.price === r2(S.cost * 3) && full.pricing.failure_source != null,
+      "break-even, minimum (whole dollars per piece: Frog x10 is 10 pieces), the winning method and the failure source are in the API", { be: full.pricing.break_even, min: full.pricing.minimum, rec: full.pricing.recommended, src: full.pricing.failure_source });
+    r = await jpost("/api/margin/settings", { sell_per_g: 0.12 });
+    full = (await jget("/api/costing/projects/" + P1)).body;
+    ok(r.status === 200 && full.pricing.methods.find(m => m.key === "per_gram").price === r2(S.grams * 0.12), "a sell floor the owner saved (Worth printing? settings) brings the per-gram method in", full.pricing.methods.find(m => m.key === "per_gram"));
+    r = await jpost("/api/costing/settings", { sales_tax_pct: 31 });
+    ok(r.status === 400 && /sales_tax_pct/.test(r.body.error), "KNOWN-BAD sales tax over 30 % -> 400", r.body);
+    r = await jpost("/api/costing/settings", { sales_tax_pct: 8.25, platform_fee_pct: 2.6, platform_fee_fixed: 0.15 });
+    full = (await jget("/api/costing/projects/" + P1)).body;
+    ok(r.status === 200 && r.body.sales_tax_pct === 8.25 && full.pricing.break_even === r2((S.cost + 0.15) / (1 / 1.0825 - 0.026)) && full.pricing.minimum === Math.ceil(r2(full.pricing.break_even / 10)) * 10,
+      "sales tax and card fee saved; the project's break-even grosses the cost up once for both", { be: full.pricing.break_even, min: full.pricing.minimum });
+    await jpost("/api/costing/settings", { sales_tax_pct: "", platform_fee_pct: "", platform_fee_fixed: "" });
+    await jpost("/api/margin/settings", { sell_per_g: "" });
+    r = await jget("/api/costing");
+    ok(r.body.failure_measured && r.body.failure_measured.min_started_seconds === 300 && r.body.failure_measured.failed === 1 && r.body.failure_measured.pct > 0,
+      "GET /api/costing carries the measured farm failure rate: the counted 600 s cancel over the done print", r.body.failure_measured);
     ok(full.pricing.methods.find(m => m.key === "margin").price === null && /Settings/.test(full.pricing.methods.find(m => m.key === "margin").note), "unset target margin: blank with a note", full.pricing.methods);
     const csvR = await fetch(HUB + "/api/costing/projects/" + P1 + ".csv");
     const csvB = Buffer.from(await csvR.arrayBuffer());        // .text() would strip the BOM before we could see it

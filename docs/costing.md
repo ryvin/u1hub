@@ -17,7 +17,7 @@ a Costing block in Settings). Suite: `test/costing-standalone.js` (part of
 | # | Question | Decision | Why |
 |---|---|---|---|
 | 1 | Is a project one order or a long-running account? | A **project is long-running client work** that can span many prints and many Dispatch bundles; `project_id` lives on each ledger row, not on a bundle. | A small farm bills per client per piece of work, not per plate; putting the id on the row means a print can be moved after the fact and nothing in Dispatch has to change. A `bundle_id` is recorded on the row when Dispatch was driving, so a v2 bundle link needs no migration. |
-| 2 | Are failed/cancelled prints charged to the project? | **Yes by default**, each row has a **"don't count"** toggle, and the `failure_pct` allowance is applied **only while a project has no failed rows**. | A real failed print is a real cost; hiding it makes every quote look better than the last job did. The toggle absorbs the one you choose to eat, and the allowance is for quoting before anything has failed, never on top of actual failures. |
+| 2 | Are failed/cancelled prints charged to the project? | **Yes by default**, each row has a **"don't count"** toggle, and the failure allowance is applied **only while a project has no counted failed rows** (a failed row marked "don't count" is not in the cost, so it does not cancel the allowance either). | A real failed print is a real cost; hiding it makes every quote look better than the last job did. The toggle absorbs the one you choose to eat, and the allowance is for quoting before anything has failed, never on top of actual failures. |
 | 3 | Electricity measured or typed? | **Typed average watts per printer**, no default; the ledger row already carries an `energy.kwh` slot that a metered value fills in v2. | The U1 has no published average draw (1150 W is its peak), so a default would be an invented number. A blank energy line that says "no watts" is honest; the Shelly Wh delta at print edges is the v2 sampler and drops straight into the same field. |
 | 4 | Labour per print or as line items? | **Explicit line items only**, plus an optional `setup_minutes` per counted print that is **blank (off) by default**. | Most labour is per project (support removal for the batch, packing), not per plate. The per-print default exists for a farm that wants it, but nothing is charged the person did not type. |
 | 5 | CSV + quote page, or invoices? | **CSV export and a printable quote page**; no invoice numbering, tax or currency. | Invoicing is a different feature with legal shape. The quote page prints to PDF from the browser and carries every line's source; the CSV is the bridge to whatever does the invoicing. |
@@ -256,7 +256,8 @@ direct    = sum of direct over counted rows       (failed rows included)
 labor     = (sum item.minutes + setup_minutes x counted rows) / 60 x labor_rate
 extras    = sum of hardware + packaging + shipping + other items
 subtotal  = direct + labor + extras
-failure   = direct x failure_pct          only while the project has NO failed rows
+failure   = direct x failure rate         only while the project has NO counted failed rows
+            failure rate = failure_pct when typed (0 included), else the farm's measured rate (below)
 overhead  = subtotal x overhead_pct
 cost      = subtotal + failure + overhead
 margin    = charged - cost,  margin_pct = margin / charged
@@ -270,13 +271,82 @@ chosen; each method is a row, blank with a note when its rate is unset:
 markup        = cost x (1 + markup_pct)
 target margin = cost / (1 - margin_pct)
 machine-hour  = hours x hour_rate + material + labor + extras
-per-gram      = margin.quote(grams).min_plate      (the "Worth printing?" sell floor)
+per-gram      = grams x sell_per_g      ONLY when a sell floor was set on purpose: costing.sell_per_g
+                in config.json, else margin.sell_per_g (the "Worth printing?" settings). margin.js's
+                built-in $0.12/g default is not the owner's price and never makes this method.
                 each is then lifted to min_fee when one is set
-listed        = (price + platform_fee_fixed) / (1 - platform_fee_pct)     so the NET is the price you picked
+listed        = (price + platform_fee_fixed) / (1 / (1 + sales_tax_pct) - platform_fee_pct)
+                the ticket is tax-INCLUSIVE and the card / platform fee is charged on the whole
+                ticket, so the NET after tax and fee is the price you picked. One gross-up for
+                both; with sales_tax_pct unset it is the old (price + fixed) / (1 - pct) exactly.
 breaks (1/10/50 units): each = ((direct / pieces x n + labor + extras) x (1 + overhead_pct)) x (1 + markup_pct) / n
 ```
 
 `grossUp` / `netOf` are exported and round-trip exactly.
+
+### The minimum price (the owner's rule)
+
+Every recommended price - the Costing project page, the Estimate tab and the
+public quote (all three go through `pricing()`) - has this floor:
+
+```
+cost_with_failure = cost                    (projectSummary's cost: direct x (1 + failure rate)
+                                              + labour + extras + overhead)
+break_even  = (cost_with_failure + platform_fee_fixed) / (1 / (1 + sales_tax_pct) - platform_fee_pct)
+minimum     = ceil(break_even / pieces) x pieces     whole dollars PER PIECE, then times the pieces
+recommended = the highest of: minimum, grossUp(min_fee) when set, and the listed (`gross`)
+              price of every method that is set (markup, target margin, machine-hour, per-gram)
+```
+
+Per piece was chosen so that each piece sells for a whole-dollar amount (a
+10-piece plate breaking even at $25.05 has a minimum of $3 x 10 = $30, not
+$26). A cent of float noise never rounds up a dollar (the break-even is
+rounded to cents first). The API carries `break_even`, `minimum`,
+`minimum_each`, `recommended { price, each, method, label }`,
+`failure_pct_used`, `failure_source`, `sales_tax_pct` and `rule` (what a
+client needs to price a hand-picked selection of prints the same way).
+With sales tax, the fee and the failure rate all unset, the break-even is the
+cost and every method's listed price is what it was before.
+
+Acceptance numbers (test/costing-standalone.js, test/estimate-standalone.js),
+U1 at the suggested rates ($849 / 5000 h + $0.10/h, 150 W at $0.183/kWh),
+material $0.02/g, sales tax 8.25 %, card fee 2.6 % + $0.15:
+
+| Print | failure | direct | break-even | minimum |
+|---|---|---|---|---|
+| 1200 g / 70 h | 0 % | 44.81 | 50.08 | $51 |
+| 1200 g / 70 h | 24 % (typed) | 44.81 (cost 55.56) | 62.05 | $63 |
+| 1200 g / 70 h | 16.7 % (measured) | 44.81 (cost 52.29) | 58.41 | $59 |
+| 20 g / 10 h | 0 % | 3.37 | 3.92 | $4 |
+
+### The failure allowance: typed, or measured on the ledger
+
+When `costing.failure_pct` is unset, the allowance is the farm's **current
+measured rate** (`measuredFailure(rows, rates)`, pure, exported), recomputed
+whenever the ledger or the rates change (cached on a ledger version that
+every save bumps; no I/O):
+
+```
+started failure = a counted cancelled / error row with seconds >= MIN_STARTED_SECONDS (300)
+                  (no seconds recorded = not started)
+rate            = direct of the started failures / direct of the counted done rows
+```
+
+`MIN_STARTED_SECONDS = 300`: a print stopped inside its first five minutes
+(a bad first layer, a wrong file) costs next to nothing and says more about
+the operator than the farm. The owner measured the live ledger at about
+16.7 % with a 3, 5 or 10 minute cutoff against 25.2 % with none. The
+denominator is the done rows' cost, not all rows, because the allowance is a
+percentage of a good print's cost. Rows marked "don't count" are left out on
+both sides, the same basis as the report's `failure_share`.
+
+`GET /api/costing` carries it as `failure_measured { pct, failed, done,
+prints, since, failed_cost, done_cost, min_started_seconds }`, and every
+summary says what it used: `failure_pct_used` and `failure_source` -
+`"configured"`, `"measured: 3 started failures over 40 prints, since
+2026-09-01"`, an estimate's `"this file's own record: 90 % done"`, or
+`"actual: N failed prints on this project, already in the print cost"` (the
+allowance is then 0). A typed `failure_pct`, 0 included, always wins.
 
 ## Reports
 
@@ -367,13 +437,27 @@ default only unassigned prints are touched. The job card's pending
 assignment is unchanged: the next finished print of that file still lands in
 the project picked there.
 
+**Selection totals.** The bulk bar shows the selected rows' total cost, grams
+and hours ("3 selected of 120 · $12.40 cost · 310 g · 9.5 h"), summed in the
+browser from each row's server-computed `cost` (`costOf`), across pages.
+On a project page every print has a checkbox (and "all"), and a line reads
+"Selected: N prints · $X cost · Y g · Z h · minimum price $W" - for "what
+sold" out of a project. The minimum there is the owner's rule over those
+prints only (their direct cost, the failure rate from `pricing.rule` unless a
+selected print failed, tax and card fee, whole dollars per finished piece; no
+labour, extras or overhead). A print with no cost (no grams and no time) is
+named as "N without cost" and left out of every total, never summed as $0.
+The arithmetic is `selTotals` in `public/modules/costing-ui.js`, between
+`// <sel-totals>` markers; the suite evaluates that block and checks it gives
+the server's minimum for the same prints.
+
 ## State
 
 | File | Content | Cap |
 |---|---|---|
 | `prints.json` (beside config.json, gitignored) | `{ prints: [row…] }` — the ledger, in `at` order. Row: `id, at, printer_id, printer, file, type, outcome (done\|cancelled\|error), project_id, job_id, bundle_id, seconds, seconds_source (actual\|hub-clock\|history), est_minutes, est_source (slicer\|printer-meta), material { grams, grams_source (deduction\|slicer\|printer-meta\|history), material, density, density_assumed, filament_mm, cost, source, partial, progress, slicer_cost, heads[], misses[], deducted_g }, energy (null \| { kwh, source }), pieces, counted, note, autofill { at, result, still_blank }, done_twice, history_job, history_status, source ("history" on an imported row; absent on one the Hub watched), imported_at`. | 10,000 rows (`U1HUB_COSTING_LEDGER_MAX`), oldest dropped; see "The cap" above. |
 | `projects.json` (beside config.json, gitignored) | `{ clients: { id: { name, email, notes } }, projects: { id: { client_id, name, state, charged, deadline, notes, items: [{ id, kind, label, minutes \| cost }] } }, pending: { "type:file": project_id } }`. | — |
-| `config.json` → `costing` | `kwh_rate, labor_rate, setup_minutes, failure_pct, overhead_pct, min_fee, markup_pct, margin_pct, hour_rate, platform_fee_pct, platform_fee_fixed, printers: { "<idx>": { purchase, life_hours, maint_per_hour, avg_watts } }`. Every key optional; absent = blank. | — |
+| `config.json` → `costing` | `kwh_rate, labor_rate, setup_minutes, failure_pct, overhead_pct, min_fee, markup_pct, margin_pct, hour_rate, platform_fee_pct, platform_fee_fixed, sales_tax_pct, sell_per_g (config file only; else margin.sell_per_g), printers: { "<idx>": { purchase, life_hours, maint_per_hour, avg_watts } }`. Every key optional; absent = blank. | — |
 
 Writes go through the same tmp+rename-with-fallback `save()` shape as
 `modules/dispatch.js`, from handlers and event listeners only, never a timer.
@@ -464,9 +548,9 @@ place. Missing, multiACE rows simply keep the flat / slicer price.
   the Dispatch bundle); charged-vs-cost history on the client page; manual
   ledger rows for prints the Hub did not watch.
 - ~~**v3**: Moonraker `/server/history/list` reconciliation per printer for
-  prints the Hub never saw~~ — shipped as the import above. Still open:
-  per-project failure-rate statistics feeding `failure_pct` from measurement
-  (the report's `failure_share` is the raw number); invoices, if they are
+  prints the Hub never saw~~ — shipped as the import above. The measured
+  farm failure rate now feeds the allowance when `failure_pct` is unset
+  ("The failure allowance" above). Still open: invoices, if they are
   ever wanted, as their own module on top of this ledger; a cheaper save
   than rewriting the whole ledger file on every assignment once it nears the
   cap.

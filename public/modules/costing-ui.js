@@ -34,11 +34,51 @@
   const srcText = t => Object.entries(t || {}).map(([k, n]) => n + " " + (SRC[k] || k)).join(", ") || "—";
   const qs = o => Object.entries(o).filter(([, v]) => v != null && v !== "").map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&");
 
+  // <sel-totals> self-contained: test/costing-standalone.js evaluates this block on its own
+  // The totals of a hand-picked set of prints, from the per-print cost the
+  // server already sent (p.cost: costOf). A print with no direct cost (no grams
+  // and no time) is counted in `without` and left out - never summed as $0.
+  // rule = pricing.rule from the project API: the same minimum as the server's
+  // pricing() (docs/costing.md "The minimum price"), over these prints only -
+  // no labour, extras or overhead, which belong to the project, not a print.
+  function selTotals(prints, rule) {
+    const r2 = v => Math.round(v * 100) / 100;
+    const out = { n: 0, priced: 0, without: 0, failed: 0, pieces: 0, cost: null, grams: null, hours: null, break_even: null, minimum: null };
+    let cost = 0, grams = 0, hours = 0, anyG = false, anyH = false;
+    for (const p of prints || []) {
+      out.n++;
+      const c = (p && p.cost) || {};
+      if (c.direct == null) { out.without++; continue; }
+      out.priced++; cost += c.direct;
+      if (c.material && c.material.grams != null) { grams += c.material.grams; anyG = true; }
+      if (c.hours != null) { hours += c.hours; anyH = true; }
+      if (p.outcome !== "done") out.failed++; else out.pieces += p.pieces > 0 ? p.pieces : 1;
+    }
+    if (!out.priced) return out;
+    out.cost = r2(cost); out.grams = anyG ? r2(grams) : null; out.hours = anyH ? Math.round(hours * 1000) / 1000 : null;
+    const R = rule || {};
+    const f = out.failed === 0 && Number(R.failure_pct) > 0 ? r2(out.cost * R.failure_pct / 100) : 0;
+    const keep = 1 / (1 + (Number(R.sales_tax_pct) || 0) / 100) - (Number(R.fee_pct) || 0) / 100;
+    if (keep > 0) {
+      const be = (r2(out.cost + f) + (Number(R.fee_fixed) || 0)) / keep, pcs = out.pieces > 0 ? out.pieces : 1;
+      out.break_even = r2(be);
+      out.minimum = Math.max(0, Math.ceil(r2(be / pcs) - 1e-9)) * pcs;
+    }
+    return out;
+  }
+  // </sel-totals>
+  // "$12.34 cost · 56.7 g · 3.2 h · 1 without cost", every part from selTotals.
+  const selText = (t, withMin) => !t.n ? "" : (t.priced ? usd(t.cost) + " cost · " + (t.grams != null ? t.grams + " g" : "— g") + " · " + hrs(t.hours) + (withMin && t.minimum != null ? " · minimum price $" + t.minimum : "") : "no cost known") +
+    (t.without ? " · " + t.without + " without cost (no grams or time), not counted" : "");
+
   let EL = null, DATA = null, OPEN = null, PROJ = null, FORM = null, MSG = "", OKMSG = "";
   let VIEW = "projects";                                           // projects | prints | reports
   // the Prints view
   const PF = { from: "", to: "", printer: "", type: "", outcome: "", assigned: "", project: "", client: "", q: "", source: "", offset: 0, limit: 50 };
-  let PL = null, SEL = new Set(), MATCH = null;
+  // SEL: id -> the print row as the list served it (its cost included), so a
+  // selection that spans pages still totals from the server's own numbers.
+  let PL = null, SEL = new Map(), MATCH = null;
+  let PSEL = new Set(), PSEL_FOR = null;                           // the project page's checked prints
   // the Reports view
   const RF = { range: "month", from: "", to: "", group: "client" };
   let REP = null;
@@ -87,6 +127,7 @@
       ".cst-filters{display:flex; gap:6px 8px; align-items:center; flex-wrap:wrap; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:10px;} .cst-filters label{display:flex; flex-direction:column; gap:2px; font-family:var(--mono); font-size:10.5px; color:var(--ink-faint); letter-spacing:.04em;}",
       ".cst-filters .field{font-size:12px; padding:4px 7px; min-width:0;} .cst-filters input[type=date].field{width:138px;} .cst-filters input.q{width:170px;} .cst-filters .btn{align-self:flex-end;} .cst-filters a.btn{align-self:flex-end; text-decoration:none;}",
       ".cst-bulk{display:flex; gap:6px 10px; align-items:center; flex-wrap:wrap; padding:8px 12px; border:1px solid color-mix(in srgb, var(--signal) 40%, var(--line)); border-radius:10px; background:color-mix(in srgb, var(--signal) 6%, var(--panel)); margin-bottom:10px; font-family:var(--mono); font-size:11.5px; color:var(--ink-dim);}",
+      ".cst-bulk .seltot{flex:1 1 220px; min-width:0; overflow-wrap:anywhere; color:var(--ink);} .cst-row .pck{flex:none; align-self:center; width:18px; height:18px; margin:0;}",
       ".cst-bulk .btn{font-size:11.5px; padding:4px 9px;} .cst-bulk select.field{font-size:12px; padding:3px 7px; width:auto;} .cst-bulk .sp{flex:1;}",
       ".cst-pager{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; font-family:var(--mono); font-size:11.5px; color:var(--ink-faint);} .cst-pager .sp{flex:1;} .cst-pager .btn{font-size:11.5px; padding:4px 9px;} .cst-pager select.field{font-size:12px; padding:3px 7px; width:auto;}",
       // the report chart: one series, one hue, plain markup (no library)
@@ -167,7 +208,8 @@
   const printRow = (p, inProject) => {
     const c = p.cost || {};
     const mat = c.material || {};
-    return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '">' + thumb(p) + '<div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
+    return '<div class="cst-row' + (p.counted === false ? " off" : "") + '" data-print="' + esc(p.id) + '">' +
+      (inProject ? '<input type="checkbox" class="pck" data-psel="' + esc(p.id) + '"' + (PSEL.has(p.id) ? " checked" : "") + ' aria-label="select ' + esc(String(p.file).replace(/\.gcode$/i, "")) + '">' : "") + thumb(p) + '<div class="cmain"><div class="t">' + esc(String(p.file).replace(/\.gcode$/i, "")) +
       ' <span class="cst-pill ' + (p.outcome === "done" ? "ok" : "bad") + '">' + esc(p.outcome) + "</span>" + (p.counted === false ? ' <span class="cst-pill">not counted</span>' : "") + srcPill(p) + "</div>" +
       '<div class="s">' + when(p.at) + " · " + esc(p.printer) + " · " + (p.pieces || 1) + " pc · " + hrs(c.hours) + (c.time_source ? " (" + (SRC[c.time_source] || c.time_source) + ")" : "") +
       " · " + (mat.grams != null ? mat.grams + " g" + (mat.grams_source ? " (" + (SRC[mat.grams_source] || mat.grams_source) + ")" : "") : "no grams") + " · material <b>" + usd(mat.cost) + "</b>" + (mat.source ? " (" + (SRC[mat.source] || mat.source) + (mat.partial ? ", partial" : "") + ")" : "") +
@@ -221,6 +263,8 @@
 
   function renderProject() {
     const { project: p, client: c, summary: s, pricing: pz, prints } = PROJ;
+    if (PSEL_FOR !== p.id) { PSEL = new Set(); PSEL_FOR = p.id; }
+    for (const id of [...PSEL]) if (!prints.some(x => x.id === id)) PSEL.delete(id);
     let h = '<div class="cst-sec"><a href="#" data-back style="color:inherit; text-decoration:none">← projects</a><span class="sp"></span>' +
       '<a class="btn ghost" href="/api/costing/projects/' + encodeURIComponent(p.id) + '.csv" download style="text-decoration:none">Export CSV</a>' +
       '<a class="btn ghost" href="/api/costing/projects/' + encodeURIComponent(p.id) + '/quote" target="_blank" rel="noopener" style="text-decoration:none">Print quote</a>' +
@@ -238,12 +282,17 @@
       line("machine time", usd(s.machine), srcText(s.sources.machine)) + line("energy", usd(s.energy), srcText(s.sources.energy)) +
       line("labour", usd(s.labor.cost), s.labor.minutes + " min" + (s.labor.setup_minutes ? " incl. " + s.labor.setup_minutes + "/print setup" : "") + (s.labor.minutes && s.labor.cost == null ? " · no labour rate" : "")) +
       line("extras", usd(s.extras), "hardware, packaging, shipping") +
-      (s.failure ? line("failure allowance", usd(s.failure), "quoting only - no failed prints yet") : "") + (s.overhead ? line("overhead", usd(s.overhead), "of subtotal") : "") +
+      (s.failure || s.failure_source ? line("failure allowance", usd(s.failure), (s.failure_pct_used != null ? s.failure_pct_used + "% · " : "") + (s.failure_source || "")) : "") + (s.overhead ? line("overhead", usd(s.overhead), "of subtotal") : "") +
       line("cost", usd(s.cost), "", "tot") +
       (s.charged != null ? line("charged", usd(s.charged), "") + line("margin", usd(s.margin) + (s.margin_pct != null ? ' <span class="src">' + s.margin_pct + "%</span>" : ""), "", "") : "") + "</div>" +
       (s.blanks.length ? '<div class="cst-blank">Not included: ' + esc(s.blanks.join("; ")) + ". Set the missing rates in Settings → Project costing, or price the roll on the Spools tab.</div>" : "");
     // prints
-    h += '<div class="cst-sec">Prints <span class="cst-pill">' + prints.length + "</span></div>" + (prints.length ? prints.map(x => printRow(x, true)).join("") : '<div class="cst-empty">No prints yet. Pick this project on the job card before sending a file, or assign finished prints from the unassigned strip.</div>');
+    const picked = prints.filter(x => PSEL.has(x.id));
+    const pt = selTotals(picked, pz && pz.rule);
+    h += '<div class="cst-sec">Prints <span class="cst-pill">' + prints.length + "</span></div>" +
+      (prints.length ? '<div class="cst-bulk" id="cst-psel"><label class="cst-inline"><input type="checkbox" data-pselall' + (picked.length === prints.length ? " checked" : "") + ' aria-label="select every print"> all</label>' +
+        '<span class="seltot">' + (picked.length ? "<b>Selected: " + picked.length + " print" + (picked.length === 1 ? "" : "s") + "</b> · " + esc(selText(pt, true)) : "Tick the prints that sold to total their cost and the minimum to charge for them.") + "</span></div>" : "") +
+      (prints.length ? prints.map(x => printRow(x, true)).join("") : '<div class="cst-empty">No prints yet. Pick this project on the job card before sending a file, or assign finished prints from the unassigned strip.</div>');
     // items
     h += '<div class="cst-sec">Line items<span class="sp"></span><button class="btn ghost" data-form="item">+ Add item</button></div>';
     if (FORM === "item") h += '<div class="cst-form" data-enter><div class="r"><select class="field" id="cst-ik" style="flex:0 0 140px"><option value="labor">Labour (minutes)</option><option value="hardware">Hardware</option><option value="packaging">Packaging</option><option value="shipping">Shipping</option><option value="other">Other</option></select><input class="field" id="cst-il" placeholder="What (e.g. support removal, M3 inserts x40, UPS)" data-focus><input class="field num" id="cst-iv" type="number" min="0" step="0.01" placeholder="minutes / $"></div><div class="r"><button class="btn primary" data-go data-additem>Save</button><button class="btn ghost" data-form="">Cancel</button></div></div>';
@@ -251,11 +300,15 @@
     // pricing
     h += '<div class="cst-sec">Pricing helper</div>';
     if (!pz) h += '<div class="cst-empty">Nothing to price yet - the cost is blank.</div>';
-    else h += '<div class="cst-wrap"><table class="cst-table"><thead><tr><th>Method</th><th>Price</th><th>Per piece</th><th>Listed</th></tr></thead><tbody>' +
+    else h += (pz.minimum != null ? '<div class="cst-note" id="cst-minline"><b>Break-even ' + usd(pz.break_even) + " · minimum $" + esc(pz.minimum) + "</b>" + (pz.pieces > 1 ? " ($" + esc(pz.minimum_each) + " x " + esc(pz.pieces) + " pieces)" : "") +
+        (pz.recommended ? " · recommended <b>" + usd(pz.recommended.price) + "</b> (" + esc(pz.recommended.label) + ")" : "") +
+        '<div class="mono">failure ' + (pz.failure_pct_used != null ? esc(pz.failure_pct_used) + "%" : "none") + (pz.failure_source ? " (" + esc(pz.failure_source) + ")" : "") +
+        " · sales tax " + (pz.sales_tax_pct != null ? esc(pz.sales_tax_pct) + "%" : "none") + " · card fee " + (pz.platform.pct != null || pz.platform.fixed != null ? esc(pz.platform.pct || 0) + "% + $" + esc(pz.platform.fixed || 0) : "none") + " · the price is tax-inclusive, the fee is on the whole ticket</div></div>" : "") +
+      '<div class="cst-wrap"><table class="cst-table"><thead><tr><th>Method</th><th>Price</th><th>Per piece</th><th>Listed</th></tr></thead><tbody>' +
       pz.methods.map(m => "<tr><td>" + esc(m.label) + '<div class="note">' + esc(m.note) + '</div></td><td class="hi">' + usd(m.price) + "</td><td>" + usd(m.per_piece) + "</td><td>" + usd(m.gross) + "</td></tr>").join("") +
       "</tbody></table></div>" +
       '<div class="cst-wrap" style="margin-top:8px"><table class="cst-table"><thead><tr><th>Quantity</th>' + pz.breaks.map(b => "<th>" + b.qty + "</th>").join("") + "</tr></thead><tbody><tr><td>cost each</td>" + pz.breaks.map(b => "<td>" + usd(b.cost_each) + "</td>").join("") + "</tr><tr><td>price each (markup)</td>" + pz.breaks.map(b => '<td class="hi">' + usd(b.each) + "</td>").join("") + "</tr></tbody></table></div>" +
-      '<div class="cst-empty" style="font-size:12px">Listed = the price grossed up for the platform fee' + (pz.platform.pct != null || pz.platform.fixed != null ? " (" + (pz.platform.pct || 0) + "% + $" + (pz.platform.fixed || 0) + ")" : " (none set)") + (pz.min_fee != null ? "; minimum fee $" + pz.min_fee + " applied" : "") + ". Quantity breaks amortise labour and extras over the run. Pick one; nothing here is chosen for you.</div>";
+      '<div class="cst-empty" style="font-size:12px">Listed = the price grossed up for sales tax and the card fee' + (pz.platform.pct != null || pz.platform.fixed != null ? " (" + (pz.platform.pct || 0) + "% + $" + (pz.platform.fixed || 0) + ")" : " (none set)") + (pz.min_fee != null ? "; minimum fee $" + pz.min_fee + " applied" : "") + ". Quantity breaks amortise labour and extras over the run. Pick one; nothing here is chosen for you.</div>";
     return h;
   }
 
@@ -278,6 +331,7 @@
     // bulk actions
     const n = SEL.size;
     h += '<div class="cst-bulk"><span><b>' + n + "</b> selected" + (n ? " of " + PL.total : "") + "</span>" +
+      (n ? '<span class="seltot" id="cst-seltot">' + esc(selText(selTotals([...SEL.values()]), false)) + "</span>" : "") +
       '<select class="field" id="cst-bulkproj">' + projOpts("", "assign to…") + '<option value="__none">unassign</option></select><button class="btn ghost" data-bulk="assign"' + (n ? "" : " disabled") + ">Assign selected</button>" +
       '<button class="btn ghost" data-bulk="uncount"' + (n ? "" : " disabled") + ">Don't count</button><button class=\"btn ghost\" data-bulk=\"count\"" + (n ? "" : " disabled") + ">Count</button>" +
       (n ? '<button class="btn ghost" data-bulk="clear">Clear selection</button>' : "") +
@@ -357,11 +411,11 @@
     }
     const row = (g, cls) => '<tr class="' + (cls || "") + '"><td>' + esc(g.label) + (g.projects && RF.group === "client" ? '<div class="note">' + g.projects + " project" + (g.projects === 1 ? "" : "s") + "</div>" : "") + "</td><td>" + g.prints + (g.failed ? ' <span class="note">' + g.failed + " failed</span>" : "") + "</td><td>" + hrs(g.hours) + "</td><td>" + (g.grams != null ? g.grams + " g" : "—") +
       "</td><td>" + usd(g.material) + "</td><td>" + usd(g.machine) + "</td><td>" + usd(g.energy) + '</td><td class="hi">' + usd(g.direct) + "</td><td>" + usd(g.failure_cost) + (g.failure_share ? ' <span class="note">' + g.failure_share + "%</span>" : "") + "</td>" +
-      (al ? "<td>" + usd(g.labor) + "</td><td>" + usd(g.extras) + "</td><td>" + usd(g.overhead != null || g.failure != null ? (g.overhead || 0) + (g.failure || 0) : null) + '</td><td class="hi">' + usd(g.cost) + "</td><td>" + usd(g.charged) + "</td><td>" + usd(g.margin) + (g.margin_pct != null ? ' <span class="note">' + g.margin_pct + "%</span>" : "") + "</td>" : "") +
+      (al ? "<td>" + usd(g.labor) + "</td><td>" + usd(g.extras) + "</td><td>" + usd(g.failure) + "</td><td>" + usd(g.overhead) + '</td><td class="hi">' + usd(g.cost) + "</td><td>" + usd(g.charged) + "</td><td>" + usd(g.margin) + (g.margin_pct != null ? ' <span class="note">' + g.margin_pct + "%</span>" : "") + "</td>" : "") +
       "<td>" + pc(g.coverage.time) + " · " + pc(g.coverage.grams) + " · " + pc(g.coverage.material) + "</td></tr>";
     h += '<div class="cst-wrap"><table class="cst-table" id="cst-rtable"><thead><tr><th>' + esc((GROUPS.find(g => g[0] === RF.group) || [])[1] || RF.group) + "</th><th>Prints</th><th>Time</th><th>Grams</th><th>Material</th><th>Machine</th><th>Energy</th><th>Direct</th><th>Failed</th>" +
-      (al ? "<th>Labour</th><th>Extras</th><th>Overhead</th><th>Cost</th><th>Charged</th><th>Margin</th>" : "") + "<th>Actual t·g·m</th></tr></thead><tbody>" +
-      (REP.groups.length ? REP.groups.map(g => row(g, "")).join("") + row(T, "tot") : '<tr><td colspan="' + (al ? 16 : 10) + '">No prints in this range.</td></tr>') + "</tbody></table></div>" +
+      (al ? "<th>Labour</th><th>Extras</th><th>Failure allow.</th><th>Overhead</th><th>Cost</th><th>Charged</th><th>Margin</th>" : "") + "<th>Actual t·g·m</th></tr></thead><tbody>" +
+      (REP.groups.length ? REP.groups.map(g => row(g, "")).join("") + row(T, "tot") : '<tr><td colspan="' + (al ? 17 : 10) + '">No prints in this range.</td></tr>') + "</tbody></table></div>" +
       '<div class="cst-empty" style="font-size:12px">' + esc(REP.note) + ' "Actual t·g·m" is the share of counted prints whose time, grams and material are measured (the printer\'s clock, the rolls that were loaded, the filament actually extruded) rather than a slicer, metadata or suggested figure.' + (T.labor_blank ? " Some labour minutes have no labour rate and are not costed." : "") + "</div>";
     return h;
   }
@@ -399,7 +453,7 @@
     if (d.rfApply != null) { EL.querySelectorAll("[data-rf]").forEach(i => { RF[i.dataset.rf] = i.value; }); REP = await jget("/api/costing/report?" + qs(reportQuery())); render(); return; }
     if (d.bulk != null) {
       if (d.bulk === "clear") { SEL.clear(); render(); return; }
-      const ids = [...SEL]; if (!ids.length) return;
+      const ids = [...SEL.keys()]; if (!ids.length) return;
       let r;
       if (d.bulk === "assign") { const v = val("#cst-bulkproj"); if (!v) { MSG = "Pick a project to assign to (or 'unassign')."; render(); return; } r = await jpost("/api/costing/prints/bulk", { print_ids: ids, project_id: v === "__none" ? null : v }); }
       else r = await jpost("/api/costing/prints/bulk", { print_ids: ids, counted: d.bulk === "count" });
@@ -431,8 +485,10 @@
   }
   async function onChange(e) {
     const t = e.target;
-    if (t.dataset.sel != null) { if (t.checked) SEL.add(t.dataset.sel); else SEL.delete(t.dataset.sel); render(); return; }
-    if (t.dataset.selall != null) { for (const p of PL.prints) { if (t.checked) SEL.add(p.id); else SEL.delete(p.id); } render(); return; }
+    if (t.dataset.sel != null) { const p = PL.prints.find(x => x.id === t.dataset.sel); if (t.checked && p) SEL.set(p.id, p); else SEL.delete(t.dataset.sel); render(); return; }
+    if (t.dataset.selall != null) { for (const p of PL.prints) { if (t.checked) SEL.set(p.id, p); else SEL.delete(p.id); } render(); return; }
+    if (t.dataset.psel != null) { if (t.checked) PSEL.add(t.dataset.psel); else PSEL.delete(t.dataset.psel); render(); return; }
+    if (t.dataset.pselall != null) { for (const p of (PROJ && PROJ.prints) || []) { if (t.checked) PSEL.add(p.id); else PSEL.delete(p.id); } render(); return; }
     if (t.dataset.pagesize != null) { PF.limit = Number(t.value) || 50; PF.offset = 0; await reloadPrints(); return; }
     if (t.dataset.rf === "range") { RF.range = t.value; render(); return; }
     if (t.dataset.rf != null || t.dataset.pf != null) return;      // applied by the Run / Filter buttons
@@ -486,9 +542,10 @@
   // ---- Settings ----------------------------------------------------------------------
   let SET = null, RATES = null;
   const RATE_LABELS = [["kwh_rate", "electricity $/kWh", "your tariff"], ["labor_rate", "labour $/hour", "for line items and setup"], ["setup_minutes", "setup minutes per print", "blank = none; adds labour to every counted print"],
-    ["failure_pct", "failure allowance %", "quotes only; dropped once a failed print is on the project"], ["overhead_pct", "overhead %", "of subtotal"], ["min_fee", "minimum fee $", "floor for any price"],
+    ["failure_pct", "failure allowance %", "blank = the farm's measured rate; dropped once a failed print is on the project"], ["overhead_pct", "overhead %", "of subtotal"], ["min_fee", "minimum fee $", "floor for any price"],
     ["markup_pct", "markup %", "cost x (1 + markup)"], ["margin_pct", "target margin %", "cost / (1 - margin)"], ["hour_rate", "machine-hour rate $/h", "for the machine-hour method"],
-    ["platform_fee_pct", "platform fee %", "e.g. Etsy 6.5 + 3"], ["platform_fee_fixed", "platform fee fixed $", "e.g. 0.45"]];
+    ["sales_tax_pct", "sales tax %", "prices are tax-inclusive, e.g. 8.25"],
+    ["platform_fee_pct", "card / platform fee %", "on the whole ticket, e.g. 2.6"], ["platform_fee_fixed", "card / platform fee fixed $", "per sale, e.g. 0.15"]];
   const PKEYS = [["purchase", "purchase $"], ["life_hours", "life hours"], ["maint_per_hour", "maintenance $/h"], ["avg_watts", "average watts"]];
   // The suggestion block for a printer: its type's block, else the default
   // block when the type is the one it applies to. A type with neither gets
@@ -549,6 +606,12 @@
       if (notes[k]) i.title = notes[k];
       const h = SET.querySelector('[data-hint="' + k + '"]');
       if (h && sug[k] != null) h.textContent = (s[k] != null ? "" : "suggested " + sug[k] + " - ") + (notes[k] || "");
+      // the failure allowance falls back to the farm's own measured rate, not a suggestion
+      const fm = s.failure_measured;
+      if (k === "failure_pct" && fm && fm.pct != null) {
+        i.placeholder = "measured " + fm.pct;
+        if (h) h.textContent = (s[k] != null ? "typed; the farm measures " : "blank = the measured ") + fm.pct + "% (" + fm.failed + " started failures over " + fm.prints + " prints; under " + Math.round(fm.min_started_seconds / 60) + " min of printing is not a failure)";
+      }
     });
     const set = Object.keys(s.keys ? s : {}).filter(k => s.keys.includes(k) && s[k] != null).length;
     SET.querySelector("#cstHint").textContent = set ? set + " of " + s.keys.length + " rates set" : "no rates set yet - lines with a suggested value are costed from it and say so";

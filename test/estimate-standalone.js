@@ -212,8 +212,20 @@ async function main() {
     ok(rush.recommended.price === Math.round(est.recommended.price * 1.5 * 100) / 100, "rush 1.5x multiplies the recommended price", rush.recommended);
     const q = PRICE.priceEstimate({ ...base, qty: 10, labor_minutes: 0 }, R, { sell_per_g: 0.12 });
     ok(q.cost.pieces === 10 && q.cost.grams === 1000, "quantity 10 = ten pieces, 1000 g", { pieces: q.cost.pieces, grams: q.cost.grams });
-    const fr = PRICE.priceEstimate({ ...base, labor_minutes: 0, failure_rate: 0.5 }, R, {});
-    ok(fr.cost.failure === Math.round(fr.cost.direct * 0.5 * 100) / 100, "a candidate's 50 % success rate becomes a 50 % failure allowance", fr.cost);
+    const fr = PRICE.priceEstimate({ ...base, labor_minutes: 0, success_rate: 0.5 }, R, {});
+    ok(fr.cost.failure === Math.round(fr.cost.direct * 0.5 * 100) / 100 && /50 % done/.test(fr.cost.failure_source), "a candidate's 50 % success rate becomes a 50 % failure allowance, and says where it came from", fr.cost);
+    const sr = PRICE.priceEstimate({ ...base, labor_minutes: 0, success_rate: 0.9 }, R, {});
+    ok(sr.cost.failure === Math.round(sr.cost.direct * 0.1 * 100) / 100, "success_rate 0.9 (what match.js reports) -> a 10 % allowance, not 90 %", sr.cost);
+    // The owner's rule (docs/costing.md "The minimum price"): live-style rates, 1200 g / 70 h.
+    const RL = { cost_per_g: 0.02, sales_tax_pct: 8.25, platform_fee_pct: 2.6, platform_fee_fixed: 0.15, failure_pct: 0, suggested: COST.SUGGESTED };
+    const own = PRICE.priceEstimate({ grams: 1200, minutes: 4200, qty: 1, printer_id: 0, type: "u1", material: "PLA", labor_minutes: 0, rush: 1, name: "big.stl" }, RL, {});
+    ok(own.cost.direct === 44.81 && own.pricing.break_even === 50.08 && own.pricing.minimum === 51 && own.recommended.price === 51 && own.recommended.method === "minimum",
+      "1200 g / 70 h: direct 44.81, break-even 50.08, minimum and recommended $51", { direct: own.cost.direct, be: own.pricing.break_even, min: own.pricing.minimum, rec: own.recommended });
+    const own24 = PRICE.priceEstimate({ grams: 1200, minutes: 4200, qty: 1, printer_id: 0, type: "u1", labor_minutes: 0, name: "big.stl" }, { ...RL, failure_pct: 24 }, {});
+    const ownS = PRICE.priceEstimate({ grams: 20, minutes: 600, qty: 1, printer_id: 0, type: "u1", labor_minutes: 0, name: "small.stl" }, RL, {});
+    ok(own24.recommended.price === 63 && ownS.cost.direct === 3.37 && ownS.recommended.price === 4, "failure 24 % -> $63; 20 g / 10 h -> direct 3.37, $4", { f24: own24.recommended, small: ownS.recommended });
+    const noFloor = PRICE.priceEstimate({ ...base, labor_minutes: 0 }, { ...R, markup_pct: null }, {});
+    ok(noFloor.pricing.methods.find(m => m.key === "per_gram").price === null && noFloor.recommended.method === "minimum", "no sell floor set by the owner: margin.js's built-in $0.12/g is NOT a price method", noFloor.pricing.methods.find(m => m.key === "per_gram"));
     const bare = PRICE.priceEstimate({ ...base, labor_minutes: 0 }, {}, {});
     const bm = bare.pricing ? bare.pricing.methods.find(m => m.key === "markup") : null;
     ok(bare.blanks.length > 0 && (!bm || (bm.price === null && /Settings/.test(bm.note))), "no rates: blanks named, markup says 'set a markup % in Settings'", bare);
