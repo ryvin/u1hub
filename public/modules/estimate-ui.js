@@ -149,7 +149,9 @@
     const blanks = (v.blanks || []).map(b => '<div class="estblank">' + esc(b) + '</div>').join("");
     const rows = [["Material", c.material], ["Machine", c.machine], ["Electricity", c.energy], ["Labour", c.labor && c.labor.cost], ["Failure allowance", c.failure], ["Overhead", c.overhead]];
     return '<div class="estcard"><h3>Cost &amp; price</h3><div class="estprice">' + usd(rec.price) + (v.qty > 1 ? ' <small>' + usd(rec.each) + ' each × ' + esc(v.qty) + '</small>' : "") + '</div>'
-      + '<div class="estsub">recommended: the higher of your markup and your per-gram floor' + (rec.rush && rec.rush !== 1 ? ', × ' + esc(rec.rush) + ' rush' : "") + '</div>'
+      + '<div class="estsub">recommended: ' + (rec.label ? esc(rec.label) : "—") + ' - the higher of your minimum and any markup, margin, hour rate or per-gram floor you set' + (rec.rush && rec.rush !== 1 ? ', × ' + esc(rec.rush) + ' rush' : "") + '</div>'
+      + (P.minimum != null ? '<div class="estsub" id="estminline"><b>Break-even ' + usd(P.break_even) + ' · minimum $' + esc(P.minimum) + '</b>' + (P.pieces > 1 ? ' ($' + esc(P.minimum_each) + ' × ' + esc(P.pieces) + ')' : "")
+        + ' · failure ' + (P.failure_pct_used != null ? esc(P.failure_pct_used) + ' %' : "none") + (P.failure_source ? ' (' + esc(P.failure_source) + ')' : "") + '</div>' : "")
       + '<table class="esttable"><tr><th>Cost</th><th></th></tr>' + rows.map(r => '<tr><td>' + r[0] + '</td><td>' + usd(r[1]) + '</td></tr>').join("") + '<tr class="tot"><td>Total cost</td><td>' + usd(c.cost) + '</td></tr></table>' + blanks
       + '<table class="esttable"><tr><th>Method</th><th>Price</th><th>Each</th><th>Listed</th></tr>' + (P.methods || []).map(m => '<tr><td title="' + esc(m.note) + '">' + esc(m.label) + '</td><td>' + usd(m.price) + '</td><td>' + usd(m.per_piece) + '</td><td>' + usd(m.gross) + '</td></tr>').join("") + '</table>'
       + ((P.breaks || []).length ? '<div class="estsub">Quantity breaks (cost + markup): ' + P.breaks.map(b => '×' + esc(b.qty) + ' ' + usd(b.each) + ' each').join(" · ") + '</div>' : "") + '</div>';

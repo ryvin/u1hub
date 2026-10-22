@@ -242,11 +242,11 @@ function reportHtml(rep) {
   const cov = c => c.actual_pct == null ? "—" : c.actual_pct + "%";
   const al = rep.aligned;
   const head = "<tr><th>" + esc(GROUP_LABEL[rep.group_by] || rep.group_by) + "</th><th class=n>Prints</th><th class=n>Failed</th><th class=n>Time</th><th class=n>Grams</th><th class=n>Material</th><th class=n>Machine</th><th class=n>Energy</th><th class=n>Direct</th><th class=n>Failed cost</th>" +
-    (al ? "<th class=n>Labour</th><th class=n>Extras</th><th class=n>Overhead</th><th class=n>Cost</th><th class=n>Charged</th><th class=n>Margin</th>" : "") +
+    (al ? "<th class=n>Labour</th><th class=n>Extras</th><th class=n>Failure allowance</th><th class=n>Overhead</th><th class=n>Cost</th><th class=n>Charged</th><th class=n>Margin</th>" : "") +
     "<th class=n>Actual: time</th><th class=n>grams</th><th class=n>material</th></tr>";
   const row = (g, cls) => "<tr" + (cls ? ' class="' + cls + '"' : "") + "><td>" + esc(g.label) + "</td><td class=n>" + g.prints + "</td><td class=n>" + g.failed + "</td><td class=n>" + hrs(g.hours) + "</td><td class=n>" + (g.grams != null ? g.grams + " g" : "—") +
     "</td><td class=n>" + usd(g.material) + "</td><td class=n>" + usd(g.machine) + "</td><td class=n>" + usd(g.energy) + "</td><td class=n><b>" + usd(g.direct) + "</b></td><td class=n>" + usd(g.failure_cost) + (g.failure_share != null && g.failure_share > 0 ? " (" + g.failure_share + "%)" : "") + "</td>" +
-    (al ? "<td class=n>" + usd(g.labor) + "</td><td class=n>" + usd(g.extras) + "</td><td class=n>" + usd(g.overhead != null && g.failure != null ? r2(g.overhead + g.failure) : (g.overhead != null ? g.overhead : g.failure)) + "</td><td class=n><b>" + usd(g.cost) + "</b></td><td class=n>" + usd(g.charged) + "</td><td class=n>" + usd(g.margin) + (g.margin_pct != null ? " (" + pct(g.margin_pct) + ")" : "") + "</td>" : "") +
+    (al ? "<td class=n>" + usd(g.labor) + "</td><td class=n>" + usd(g.extras) + "</td><td class=n>" + usd(g.failure) + "</td><td class=n>" + usd(g.overhead) + "</td><td class=n><b>" + usd(g.cost) + "</b></td><td class=n>" + usd(g.charged) + "</td><td class=n>" + usd(g.margin) + (g.margin_pct != null ? " (" + pct(g.margin_pct) + ")" : "") + "</td>" : "") +
     "<td class=n>" + cov(g.coverage.time) + "</td><td class=n>" + cov(g.coverage.grams) + "</td><td class=n>" + cov(g.coverage.material) + "</td></tr>";
   const when = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
   return "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width, initial-scale=1\"><title>Cost report by " + esc(GROUP_LABEL[rep.group_by] || rep.group_by) + "</title><style>" +

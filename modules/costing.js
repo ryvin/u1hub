@@ -89,11 +89,17 @@ const OUTCOMES = ["done", "cancelled", "error"];
 // key -> [min, max]. Anything outside is a 400, not a clamp.
 const RATE_KEYS = {
   kwh_rate: [0, 10], labor_rate: [0, 1000], failure_pct: [0, 100], overhead_pct: [0, 100],
-  min_fee: [0, 100000], platform_fee_pct: [0, 50], platform_fee_fixed: [0, 100],
+  min_fee: [0, 100000], platform_fee_pct: [0, 50], platform_fee_fixed: [0, 100], sales_tax_pct: [0, 30],
   markup_pct: [0, 1000], margin_pct: [0, 95], hour_rate: [0, 1000], setup_minutes: [0, 600]
 };
 const PRINTER_KEYS = { purchase: [0, 100000], life_hours: [1, 1000000], maint_per_hour: [0, 100], avg_watts: [1, 5000] };
 const BREAKS = [1, 10, 50];
+// The measured failure rate counts only prints that actually STARTED: a
+// failed or cancelled row with less print time than this (or none recorded)
+// was stopped at the first layer or never ran, and costs next to nothing, so
+// counting it as a failure would describe the operator, not the farm.
+// docs/costing.md "The failure allowance".
+const MIN_STARTED_SECONDS = 300;
 
 // Filament length -> grams. 1.75 mm filament; densities in g/cm^3 are the
 // slicer-default table (sources and dates in docs/costing.md). A material the
@@ -281,6 +287,43 @@ function costOf(print, rates) {
   return { material, hours: hours != null ? r3(hours) : null, time_source, machine, energy, direct, blanks };
 }
 
+// ---- pure: the failure rate --------------------------------------------------------
+// The farm's own failure rate, measured on the ledger: the direct cost of the
+// counted failed / cancelled prints that actually started (MIN_STARTED_SECONDS
+// of print time or more) over the direct cost of the counted finished ones -
+// failure cost per dollar of good print, which is what an allowance on a good
+// print's cost has to cover. Rows with no cost are left out of both sides.
+// -> { pct, failed, done, prints, since, failed_cost, done_cost, min_started_seconds }
+//    pct null when nothing finished has a cost (an empty ledger measures nothing).
+function measuredFailure(rows, rates) {
+  let doneCost = 0, failedCost = 0, done = 0, failed = 0, since = null;
+  for (const r of rows || []) {
+    if (!r || r.counted === false) continue;
+    const isDone = r.outcome === "done";
+    if (!isDone && !(num(r.seconds) >= MIN_STARTED_SECONDS)) continue;
+    const d = costOf(r, rates).direct;
+    if (d == null) continue;
+    if (isDone) { doneCost += d; done++; } else { failedCost += d; failed++; }
+    if (num(r.at) != null && (since == null || r.at < since)) since = r.at;
+  }
+  return { pct: doneCost > 0 ? Math.round(failedCost / doneCost * 1000) / 10 : null, failed, done, prints: done + failed, since,
+           failed_cost: r2(failedCost), done_cost: r2(doneCost), min_started_seconds: MIN_STARTED_SECONDS };
+}
+// The allowance a summary uses: a typed failure_pct (0 included) wins; else the
+// measured rate conf() attaches as rates.failure_measured; else none.
+// rates.failure_label names a typed value that came from somewhere specific
+// (an estimate's matched print).
+function failureRate(R) {
+  const typed = num(R.failure_pct);
+  if (typed != null) return { pct: typed, source: R.failure_label ? String(R.failure_label) : "configured" };
+  const m = R.failure_measured;
+  if (m && num(m.pct) != null) {
+    const day = num(m.since) != null ? new Date(m.since).toISOString().slice(0, 10) : null;
+    return { pct: m.pct, source: "measured: " + m.failed + " started failure" + (m.failed === 1 ? "" : "s") + " over " + m.prints + " print" + (m.prints === 1 ? "" : "s") + (day ? ", since " + day : "") };
+  }
+  return { pct: null, source: null };
+}
+
 // ---- pure: one project ----------------------------------------------------------
 // project: { items:[...], charged, ... }; prints: its ledger rows; rates: conf().
 function projectSummary(project, prints, rates) {
@@ -311,11 +354,17 @@ function projectSummary(project, prints, rates) {
                   setup_minutes: num(R.setup_minutes) > 0 ? R.setup_minutes : null };
   const extras = r2(items.filter(i => i.kind !== "labor").reduce((a, i) => a + (num(i.cost) || 0), 0));
   const failed = rows.filter(r => r.print.outcome !== "done").length;
+  // Only a COUNTED failed row puts its cost in `direct`; one marked "don't
+  // count" is not in the cost, so it must not cancel the allowance either.
+  const failedCounted = counted.filter(r => r.print.outcome !== "done").length;
   const subtotal = r2((direct.total || 0) + (labor.cost || 0) + extras);
   // The allowance is for quoting: once a project carries real failed rows the
   // failures are in `direct` already and adding a percentage on top would count
   // them twice.
-  const failure = num(R.failure_pct) > 0 && failed === 0 && direct.total != null ? r2(direct.total * R.failure_pct / 100) : 0;
+  const fr = failureRate(R);
+  const failure = fr.pct > 0 && failedCounted === 0 && direct.total != null ? r2(direct.total * fr.pct / 100) : 0;
+  const failure_pct_used = failedCounted > 0 ? 0 : fr.pct;
+  const failure_source = failedCounted > 0 ? "actual: " + failedCounted + " failed print" + (failedCounted === 1 ? "" : "s") + " on this project, already in the print cost" : fr.source;
   const overhead = num(R.overhead_pct) > 0 ? r2(subtotal * R.overhead_pct / 100) : 0;
   const anything = direct.total != null || labor.cost || extras;
   const cost = anything ? r2(subtotal + failure + overhead) : null;
@@ -330,7 +379,7 @@ function projectSummary(project, prints, rates) {
     prints: rows.length, counted: counted.length, uncounted: rows.length - counted.length, failed, pieces,
     hours: hours.total, grams: grams.total,
     material: material.total, machine: machine.total, energy: energy.total, direct: direct.total,
-    labor, extras, subtotal, failure, overhead, cost,
+    labor, extras, subtotal, failure, failure_pct_used, failure_source, failure_rate_pct: fr.pct, overhead, cost,
     charged, margin, margin_pct: margin != null && charged > 0 ? Math.round(margin / charged * 100) : null,
     sources, blanks, partial: blanks.length > 0 || sources.material_partial > 0,
     rows: rows.map(r => ({ id: r.print.id, counted: r.counted, ...r.cost }))
@@ -338,21 +387,43 @@ function projectSummary(project, prints, rates) {
 }
 
 // ---- pure: the pricing helper ----------------------------------------------------
-// Several answers, none chosen. gross = what to list so that the net after a
-// platform's percentage and fixed fee is the price you picked.
+// Several answers, none chosen. gross = the ticket to list so that what is
+// left after sales tax and the card / platform fee is the price you picked.
+// The ticket is tax-INCLUSIVE and the fee is charged on the whole ticket:
+//   net = gross / (1 + sales_tax_pct) - gross x platform_fee_pct - platform_fee_fixed
+// so gross = (net + fixed) / (1 / (1 + tax) - pct). One gross-up for both;
+// with no sales tax it is the old (price + fixed) / (1 - pct) exactly.
+function keepShare(rates) {
+  const tax = num(rates && rates.sales_tax_pct) || 0, pct = num(rates && rates.platform_fee_pct) || 0;
+  return 1 / (1 + tax / 100) - pct / 100;
+}
 function grossUp(price, rates) {
   if (price == null) return null;
-  const pct = num(rates && rates.platform_fee_pct) || 0, fixed = num(rates && rates.platform_fee_fixed) || 0;
-  if (pct >= 100) return null;
-  return (price + fixed) / (1 - pct / 100);
+  const fixed = num(rates && rates.platform_fee_fixed) || 0, k = keepShare(rates);
+  if (!(k > 0)) return null;
+  return (price + fixed) / k;
 }
 function netOf(gross, rates) {
   if (gross == null) return null;
-  const pct = num(rates && rates.platform_fee_pct) || 0, fixed = num(rates && rates.platform_fee_fixed) || 0;
-  return gross * (1 - pct / 100) - fixed;
+  const fixed = num(rates && rates.platform_fee_fixed) || 0;
+  return gross * keepShare(rates) - fixed;
 }
+// Whole dollars, per piece: the break-even per piece rounded UP to the next
+// dollar (a cent of float noise is not a dollar), times the pieces.
+function minimumOf(breakEven, pieces) {
+  if (breakEven == null) return null;
+  const n = pieces > 0 ? pieces : 1;
+  const each = Math.max(0, Math.ceil(r2(breakEven / n) - 1e-9));
+  return { each, total: each * n };
+}
+const RECOMMEND_KEYS = ["markup", "margin", "machine_hour", "per_gram"];
 // s: projectSummary(); floor: the per-gram floor for the project's grams
-// (margin.quote's min_plate) or null.
+// (the owner's own sell_per_g x grams) or null when no sell floor is set.
+// Beside the methods: the owner's rule (docs/costing.md "The minimum price") -
+//   break_even = grossUp(cost)            cost already carries the failure allowance
+//   minimum    = ceil(break_even / pieces) x pieces
+//   recommended = the higher of the minimum and every method that is set,
+//                 each compared as the ticket it lists at (its `gross`).
 function pricing(s, rates, floor) {
   const R = rates || {};
   if (!s || s.cost == null) return null;
@@ -379,7 +450,20 @@ function pricing(s, rates, floor) {
     const c = (variable * n + fixed) * (1 + (num(R.overhead_pct) || 0) / 100);
     return { qty: n, cost_each: r2(c / n), each: r2(minFee(c * (1 + R.markup_pct / 100)) / n) };
   });
-  return { cost, pieces, methods, breaks, min_fee: num(R.min_fee), platform: { pct: num(R.platform_fee_pct), fixed: num(R.platform_fee_fixed) } };
+  const be = grossUp(cost, R);
+  const min = minimumOf(be, pieces);
+  const cands = [];
+  if (min) cands.push({ key: "minimum", label: "Minimum (break-even, whole dollars)", price: min.total });
+  if (num(R.min_fee) != null && grossUp(R.min_fee, R) != null) cands.push({ key: "min_fee", label: "Minimum fee", price: r2(grossUp(R.min_fee, R)) });
+  for (const m of methods) if (RECOMMEND_KEYS.includes(m.key) && m.gross != null) cands.push({ key: m.key, label: m.label, price: m.gross });
+  const best = cands.reduce((a, c) => (a == null || c.price > a.price ? c : a), null);
+  return { cost, pieces, methods, breaks, min_fee: num(R.min_fee), platform: { pct: num(R.platform_fee_pct), fixed: num(R.platform_fee_fixed) },
+    sales_tax_pct: num(R.sales_tax_pct),
+    break_even: be == null ? null : r2(be), minimum: min ? min.total : null, minimum_each: min ? min.each : null,
+    recommended: best ? { price: best.price, each: r2(best.price / pieces), method: best.key, label: best.label } : null,
+    failure_pct_used: s.failure_pct_used != null ? s.failure_pct_used : null, failure_source: s.failure_source || null,
+    // what a client needs to price a selection of these prints the same way (costing-ui.js selTotals)
+    rule: { failure_pct: s.failure_rate_pct != null ? s.failure_rate_pct : null, sales_tax_pct: num(R.sales_tax_pct), fee_pct: num(R.platform_fee_pct), fee_fixed: num(R.platform_fee_fixed) } };
 }
 
 // ---- pure: CSV ---------------------------------------------------------------------
@@ -442,12 +526,15 @@ function quoteHtml(o) {
     line("Material", usd(s.material), srcLine(s.sources.material) + (s.sources.material_partial ? " · " + s.sources.material_partial + " partial" : "") + (s.sources.grams ? " · grams: " + srcLine(s.sources.grams) : "")) +
     line("Machine time", usd(s.machine), srcLine(s.sources.machine)) + line("Energy", usd(s.energy), srcLine(s.sources.energy)) +
     line("Labour", usd(s.labor.cost), s.labor.minutes + " min" + (s.labor.setup_minutes ? " incl. " + s.labor.setup_minutes + " min setup per print" : "")) + line("Extras", usd(s.extras), "hardware, packaging, shipping") +
-    (s.failure ? line("Failure allowance", usd(s.failure), rates.failure_pct + "% of print cost (no failed prints recorded)") : "") +
+    (s.failure ? line("Failure allowance", usd(s.failure), s.failure_pct_used + "% of print cost (" + (s.failure_source || "") + ")") : "") +
     (s.overhead ? line("Overhead", usd(s.overhead), rates.overhead_pct + "% of subtotal") : "") +
     '<tr class=total><td>Cost</td><td class=n>' + usd(s.cost) + "</td><td class=note>" + esc(s.counted + " of " + s.prints + " prints counted" + (s.failed ? ", " + s.failed + " failed" : "")) + "</td></tr>" +
     (s.charged != null ? line("Charged", usd(s.charged), s.margin != null ? "margin " + usd(s.margin) + (s.margin_pct != null ? " (" + s.margin_pct + "%)" : "") : "") : "") + "</table>" +
     (s.blanks.length ? '<div class=blank>Not included: ' + esc(s.blanks.join("; ")) + ".</div>" : "") +
-    (methods ? "<h2>Pricing</h2><table><tr><th>Method</th><th class=n>Price</th><th class=n>Per piece</th><th class=n>Listed (fees grossed up)</th><th></th></tr>" + methods + "</table>" : "") +
+    (pz && pz.minimum != null ? "<h2>Minimum price</h2><table>" + line("Break-even", usd(pz.break_even), "cost" + (pz.sales_tax_pct ? " + " + pz.sales_tax_pct + "% sales tax" : "") + (pz.platform.pct || pz.platform.fixed ? " + card fee " + (pz.platform.pct || 0) + "% + $" + (pz.platform.fixed || 0) : "")) +
+      line("Minimum", usd(pz.minimum), "whole dollars" + (pz.pieces > 1 ? ", $" + pz.minimum_each + " x " + pz.pieces + " pieces" : "")) +
+      (pz.recommended ? line("Recommended", usd(pz.recommended.price), pz.recommended.label) : "") + "</table>" : "") +
+    (methods ? "<h2>Pricing</h2><table><tr><th>Method</th><th class=n>Price</th><th class=n>Per piece</th><th class=n>Listed (tax and fees grossed up)</th><th></th></tr>" + methods + "</table>" : "") +
     "</body></html>";
 }
 
@@ -475,12 +562,33 @@ function register(ctx) {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
   }
   const saveP = () => writeState(PFILE, P);
-  const saveL = () => writeState(LFILE, L);
+  const saveL = () => { LVER++; writeState(LFILE, L); };
   const newId = p => p + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   const printers = () => ctx.printers || [];
 
   // ---- rates ------------------------------------------------------------------------
-  const flat = () => { const q = ctx.use("margin.quote"); if (!q) return { cost_per_g: null, sell_per_g: null }; const r = q({ grams: 1, minutes: null, name: "" }) || {}; return { cost_per_g: num(r.cost_per_g), sell_per_g: num(r.sell_per_g) }; };
+  // The flat $/g for material comes from the margin module (its default
+  // included, as before). The SELL floor does not: margin.js answers $0.12/g
+  // when nobody has typed one, and that built-in is not the owner's price, so
+  // the per-gram method exists only when sell_per_g was set on purpose - in
+  // config.json costing.sell_per_g, else margin.sell_per_g (the "Worth
+  // printing?" settings write it there).
+  const flat = () => { const q = ctx.use("margin.quote"); if (!q) return { cost_per_g: null }; const r = q({ grams: 1, minutes: null, name: "" }) || {}; return { cost_per_g: num(r.cost_per_g) }; };
+  const explicitSell = c => {
+    const own = num(c.sell_per_g);
+    if (own > 0) return { sell_per_g: own, sell_per_g_source: "costing" };
+    const m = (ctx.cfg && typeof ctx.cfg.margin === "object" && ctx.cfg.margin) || {};
+    const mv = ctx.use("margin.quote") ? num(m.sell_per_g) : null;
+    return mv > 0 ? { sell_per_g: mv, sell_per_g_source: "margin" } : { sell_per_g: null, sell_per_g_source: null };
+  };
+  // The measured failure rate, recomputed only when the ledger (LVER, bumped
+  // by saveL) or the rates it is costed with change. No I/O: L is in memory.
+  let LVER = 0, FM_KEY = null, FM = null;
+  function measured(base) {
+    const key = LVER + "|" + JSON.stringify((ctx.cfg && ctx.cfg.costing) || {}) + "|" + base.cost_per_g;
+    if (key !== FM_KEY) { FM = measuredFailure(L.prints, base); FM_KEY = key; }
+    return FM;
+  }
   function conf() {
     const c = (ctx.cfg && typeof ctx.cfg.costing === "object" && ctx.cfg.costing) || {};
     const out = {};
@@ -490,7 +598,8 @@ function register(ctx) {
       out.printers[i] = {};
       for (const k of Object.keys(PRINTER_KEYS)) out.printers[i][k] = num(p && p[k]);
     }
-    return { ...out, ...flat(), suggested: SUGGESTED };
+    const base = { ...out, ...flat(), ...explicitSell(c), suggested: SUGGESTED };
+    return { ...base, failure_measured: measured(base) };
   }
   const ratesView = () => ({ ...conf(), suggested: { ...SUGGESTED, notes: SUGGESTED_NOTES, type_notes: SUGGESTED_TYPE_NOTES },
     printer_names: printers().map((p, i) => ({ idx: i, name: p.name || ("printer " + (i + 1)), type: p.type || "u1", hours: HOURS[String(i)] ? HOURS[String(i)].hours : null, hours_at: HOURS[String(i)] ? HOURS[String(i)].at : null })),
@@ -972,12 +1081,13 @@ function register(ctx) {
   const project = id => P.projects[String(id || "")] || null;
   const client = id => P.clients[String(id || "")] || null;
   const printsOf = pid => L.prints.filter(r => r.project_id === pid);
-  const floorFor = grams => { const q = ctx.use("margin.quote"); if (!q || !(grams > 0)) return null; const r = q({ grams, minutes: null, name: "" }); return r && r.min_plate != null ? r.min_plate : null; };
+  // grams x the owner's own sell floor; null when none is set (see explicitSell).
+  const floorFor = (grams, R) => R.sell_per_g > 0 && grams > 0 ? r2(grams * R.sell_per_g) : null;
   function full(pr) {
     const rows = printsOf(pr.id).sort((a, b) => b.at - a.at);
     const R = conf();
     const s = projectSummary(pr, rows, R);
-    return { project: pr, client: client(pr.client_id), summary: s, pricing: pricing(s, R, floorFor(s.grams)), prints: rows.map(r => ({ ...r, cost: costOf(r, R) })) };
+    return { project: pr, client: client(pr.client_id), summary: s, pricing: pricing(s, R, floorFor(s.grams, R)), prints: rows.map(r => ({ ...r, cost: costOf(r, R) })) };
   }
   const brief = pr => { const s = projectSummary(pr, printsOf(pr.id), conf()); return { ...pr, summary: { cost: s.cost, charged: s.charged, margin: s.margin, margin_pct: s.margin_pct, prints: s.prints, counted: s.counted, failed: s.failed, pieces: s.pieces, hours: s.hours, partial: s.partial } }; };
   // What the whole ledger's numbers came from, for the tab's "filled by the
@@ -1322,6 +1432,6 @@ function register(ctx) {
   ctx.hublog("info", "costing (ryvin/u1hub fork module) armed: " + L.prints.length + " ledger rows, " + Object.keys(P.projects).length + " projects");
 }
 
-module.exports = { register, costOf, projectSummary, pricing, grossUp, netOf, projectCsv, quoteHtml, mmToGrams, materialOf, densityOf,
+module.exports = { register, costOf, projectSummary, pricing, grossUp, netOf, minimumOf, measuredFailure, MIN_STARTED_SECONDS, projectCsv, quoteHtml, mmToGrams, materialOf, densityOf,
                    report: REPORT.report, reportCsv: REPORT.reportCsv, reportHtml: REPORT.reportHtml, GROUPINGS: REPORT.GROUPINGS, monthKey: REPORT.monthKey,
                    LEDGER_MAX, RATE_KEYS, PRINTER_KEYS, ITEM_KINDS, STATES, OUTCOMES, STATUS_OUTCOME, outcomeOf, CANCELLED_BUT_DONE_SHARE, DENSITY, FILAMENT_DIAMETER_MM, SUGGESTED, SUGGESTED_NOTES, SUGGESTED_TYPE_NOTES };

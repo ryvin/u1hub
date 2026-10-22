@@ -68,9 +68,14 @@ height or no gcode height is "size unchecked".
 The estimate is one synthetic ledger row (grams × qty, minutes × qty, qty pieces)
 run through costing's own `projectSummary()` and `pricing()` with the costing
 rates, so a quote and the Projects tab cannot disagree. Labour minutes are a
-labour item; `failure_pct` is replaced by (1 − success rate) when an earlier print
-is used. **Recommended price** = the higher of cost + markup and the per-gram floor
-(margin module's `sell_per_g`), × the rush multiplier. Quantity breaks are
+labour item; the failure allowance is replaced by (1 − success rate) when an earlier
+print is used (`success_rate` from match.js: done / runs), else it is costing's
+(typed `failure_pct`, or the farm's measured rate). **Recommended price** = costing's
+`pricing().recommended`: the highest of the owner's minimum (break-even with failure,
+sales tax and card fee, whole dollars per piece; [costing.md](costing.md#the-minimum-price-the-owners-rule))
+and every method that is set (markup, target margin, machine-hour, and the per-gram
+floor only when a sell floor was set on purpose), × the rush multiplier. The tab shows
+"Break-even $50.08 · minimum $51" and the failure rate used with its source. Quantity breaks are
 costing's (1 / 10 / 50, cost + markup). A rate that is not set is named as a blank.
 
 ## Inputs
