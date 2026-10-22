@@ -10,15 +10,18 @@
 //      person's own subscription, validates, escalates once if weak, and
 //      merges lessons into SME_HOME/lessons.json (the store of record),
 //   4. posts the review to the Hub and syncs the Hub's lessons mirror.
-// It never touches a printer, a gcode, config.json or the print queue; its
-// own files are sme-runner.lock / .json / .log beside this repo.
+// It never touches a printer, a gcode or the print queue, and never writes
+// config.json (it may READ sme.token from it, below); its own files are
+// sme-runner.lock / .json / .log beside this repo.
 //
 //   node scripts/sme-runner.js                 review the next SME_BATCH targets
 //   node scripts/sme-runner.js --dry-run       build the prompts, call nothing, store nothing
 //   node scripts/sme-runner.js --refresh-knowledge   monthly: rewrite knowledge.md with web research (tier 3)
 //   node scripts/sme-runner.js --kind gcode --key "u1:file.gcode" [--force]   one target
 //
-// Env: HUB_URL (http://127.0.0.1:4545), SME_TOKEN (else GET /api/sme/token),
+// Env: HUB_URL (http://127.0.0.1:4545), SME_TOKEN (else sme.token from the
+// Hub's config.json: SME_HUB_CONFIG, $U1HUB_DIR/config.json, data/config.json,
+// config.json; else GET /api/sme/token, which answers only without a Hub login),
 // SME_BATCH (4), SME_HOME (the shared state, sme/core/store.js), SME_MODEL,
 // SME_MODEL_TIER1/2/3, CLAUDE_BIN, SME_TIMEOUT_MS, SME_PAUSE_MS (2000 between
 // targets), SME_STATE_DIR (this repo), SME_AGENT_FILE, SME_KNOWLEDGE_FILE,
@@ -58,10 +61,32 @@ function log(line) {
   try { fs.appendFileSync(LOGF, s + "\n"); } catch {}
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function jget(p) { const r = await fetch(HUB + p); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; }
+// The token goes on EVERY request: with a Hub password set, the Hub lets the
+// runner's own routes through on X-SME-Token and answers 401 without it.
+let AUTH_TOKEN = null;
+const authHeaders = token => (token || AUTH_TOKEN) ? { "X-SME-Token": token || AUTH_TOKEN } : {};
+async function jget(p) { const r = await fetch(HUB + p, { headers: authHeaders() }); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; }
 async function jpost(p, b, token) {
-  const r = await fetch(HUB + p, { method: "POST", headers: { "Content-Type": "application/json", "X-SME-Token": token || "" }, body: JSON.stringify(b || {}) });
+  const r = await fetch(HUB + p, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders(token) }, body: JSON.stringify(b || {}) });
   let body = null; try { body = await r.json(); } catch {} return { status: r.status, body };
+}
+// The Hub writes the runner token into its own config.json (sme.token) at
+// first boot. The runner lives on the same PC, so it reads it from there
+// rather than asking GET /api/sme/token, which needs a login once the Hub has
+// a password. SME_HUB_CONFIG names the file; without it: $U1HUB_DIR/config.json,
+// then data/config.json (the Docker deploy's U1HUB_DIR), then config.json
+// beside this repo. Only sme.token is read; the file is never written.
+function tokenFromConfig() {
+  const cands = process.env.SME_HUB_CONFIG ? [process.env.SME_HUB_CONFIG]
+    : [process.env.U1HUB_DIR ? path.join(process.env.U1HUB_DIR, "config.json") : null, path.join(ROOT, "data", "config.json"), path.join(ROOT, "config.json")].filter(Boolean);
+  for (const f of cands) {
+    try {
+      const j = JSON.parse(fs.readFileSync(f, "utf8"));
+      const t = j && j.sme && j.sme.token ? String(j.sme.token) : "";
+      if (/^[A-Za-z0-9_-]{16,256}$/.test(t)) return { token: t, from: f };
+    } catch {}
+  }
+  return null;
 }
 function readState() { try { return JSON.parse(fs.readFileSync(STATE, "utf8")) || {}; } catch { return {}; } }
 function writeState(s) { try { fs.writeFileSync(STATE, JSON.stringify(s, null, 2)); } catch (e) { log("state write failed: " + e.message); } }
@@ -122,12 +147,18 @@ async function reviewOne(item, token, run) {
   if (L.held) { log("another run is in progress (pid " + L.pid + " since " + new Date(L.at).toISOString() + "); exiting"); process.exit(0); }
   const run = { started_at: Date.now(), mode: REFRESH ? "refresh" : "review", reviewed: 0, from_lessons: 0, from_cache: 0, escalated: 0, errors: 0, dry: 0, feedback: 0, models: {}, rejected: {}, cost_usd: 0, paused_until: null, last_error: null, knowledge: null };
   let token = process.env.SME_TOKEN || null;
+  if (!token) { const fc = tokenFromConfig(); if (fc) token = fc.token; }
+  AUTH_TOKEN = token;
   try {
     const st = readState();
     if (st.paused_until && st.paused_until > Date.now()) { log("paused until " + new Date(st.paused_until).toISOString() + " (usage limit); exiting"); return; }
     const status = await jget("/api/sme/status?totals=0").catch(e => ({ status: 0, body: { error: e.message } }));
+    if (status.status === 401) {
+      log("the Hub has a login and " + (token ? "did not accept this token" : "this runner has no token") + "; set SME_TOKEN (Settings -> 3D-printing SME shows it) or SME_HUB_CONFIG (the Hub's config.json); exiting");
+      run.last_error = "hub login: no valid token"; token = null; return;
+    }
     if (status.status !== 200) { log("Hub not reachable at " + HUB + " (" + (status.body && status.body.error || "HTTP " + status.status) + "); exiting"); run.last_error = "hub unreachable"; return; }
-    if (!token) { const t = await jget("/api/sme/token"); token = t.body && t.body.token; }
+    if (!token) { const t = await jget("/api/sme/token"); token = t.body && t.body.token; AUTH_TOKEN = token || null; }   // open mode: the Hub hands it out
     if (!token) { log("no SME_TOKEN and the Hub gave none; exiting"); run.last_error = "no token"; return; }
     log("SME_HOME " + STORE.home() + " (" + Object.keys(STORE.loadLessons()).length + " lessons); knowledge " + REVIEW.knowledgeFile());
     if (REFRESH) {

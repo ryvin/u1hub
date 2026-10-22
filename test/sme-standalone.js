@@ -157,7 +157,7 @@ const klipper = (pa, extra) => ({ printer: { kinematics: "corexy", max_velocity:
   const writeConfig = features => fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: gdir, port: PORT, types: [{ slug: "u1", label: "U1" }, { slug: "kobra-s1", label: "Kobra S1" }],
     printers: [{ name: "U1-mock", url: "http://127.0.0.1:" + portU1, type: "u1" }, { name: "Kobra-mock", url: "http://127.0.0.1:" + portK, type: "kobra-s1" }, { name: "Offline-mock", url: "http://127.0.0.1:9", type: "u1" }],
     models: { folder: mdir }, ...(features ? { features } : {}) }, null, 2));
-  const runnerEnv = extra => ({ ...process.env, HUB_URL: HUB, SME_HOME: HOME, SME_STATE_DIR: STATE, CLAUDE_BIN: FAKE, FAKE_CLAUDE_LOG: path.join(tmp, "fake.log"), SME_PAUSE_MS: "0", SME_TIMEOUT_MS: "30000", SME_BATCH: "2", SPOOLMAN_URL: "http://127.0.0.1:9", SME_PRINTER_CONFIGS: path.join(tmp, "nope"), SME_MULTIACE_DIR: path.join(tmp, "nope"), ...(extra || {}) });
+  const runnerEnv = extra => ({ ...process.env, HUB_URL: HUB, SME_HOME: HOME, SME_STATE_DIR: STATE, CLAUDE_BIN: FAKE, FAKE_CLAUDE_LOG: path.join(tmp, "fake.log"), SME_PAUSE_MS: "0", SME_TIMEOUT_MS: "30000", SME_BATCH: "2", SPOOLMAN_URL: "http://127.0.0.1:9", SME_PRINTER_CONFIGS: path.join(tmp, "nope"), SME_MULTIACE_DIR: path.join(tmp, "nope"), SME_HUB_CONFIG: path.join(tmp, "nope.json"), ...(extra || {}) });
   // async, never spawnSync: the mock printers live in THIS process, and a
   // blocked event loop would freeze them while the Hub reads Klipper settings
   // for the review the runner is about to post (seen as "timeout" 2026-10-04)
@@ -444,6 +444,49 @@ const klipper = (pa, extra) => ({ printer: { kinematics: "corexy", max_velocity:
     ok(run.status === 0 && calls[calls.length - 1].model === "opus" && calls[calls.length - 1].args[calls[calls.length - 1].args.indexOf("--tools") + 1] === "WebSearch,WebFetch" && /refreshed by the fake/.test(nk) && /^# seed/.test(fs.readFileSync(kf + ".bak", "utf8")), "a refresh runs at tier 3 with web tools, writes the file, keeps a .bak", run.stdout.slice(-300));
     const st2 = (await jget("/api/sme/status")).body;
     ok(st2.last_run.mode === "refresh" && st2.last_run.knowledge && st2.last_run.knowledge.updated === new Date().toISOString().slice(0, 10) && st2.last_run.knowledge.sections === 10, "the Hub records the refresh with its date and section count", st2.last_run);
+
+    console.log("\n== HASHING progress is per build, not cumulative ==");
+    {
+      const q1 = (await jget("/api/sme/queue?refresh=1&limit=1")).body;
+      const q2 = (await jget("/api/sme/queue?refresh=1&limit=1")).body;
+      const h = (await jget("/api/sme/status?totals=0")).body.hashing;
+      ok(q1.building === false && q2.building === false && h.total === q2.paths && h.done === q2.paths && h.busy === false, "after two rebuilds the progress counts one build's " + q2.paths + " paths, done = total", h);
+    }
+
+    console.log("\n== PASSWORD: the runner keeps working when the Hub has a login ==");
+    {
+      const setup = await fetch(HUB + "/api/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "password", password: "sme-test-pw" }) });
+      const cookie = String(setup.headers.get("set-cookie") || "").split(";")[0];
+      ok(setup.status === 200 && /^u1hub_session=/.test(cookie), "a Hub password is set (and the setup call logs in)", setup.status);
+      const CK = { Cookie: cookie };
+      r = await jget("/api/sme/token");
+      ok(r.status === 401 && !JSON.stringify(r.body).includes(TOKEN), "GET /api/sme/token without a login: 401, no token", r);
+      ok((await jget("/api/sme/token", CK)).body.token === TOKEN, "...with a login: the token (Settings shows it)");
+      const ctxKey = "/api/sme/context?kind=gcode&key=" + encodeURIComponent("u1:" + REGAL);
+      const gets = ["/api/sme/status?totals=0", "/api/sme/queue?limit=1", ctxKey, "/api/sme/lessons/feedback"];
+      const withTok = [], without = [], wrong = [];
+      for (const p of gets) {
+        withTok.push([p, (await jget(p, TOK())).status]);
+        without.push([p, (await jget(p)).status]);
+        wrong.push([p, (await jget(p, { "X-SME-Token": TOKEN.slice(0, -1) + (TOKEN.endsWith("0") ? "1" : "0") })).status]);
+      }
+      ok(withTok.every(x => x[1] === 200), "the runner's GET routes answer 200 with X-SME-Token and no login", withTok);
+      ok(without.every(x => x[1] === 401) && wrong.every(x => x[1] === 401), "...401 without the token or with a wrong one", { without, wrong });
+      r = await jpost("/api/sme/runs", { started_at: Date.now(), finished_at: Date.now(), mode: "review", reviewed: 0 }, TOK());
+      ok(r.status === 200, "a runner POST (runs) with the token and no login: 200", r);
+      ok((await jpost("/api/sme/runs", { reviewed: 0 })).status === 401, "...without it: 401");
+      const notRunner = [["GET", "/api/sme/reviews?kind=gcode&brief=1"], ["GET", "/api/sme/lessons"], ["GET", "/api/sme/token"], ["GET", "/api/config"], ["GET", "/api/fleet"], ["GET", "/api/sme/status/"], ["GET", "/api/sme/%2e%2e/config"]];
+      const leaked = [];
+      for (const [m, p] of notRunner) { const x = await fetch(HUB + p, { method: m, headers: TOK() }); if (x.status !== 401) leaked.push([m, p, x.status]); }
+      ok(leaked.length === 0, "the token opens ONLY the runner's routes: UI routes, the token itself, config, fleet, a trailing slash and a dot-segment stay 401", leaked);
+      // the runner itself, with no SME_TOKEN: it reads sme.token from the Hub's config.json (SME_HUB_CONFIG)
+      run = await runRunner(["--dry-run"], { SME_HUB_CONFIG: path.join(tmp, "config.json") });
+      ok(run.status === 0 && /queue: \d+ pending/.test(run.stdout) && !/401/.test(run.stdout), "the runner (token from the Hub's config.json) reads status, queue and context through the login", run.stdout.slice(-500));
+      run = await runRunner(["--dry-run"], { SME_HUB_CONFIG: path.join(tmp, "nope.json") });
+      ok(run.status === 0 && /login/i.test(run.stdout) && /SME_TOKEN/.test(run.stdout) && !/queue: /.test(run.stdout), "no token anywhere: the runner says the Hub has a login and how to give it the token, exits 0", run.stdout.slice(-400));
+      r = await jpost("/api/auth/setup", { mode: "open" }, CK);
+      ok(r.status === 200 && (await jget("/api/sme/status?totals=0")).status === 200 && (await jget("/api/sme/token")).status === 200, "back to open mode: every SME route answers without a token, as before", r);
+    }
     await stopHub();
 
     console.log("\n== OFF and LITE ==");

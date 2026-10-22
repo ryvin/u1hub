@@ -187,7 +187,15 @@ function register(ctx) {
     } catch (e) { ctx.hublog("warn", "sme: could not persist a token - " + e.message); return null; }
   }
   const TOKEN = token();
-  const tokenOk = req => !!TOKEN && String(req.headers["x-sme-token"] || "") === TOKEN;
+  const tokenOk = req => {
+    if (!TOKEN) return false;
+    const a = Buffer.from(String(req.headers["x-sme-token"] || "")), b = Buffer.from(TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+  // auth.js asks this to let the runner's own routes (and only those) past the
+  // Hub login: the runner is a scheduled job with no browser session. Absent
+  // when this module is off, so the bypass is closed with it.
+  ctx.app.locals.smeTokenOk = tokenOk;
   const printers = () => ctx.printers || [];
   const ledger = () => { const g = ctx.use("costing.prints"); try { return typeof g === "function" ? (g() || []) : []; } catch { return []; } };
 
@@ -397,6 +405,7 @@ function register(ctx) {
   // target afterwards (reviews by path, feedback from the ledger).
   let CAT = { at: 0, gcode: new Map(), models: new Map(), families: new Map(), byPath: new Map() };
   async function buildCatalogue(force) {
+    HASHING.done = 0; HASHING.total = 0;   // progress of THIS build (it summed every build before)
     const files = await libraryFiles();
     const gcode = new Map();   // cid -> target
     const byPath = new Map();
