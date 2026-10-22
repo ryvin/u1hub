@@ -7,7 +7,7 @@
 const { spawn } = require("child_process");
 const http = require("http"), path = require("path");
 const FALSIFY = process.env.QUOTE_FALSIFY === "1";
-const SVC_PORT = 45996, FAKE_PORT = 45997, SVC = "http://127.0.0.1:" + SVC_PORT;
+const SVC_PORT = Number(process.env.QUOTE_TEST_PORT) || 45996, FAKE_PORT = SVC_PORT + 1, SVC = "http://127.0.0.1:" + SVC_PORT;
 const KEY = "test-quote-key-0123456789abcdef0123456789";
 let pass = 0, fail = 0;
 function ok(cond, name, detail) { if (cond) { pass++; console.log("  ok   " + name); } else { fail++; console.log("  FAIL " + name + (detail !== undefined ? "\n       " + JSON.stringify(detail).slice(0, 500) : "")); } }
@@ -40,7 +40,7 @@ async function startSvc(extra) {
   LOG = "";
   CHILD = spawn(process.execPath, [path.join(__dirname, "..", "server.js")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PORT: String(SVC_PORT),
     HUB_URL: "http://127.0.0.1:" + FAKE_PORT, QUOTE_KEY: KEY, TURNSTILE_SITEKEY: "test-site", TURNSTILE_SECRET: "test-secret", TURNSTILE_VERIFY_URL: "http://127.0.0.1:" + FAKE_PORT + "/siteverify",
-    MAX_MB: "1", UPLOADS_PER_HOUR: "3", REQUESTS_PER_DAY: "2", GLOBAL_UPLOADS_PER_HOUR: "60", HUB_TIMEOUT_MS: "1500", TRUST_CF: "1", ...(extra || {}) } });
+    MAX_MB: "1", UPLOADS_PER_HOUR: "3", REQUESTS_PER_DAY: "2", GLOBAL_UPLOADS_PER_HOUR: "60", HUB_TIMEOUT_MS: "1500", TRUST_CF: "1", TRUSTED_PROXY: "127.0.0.1", ...(extra || {}) } });
   CHILD.stdout.on("data", d => LOG += d); CHILD.stderr.on("data", d => LOG += d);
   // waits on observable state; a cold require of express over /mnt/e measured 12.8 s (2026-10-07), so the cap is 60 s
   for (let i = 0; i < 600; i++) { try { if ((await fetch(SVC + "/healthz")).status) return; } catch {} await sleep(100); }
@@ -129,8 +129,42 @@ async function main() {
     await up("x.stl", Buffer.alloc(10), null, "5.5.5.1");
     ok((await up("x.stl", Buffer.alloc(10), null, "5.5.5.2")).status === 429, "TRUST_CF unset: a spoofed CF-Connecting-IP does not reset the limit");
     await stopSvc();
+    await crewTrustedProxy();
   } finally { await stopSvc(); fake.close(); }
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exit(fail ? 1 : 0);
 }
+// ==== crew/estimate review fix (2026-10-21): CF-Connecting-IP only from the tunnel's own address ====
+// The service shares a Docker network with other containers; any of them could send its own
+// CF-Connecting-IP. TRUSTED_PROXY names the peer(s) allowed to set it (IP, CIDR or a hostname).
+async function crewTrustedProxy() {
+  console.log("\n-- [crew/estimate] TRUSTED_PROXY --");
+  let P = null; try { P = require("../lib/proxy.js"); } catch (e) { ok(false, "quote/lib/proxy.js loads", e.message); }
+  if (P) {
+    const c = P.createProxyCheck(["10.0.0.0/8", "192.168.1.5", "fd00::/8"]);
+    await c.ready;
+    ok(c.trusted("10.1.2.3") && c.trusted("::ffff:10.1.2.3") && c.trusted("192.168.1.5") && c.trusted("fd00::1"), "a CIDR, an IPv4-mapped address, a single IP and an IPv6 CIDR match");
+    ok(!c.trusted("11.0.0.1") && !c.trusted("192.168.1.6") && !c.trusted("") && !c.trusted(undefined), "anything else does not");
+    const h = P.createProxyCheck(["cloudflared"], { lookup: async name => (name === "cloudflared" ? [{ address: "172.18.0.7", family: 4 }] : []) });
+    await h.ready;
+    ok(h.trusted("172.18.0.7") && !h.trusted("172.18.0.8"), "a hostname (the tunnel container) is trusted at the address it resolves to");
+    ok(!P.createProxyCheck([]).trusted("127.0.0.1"), "an empty list trusts nobody");
+    let threw = false; try { P.createProxyCheck(["10.0.0.0/99"]); } catch { threw = true; }
+    ok(threw, "a bad CIDR refuses to start");
+  }
+  // booted: the test client is 127.0.0.1
+  await startSvc({ TRUST_CF: "1", TRUSTED_PROXY: "10.9.9.9", UPLOADS_PER_HOUR: "1" });
+  await up("x.stl", Buffer.alloc(10), null, "6.6.6.1");
+  ok((await up("x.stl", Buffer.alloc(10), null, "6.6.6.2")).status === 429, "TRUST_CF=1, peer not in TRUSTED_PROXY: a spoofed CF-Connecting-IP does not reset the limit");
+  await stopSvc();
+  await startSvc({ TRUST_CF: "1", TRUSTED_PROXY: "", UPLOADS_PER_HOUR: "1" });
+  await up("x.stl", Buffer.alloc(10), null, "7.7.7.1");
+  ok((await up("x.stl", Buffer.alloc(10), null, "7.7.7.2")).status === 429 && /TRUSTED_PROXY/.test(LOG), "TRUST_CF=1 with no TRUSTED_PROXY: the header is ignored, and the log says why", LOG.slice(-300));
+  await stopSvc();
+  await startSvc({ TRUST_CF: "1", TRUSTED_PROXY: "localhost", UPLOADS_PER_HOUR: "1" });
+  await up("x.stl", Buffer.alloc(10), null, "8.8.8.1");
+  ok((await up("x.stl", Buffer.alloc(10), null, "8.8.8.2")).status === 200, "TRUSTED_PROXY=localhost (a hostname): the tunnel's CF-Connecting-IP is each visitor's own limit");
+  await stopSvc();
+}
+
 main().catch(e => { console.error(e); process.exit(1); });

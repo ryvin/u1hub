@@ -10,7 +10,7 @@ const { spawn } = require("child_process");
 const fs = require("fs"), os = require("os"), path = require("path");
 const { createMock } = require("./mock-moonraker.js");
 const REPO = path.join(__dirname, "..");
-const PORT = 45993, HUB = "http://127.0.0.1:" + PORT;
+const PORT = Number(process.env.U1HUB_ESTIMATE_TEST_PORT) || 45993, HUB = "http://127.0.0.1:" + PORT;
 const FALSIFY = process.env.U1HUB_ESTIMATE_FALSIFY === "1";
 let pass = 0, fail = 0;
 function ok(cond, name, detail) { if (cond) { pass++; console.log("  ok   " + name); } else { fail++; console.log("  FAIL " + name + (detail !== undefined ? "\n       " + JSON.stringify(detail).slice(0, 600) : "")); } }
@@ -357,7 +357,100 @@ async function main() {
     ok(!jb.error && v.files && /estimated from the file.s own slice/.test(v.files[0].warning || "") && !v.files[0].error && v.files[0].sliced.grams === 20, "the mesh is past the budget: a warning, not an error, and the slice info is kept", { jb, f: v.files && v.files[0] });
     ok(v.source === "sliced" && !v.sources_available.includes("geometry") && v.print.grams === 20 && /file's slice/.test(v.source_label), "with no measurable mesh the estimate uses the file's own slice (20 g), and geometry is not offered", v.print && { src: v.source, avail: v.sources_available });
   } finally { await stopHub(); await moon.close(); }
+  await crewEstimateReview();
   console.log("\n" + pass + " passed, " + fail + " failed" + (FALSIFY ? "  (U1HUB_ESTIMATE_FALSIFY=1: a red run is the expected result)" : ""));
   process.exit(fail ? 1 : 0);
 }
+// ==== crew/estimate review fixes (2026-10-21): state file, stable printer id, honest print links ====
+// Kept in one section so the pricing checks another branch adds above merge cleanly.
+async function crewEstimateReview() {
+  console.log("\n-- [crew/estimate] estimate-store.json is written atomically --");
+  let ST = null; try { ST = require("../modules/estimate/store.js"); } catch (e) { ok(false, "modules/estimate/store.js loads", e.message); }
+  if (ST) {
+    // A recording fs: the save must go tmp -> rename, never straight onto the store.
+    const ops = [], mem = {};
+    const rec = (failRename) => ({
+      writeFile: async (f, d) => { ops.push(["write", path.basename(f)]); mem[f] = String(d); },
+      rename: async (a, b) => { ops.push(["rename", path.basename(a), path.basename(b)]); if (failRename) { const e = new Error("refused"); e.code = "EPERM"; throw e; } mem[b] = mem[a]; delete mem[a]; },
+      unlink: async f => { ops.push(["unlink", path.basename(f)]); delete mem[f]; }
+    });
+    const warns = [];
+    const w = ST.writer("/x/estimate-store.json", { fs: rec(false), warn: m => warns.push(m) });
+    await w("{\"estimates\":{}}");
+    ok(JSON.stringify(ops) === JSON.stringify([["write", "estimate-store.json.tmp"], ["rename", "estimate-store.json.tmp", "estimate-store.json"]]) && mem["/x/estimate-store.json"] === "{\"estimates\":{}}" && !("/x/estimate-store.json.tmp" in mem),
+       "save writes estimate-store.json.tmp then renames it over the store (no partial store file)", ops);
+    ops.length = 0;
+    const ws = ST.writer("/y/estimate-store.json", { fs: rec(true), warn: m => warns.push(m) });
+    await ws("A"); await ws("B");
+    ok(mem["/y/estimate-store.json"] === "B" && !("/y/estimate-store.json.tmp" in mem) && warns.length === 1 && /atomic save failed/.test(warns[0]),
+       "a share that refuses rename-over-existing: direct write, the tmp removed, warned once", { ops, warns });
+    // A tmp write that fails (disk full) must leave the store alone - never a direct, truncating write.
+    const full = { writeFile: async f => { if (/\.tmp$/.test(f)) { const e = new Error("no space"); e.code = "ENOSPC"; throw e; } mem[f] = "CLOBBERED"; }, rename: async () => {}, unlink: async () => {} };
+    mem["/z/estimate-store.json"] = "GOOD";
+    let thrown = null; try { await ST.writer("/z/estimate-store.json", { fs: full, warn: () => {} })("NEW"); } catch (e) { thrown = e; }
+    ok(thrown && mem["/z/estimate-store.json"] === "GOOD", "a failed tmp write (disk full) throws and leaves the old store untouched", { thrown: thrown && thrown.code, store: mem["/z/estimate-store.json"] });
+  }
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-estimate-crew-"));
+  const gdir = path.join(tmp, "gcode"); fs.mkdirSync(gdir);
+  const moon = createMock("u1"); const port = await moon.listen(0);
+  const A = { id: "paaaaaa1", name: "Printer-A", url: "http://127.0.0.1:" + port }, B = { id: "pbbbbbb2", name: "Printer-B", url: "http://127.0.0.1:" + port };
+  const writeCfg = list => fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: gdir, port: PORT, printers: list }, null, 2));
+  const STORE = path.join(tmp, "estimate-store.json");
+  const up = async (name, buf) => { const r = await fetch(HUB + "/api/estimate/upload", { method: "POST", headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(name) }, body: buf }); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; };
+  const waitJob = async j => { for (let i = 0; i < 400; i++) { const r = await jget("/api/estimate/job?job=" + j); if (r.body && r.body.done) return r.body; await sleep(50); } return { error: "timeout" }; };
+  try {
+    console.log("\n-- [crew/estimate] a damaged estimate-store.json is kept, never replaced with an empty store --");
+    writeCfg([A, B]);
+    const damaged = '{"estimates":{"est_keep":{"id":"est_keep","saved":true,"created":1,"files":[]';   // truncated mid-write
+    fs.writeFileSync(STORE, damaged);
+    await startHub(tmp, {});
+    const aside = fs.readdirSync(tmp).filter(n => /^estimate-store\.json\.corrupt-/.test(n));
+    ok(aside.length === 1 && fs.readFileSync(path.join(tmp, aside[0]), "utf8") === damaged, "the truncated store is moved aside byte for byte as estimate-store.json.corrupt-<time>", fs.readdirSync(tmp));
+    const hlog = (((await jget("/api/diagnostics?logs=0")).body || {}).log || []).filter(x => /estimate-store\.json/.test(x.msg));
+    ok(hlog.some(x => x.level === "error" && /damaged/.test(x.msg) && x.msg.includes(aside[0] || "\u0000")), "the damage is logged as an error naming the kept copy", hlog);
+    ok(!fs.existsSync(STORE) || fs.readFileSync(STORE, "utf8") !== damaged, "…and the module carries on with an empty store", null);
+
+    console.log("\n-- [crew/estimate] saves leave no partial file --");
+    let r = await up("cube.stl", binStl(cubeTris(20)));
+    const ID = r.body && r.body.id;
+    if (r.body && r.body.jobId) await waitJob(r.body.jobId);
+    r = await jpost("/api/estimate/" + ID + "/inputs", { printer_id: 1 });   // printer B, by its list position (what the page sends)
+    r = await jpost("/api/estimate/" + ID + "/save", { note: "on B" });
+    let parsed = null; for (let i = 0; i < 40; i++) { try { parsed = JSON.parse(fs.readFileSync(STORE, "utf8")); if (parsed.estimates[ID] && parsed.estimates[ID].saved) break; } catch {} await sleep(50); }
+    ok(parsed && parsed.estimates[ID] && parsed.estimates[ID].saved === true && !fs.existsSync(STORE + ".tmp"), "the store parses after saves and no estimate-store.json.tmp is left", parsed && Object.keys(parsed.estimates));
+
+    console.log("\n-- [crew/estimate] an estimate follows its printer, not its list position --");
+    ok(r.status === 200 && r.body.printer_id === 1 && r.body.inputs.printer_uid === B.id, "saving on printer B stores B's stable id", r.body && { pid: r.body.printer_id, inputs: r.body.inputs });
+    ok(parsed && parsed.estimates[ID] && parsed.estimates[ID].inputs.printer_uid === B.id, "…in estimate-store.json", parsed && parsed.estimates[ID] && parsed.estimates[ID].inputs);
+    await stopHub();
+    // an estimate saved before stable ids: only a numeric position
+    const st = JSON.parse(fs.readFileSync(STORE, "utf8"));
+    st.estimates.est_old = { ...st.estimates[ID], id: "est_old", inputs: { ...st.estimates[ID].inputs, printer_id: 1, printer_uid: undefined } };
+    delete st.estimates.est_old.inputs.printer_uid;
+    fs.writeFileSync(STORE, JSON.stringify(st));
+    fs.mkdirSync(path.join(tmp, "estimates", "est_old"), { recursive: true });
+    for (const f of fs.readdirSync(path.join(tmp, "estimates", ID))) fs.copyFileSync(path.join(tmp, "estimates", ID, f), path.join(tmp, "estimates", "est_old", f));
+    writeCfg([B, A]);   // Settings reordered the list: B is now position 0
+    await startHub(tmp, {});
+    const v = (await jget("/api/estimate/" + ID)).body || {};
+    ok(v.printer_id === 0 && v.inputs && v.inputs.printer_uid === B.id && v.inputs.printer_id === 0, "after a reorder the estimate still resolves to printer B (now position 0)", v && { pid: v.printer_id, inputs: v.inputs });
+    const vo = (await jget("/api/estimate/est_old")).body || {};
+    ok(vo.printer_id === 1, "an old estimate with only a numeric position still resolves by that position", vo && { pid: vo.printer_id, inputs: vo.inputs });
+    r = await jpost("/api/estimate/" + ID + "/inputs", { printer_id: B.id });
+    ok(r.status === 200 && r.body.printer_id === 0 && r.body.inputs.printer_uid === B.id, "printer_id may also be given as the stable id", r.body && { pid: r.body.printer_id, inputs: r.body.inputs });
+    ok((await jpost("/api/estimate/" + ID + "/inputs", { printer_id: "pnope00" })).status === 400, "an unknown stable id is refused");
+
+    console.log("\n-- [crew/estimate] the print links say what they are --");
+    const rr = await fetch(HUB + "/api/estimate/" + ID + "/report?format=pdf&view=quote");
+    const body = await rr.text();
+    ok(rr.ok && /text\/html/.test(rr.headers.get("content-type") || "") && /\.html"/.test(rr.headers.get("content-disposition") || "") && /window\.print\(\)/.test(body) && /Save as PDF/i.test(body),
+       "format=pdf is an HTML page that opens the print dialog and says to choose Save as PDF", [rr.headers.get("content-type"), rr.headers.get("content-disposition"), body.slice(0, 200)]);
+    const pr = await fetch(HUB + "/api/estimate/" + ID + "/report?format=print&view=internal");
+    ok(pr.ok && /text\/html/.test(pr.headers.get("content-type") || ""), "format=print is the honest name for the same page", pr.status);
+    const ui = fs.readFileSync(path.join(REPO, "public", "modules", "estimate-ui.js"), "utf8");
+    ok(!/>\s*(Quote|Internal) PDF\s*</.test(ui) && /Printable quote/.test(ui) && /Save as PDF/.test(ui), "the Estimate tab's buttons no longer promise a PDF file", (ui.match(/data-est="pdf"[^<]*</g) || []));
+  } finally { await stopHub(); await moon.close(); }
+}
+
 main().catch(async e => { console.error(e); await stopHub(); process.exit(1); });

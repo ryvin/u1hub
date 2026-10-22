@@ -6,7 +6,9 @@ plan: [superpowers/plans/2026-10-06-estimate.md](superpowers/plans/2026-10-06-es
 An **Estimate** tab. Drop an STL or a 3MF and get, before anything is printed:
 grams, print time, the cost layers, what to charge, whether the model was printed
 before (and its real numbers), and the result as a customer **quote** or an
-**internal** breakdown, as PDF (the browser prints the page), CSV or Excel. An
+**internal** breakdown, as a printable page (**Printable quote** / **Printable
+breakdown**: an HTML page that opens the browser's print dialog, where "Save as
+PDF" makes the PDF; there is no PDF file and no PDF library), CSV or Excel. An
 estimate can be saved and linked to a costing client and project; the saved list
 shows what was quoted next to the project's actual cost.
 
@@ -78,7 +80,15 @@ costing's (1 / 10 / 50, cost + markup). A rate that is not set is named as a bla
 qty (1-10000), material (density from costing's table), preset (Standard 2 walls
 15 %, Strong 4 walls 30 %, HueForge solid, Flexi), infill override, supports
 (auto / on / off), labour minutes, rush (0.5-5×), colours override, printer (else
-the first one whose bed fits). Bed sizes: Snapmaker U1 270 × 270 × 270 mm,
+the first one whose bed fits). The printer is stored by its stable id
+(`inputs.printer_uid`, the `id` every printer carries since upstream 2.43/2.44,
+`core/printer-ids.js`) as well as its list position (`inputs.printer_id`), and
+resolved by the id first, so an estimate follows its machine when Settings
+reorders the printers; the view's `inputs.printer_id` is the printer's current
+position. An estimate saved before this has only the position, which still
+resolves. A stored id whose printer is gone means "first that fits", never
+whichever printer took its place. `printer_id` on input may be the position (what
+the page sends) or the stable id. Bed sizes: Snapmaker U1 270 × 270 × 270 mm,
 Anycubic Kobra S1 250 × 250 × 250 mm (makers' spec pages, checked 2026-10-06); a
 printer type not listed is "size unchecked".
 
@@ -92,7 +102,9 @@ printer type not listed is "size unchecked".
 - `POST /api/estimate/:id/source {source: geometry|sliced|printed, key}` → view; 400 when not available
 - `POST /api/estimate/:id/save {client_id, project_id, note}` → view
 - `GET /api/estimate` → the saved list with quoted and actual
-- `GET /api/estimate/:id/report?format=pdf|csv|xlsx&view=quote|internal`
+- `GET /api/estimate/:id/report?format=print|csv|xlsx&view=quote|internal` (`print` is
+  an HTML page that calls `window.print()` on load and says to choose Save as PDF;
+  `format=pdf` is its old name and answers the same page)
 - `GET /api/estimate/:id/thumb?file_id=` → the 3MF's own PNG
 - `DELETE /api/estimate/:id`
 - Public quotes (the **Quote requests** and **Public quotes** cards, and the key-gated
@@ -105,8 +117,8 @@ printer type not listed is "size unchecked".
 
 | File | What |
 |---|---|
-| `estimate-store.json` | estimates (files' measured facts, slice info, candidates, inputs, source, saved, links). Until the 2.44.0 merge this was `estimates.json`; that name is now upstream Dispatch's learned-estimates file, so on first boot the module copies its estimates out of it once and never touches it again |
-| `estimates/<id>/<file_id>.<ext>` | the uploads, stored by generated id, never by the uploaded name; unsaved estimates are pruned after 30 days |
+| `estimate-store.json` | estimates (files' measured facts, slice info, candidates, inputs, source, saved, links). Until the 2.44.0 merge this was `estimates.json`; that name is now upstream Dispatch's learned-estimates file, so on first boot the module copies its estimates out of it once and never touches it again. Written as `estimate-store.json.tmp` then renamed over the store (`estimate/store.js`); where the filesystem refuses rename-over-existing (a share) it writes directly for the rest of the run and warns once; a failed tmp write (disk full) leaves the store untouched. A store that does not parse at boot is moved aside as `estimate-store.json.corrupt-<time>` and logged as an error (Settings → Diagnostics log), and the module starts with no estimates; the kept copy is the owner's to repair. If it cannot be moved or copied aside, saving is off for that run so it is never overwritten |
+| `estimates/<id>/<file_id>.<ext>` | the uploads, stored by generated id, never by the uploaded name; unsaved estimates are pruned after 30 days. A public quote upload whose analysis fails is deleted at once (its error record stays); public quote files in total are capped by `estimate.quote_store_mb` ([quote.md](quote.md)) |
 | `estimate-calibration.json` | the live time fits and grams `k` |
 
 All gitignored. Env: `U1HUB_ESTIMATE_MAX_MB` (upload cap, default 200),
@@ -118,7 +130,12 @@ All gitignored. Env: `U1HUB_ESTIMATE_MAX_MB` (upload cap, default 200),
 - `test/estimate-standalone.js` (pure units against hand-computed answers, then the
   booted Hub: upload → estimate → inputs → sources → save → reports → size cap →
   restart → an unmeasurable 3MF with slice info), its falsified run red
-  (`U1HUB_ESTIMATE_FALSIFY=1`), three consecutive green runs.
+  (`U1HUB_ESTIMATE_FALSIFY=1`), three consecutive green runs. Its
+  `[crew/estimate]` section (2026-10-21 review) covers the tmp+rename store writer
+  (with a recording fs: the rename fallback and a disk-full tmp write), a truncated
+  store at boot (kept aside byte for byte, error logged), the stable printer id
+  across a reorder (and an old numeric-only estimate), and the honest print links.
+  `U1HUB_ESTIMATE_TEST_PORT` moves its Hub off 45993.
 - XLSX loaded in openpyxl (Quote and Breakdown sheets, values in place); not opened
   in Excel from here.
 - Playwright on a throwaway Hub (see docs/FORK.md "Live gates").
