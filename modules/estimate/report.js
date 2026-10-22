@@ -1,5 +1,5 @@
-// modules/estimate/report.js — the estimate as a printable page (the browser
-// prints it to PDF), a CSV and an XLSX workbook (Quote + Breakdown sheets),
+// modules/estimate/report.js — the estimate as a printable HTML page (the
+// browser's print dialog saves it as PDF; there is no PDF file), a CSV and an XLSX workbook (Quote + Breakdown sheets),
 // written with the Hub's own zip writer: no dependency. Pure.
 // Fork module estimate (ryvin/u1hub).
 "use strict";
@@ -29,13 +29,18 @@ function rows(V, internal) {
   for (const b of (V.pricing && V.pricing.breaks) || []) R.push(["Quantity break", "x" + b.qty + " each", b.each]);
   return R;
 }
-function html(V, view) {
-  const internal = view === "internal";
+// opts.autoprint: the page opens the browser's print dialog on load and says to pick "Save as PDF".
+// It is an HTML page, not a PDF file; no PDF library is a dependency, and the browser's own PDF
+// printer gives the same document.
+const PRINT_NOTE = "<p class=noprint>Your browser's print dialog opens with this page - choose <b>Save as PDF</b> as the printer to keep a PDF copy.</p>";
+const PRINT_JS = "<script>window.addEventListener(\"load\",function(){window.print()})</script>";
+function html(V, view, opts) {
+  const internal = view === "internal", auto = !!(opts && opts.autoprint);
   const tr = rows(V, internal).map(r => "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td><td class=n>" + esc(MONEY.has(r[0]) ? usd(r[2]) : r[2]) + "</td></tr>").join("");
   const rec = V.recommended || {};
   return "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>" + esc(internal ? "Estimate" : "Quote") + " - " + esc(V.name) + "</title>"
-    + "<style>body{font:14px system-ui,sans-serif;margin:32px;color:#111;background:#fff}h1{font-size:20px}table{border-collapse:collapse;width:100%}td{border-bottom:1px solid #ddd;padding:6px 8px}td.n{text-align:right}.big{font-size:28px;font-weight:700;margin:12px 0}@media print{body{margin:0}}</style></head><body>"
-    + "<h1>" + esc(internal ? "Estimate (internal)" : "Quote") + "</h1><div>" + esc(V.name) + " · " + esc(new Date(V.created).toISOString().slice(0, 10)) + "</div>"
+    + "<style>body{font:14px system-ui,sans-serif;margin:32px;color:#111;background:#fff}h1{font-size:20px}table{border-collapse:collapse;width:100%}td{border-bottom:1px solid #ddd;padding:6px 8px}td.n{text-align:right}.big{font-size:28px;font-weight:700;margin:12px 0}.noprint{color:#555;font-size:12px}@media print{body{margin:0}.noprint{display:none}}</style>" + (auto ? PRINT_JS : "") + "</head><body>"
+    + (auto ? PRINT_NOTE : "") + "<h1>" + esc(internal ? "Estimate (internal)" : "Quote") + "</h1><div>" + esc(V.name) + " · " + esc(new Date(V.created).toISOString().slice(0, 10)) + "</div>"
     + "<div class=big>" + esc(usd(rec.price)) + (V.qty > 1 ? " <small>(" + esc(usd(rec.each)) + " each × " + esc(V.qty) + ")</small>" : "") + "</div>"
     + "<table>" + tr + "</table>" + (internal ? "" : "<p>This quote is valid for " + esc(V.valid_days) + " days. Print time is an estimate.</p>") + "</body></html>";
 }

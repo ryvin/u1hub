@@ -21,7 +21,7 @@
 // Uploads: one raw-body POST per file (Content-Type application/octet-stream,
 // X-File-Name), streamed to <baseDir>/estimates/<id>/<file_id>.<ext> under a
 // byte cap; the uploaded name is only ever displayed (escaped). State:
-// estimates.json and estimate-calibration.json beside config.json (gitignored).
+// estimate-store.json (estimate/store.js) and estimate-calibration.json beside config.json (gitignored).
 "use strict";
 const fs = require("fs"), fsp = fs.promises, path = require("path"), crypto = require("crypto");
 const { facts3mf } = require("./mesh3mf.js");
@@ -30,7 +30,7 @@ const { parseGcodeMap, estMinutes } = require("../parser.js");
 const STL = require("./estimate/stl.js"), GEO = require("./estimate/geometry.js"), SL = require("./estimate/sliced.js");
 const ZC = require("./estimate/zipcap.js");
 const CAL = require("./estimate/calibrate.js"), MATCH = require("./estimate/match.js"), PRICE = require("./estimate/price.js"), REP = require("./estimate/report.js");
-const QUOTE = require("./estimate/quote.js");
+const QUOTE = require("./estimate/quote.js"), STORE = require("./estimate/store.js");
 
 const FORK = "ryvin/u1hub";
 const MAX_MB = Math.max(0.001, Number(process.env.U1HUB_ESTIMATE_MAX_MB) || 200);
@@ -51,7 +51,7 @@ const MESH_MAX_BYTES = Number(process.env.U1HUB_ESTIMATE_MESH_MAX_MB) > 0 ? Numb
 // A type not listed is "size unchecked", never "fits".
 const BEDS = { u1: [270, 270, 270], "kobra-s1": [250, 250, 250] };
 const MATERIALS = ["PLA", "PETG", "ABS", "ASA", "TPU", "PC"];
-const DEFAULT_INPUTS = Object.freeze({ qty: 1, material: "PLA", preset: "standard", walls: null, infill: null, supports: "auto", labor_minutes: 0, rush: 1, printer_id: null, colours: null });
+const DEFAULT_INPUTS = Object.freeze({ qty: 1, material: "PLA", preset: "standard", walls: null, infill: null, supports: "auto", labor_minutes: 0, rush: 1, printer_id: null, printer_uid: null, colours: null });
 const LIMITS = { qty: [1, 10000], walls: [1, 10], infill: [0, 1], labor_minutes: [0, 6000], rush: [0.5, 5], colours: [1, 16] };
 const MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const newId = p => p + Date.now().toString(36) + crypto.randomBytes(4).toString("hex");
@@ -91,8 +91,11 @@ function register(ctx) {
   // Prototype-free, and looked up by own keys only: "__proto__" or "constructor" is no estimate (final review).
   let S = { estimates: Object.create(null) };
   const fromFile = f => { const j = JSON.parse(fs.readFileSync(f, "utf8")); return j && j.estimates ? { estimates: Object.assign(Object.create(null), j.estimates) } : null; };
-  if (fs.existsSync(STATE)) { try { S = fromFile(STATE) || S; } catch {} }
-  else {
+  // A damaged store is moved aside and logged, never silently replaced by an empty one (estimate/store.js).
+  const loaded = STORE.load(STATE, { log: ctx.hublog });
+  const SAVE_OFF = !!loaded.blocked;
+  if (loaded.state) S = { estimates: Object.assign(Object.create(null), loaded.state.estimates) };
+  else if (loaded.missing) {
     let old = null; try { old = fromFile(LEGACY); } catch {}
     if (old) {
       S = old;
@@ -104,7 +107,8 @@ function register(ctx) {
   try { const j = JSON.parse(fs.readFileSync(CALF, "utf8")); if (j && j.fits) CALS = j; } catch {}
   const JOBS = new Map();
   let saving = Promise.resolve();
-  const save = () => (saving = saving.then(() => fsp.writeFile(STATE, JSON.stringify(S, null, 2))).catch(e => ctx.hublog("warn", "estimate: state write failed - " + e.message)));
+  const writeStore = STORE.writer(STATE, { warn: m => ctx.hublog("warn", "estimate: " + m) });
+  const save = () => (SAVE_OFF ? saving : (saving = saving.then(() => writeStore(JSON.stringify(S, null, 2))).catch(e => ctx.hublog("warn", "estimate: state write failed - " + e.message))));
   const pruneJobs = () => { const now = Date.now(); for (const [k, j] of JOBS) if (j.done && now - j.ts > JOB_TTL_MS) JOBS.delete(k); };
   const fileOf = (est, f) => path.join(DIR, est.id, f.file_id + "." + f.kind);
   const use = (key, dflt) => { const fn = ctx.use(key); return typeof fn === "function" ? fn : dflt; };
@@ -190,6 +194,9 @@ function register(ctx) {
       job.phase = "done";
     } catch (e) {
       f.error = e.message; job.error = e.message; job.phase = "error";
+      // A public upload that is no model is kept as its error record only: the bytes are a stranger's,
+      // they can never be priced, and they would count against estimate.quote_store_mb for 7 days.
+      if (est.public) { await fsp.rm(fp, { force: true }).catch(() => {}); f.removed = true; }
     }
     job.done = true;
     save();
@@ -248,12 +255,17 @@ function register(ctx) {
     printers.forEach((p, i) => { const bed = BEDS[p.type || "u1"]; if (!bed) fits_unchecked.push(p.name); else if (files.length && fitsBed(size, bed)) fits.push({ i, name: p.name, type: p.type || "u1" }); });
     let schedule = [];
     try { schedule = ((await ctx.fleet()) || []).map(p => ({ name: p.name, state: p.state, free_in_min: p.state === "printing" || p.state === "paused" ? Math.round((p.etaSec || 0) / 60) : 0 })); } catch {}
-    const pid = num(I.printer_id) != null && printers[I.printer_id] ? I.printer_id : (fits[0] ? fits[0].i : 0);
+    // The chosen printer by its stable id (core/printer-ids.js) first: a list position moves when Settings
+    // reorders the printers. An estimate saved before stable ids has only the position, which still resolves.
+    // A stable id whose printer is gone is no choice at all ("first that fits"), never whoever took its place.
+    const chosen = I.printer_uid ? printers.findIndex(p => p && p.id === I.printer_uid)
+      : (num(I.printer_id) != null && printers[I.printer_id] ? I.printer_id : -1);
+    const pid = chosen >= 0 ? chosen : (fits[0] ? fits[0].i : 0);
     const ptype = printers[pid] ? (printers[pid].type || "u1") : "u1";
     const price = PRICE.priceEstimate({ grams, minutes, qty: I.qty, printer_id: pid, type: ptype, material: I.material, labor_minutes: I.labor_minutes, rush: I.rush, failure_rate, name: (est.files || []).map(f => f.name).join(", ") },
                                       use("costing.rates", () => ({}))() || {}, (ctx.cfg && ctx.cfg.margin) || {});
     return {
-      inputs: I, source, sources_available: sources, source_label: label,
+      inputs: { ...I, printer_id: chosen >= 0 ? chosen : null }, source, sources_available: sources, source_label: label,
       print: { grams, minutes, plates: plates || files.length, supports_needed, supports_g: r2(geo.reduce((a, g) => a + g.supports_g, 0)), colours, band_pct, designer_minutes,
                brim: !!(tallest && tallest.aspect > 3), multiace: colours > 4,
                k_err: CALS.k && CALS.k[mode] && CALS.k[mode].err != null ? CALS.k[mode].err : null, multicolour: colours > 1 },
@@ -281,8 +293,16 @@ function register(ctx) {
     if ("supports" in b) { if (!["auto", "on", "off"].includes(b.supports)) return { error: "supports must be auto, on or off" }; out.supports = b.supports; }
     if ("material" in b) { const m = String(b.material || "").trim().toUpperCase(); if (!m || m.length > 20) return { error: "material must be 1-20 characters" }; out.material = m; }
     if ("printer_id" in b) {
-      if (b.printer_id === null || b.printer_id === "") out.printer_id = null;
-      else { const i = Number(b.printer_id); if (!Number.isInteger(i) || !(ctx.printers || [])[i]) return { error: "printer_id is not a printer" }; out.printer_id = i; }
+      // A list position (what the page sends) or a printer's stable id; stored as both, resolved by the id.
+      const list = ctx.printers || [];
+      if (b.printer_id === null || b.printer_id === "") { out.printer_id = null; out.printer_uid = null; }
+      else {
+        const byId = typeof b.printer_id === "string" && !/^[0-9]+$/.test(b.printer_id);
+        const n = Number(b.printer_id);
+        const i = byId ? list.findIndex(p => p && p.id === b.printer_id) : (Number.isInteger(n) && list[n] ? n : -1);
+        if (i < 0) return { error: "printer_id is not a printer" };
+        out.printer_id = i; out.printer_uid = list[i].id || null;
+      }
     }
     return { inputs: out };
   }
@@ -389,10 +409,11 @@ function register(ctx) {
     const est = get(req.params.id); if (!est) return bad(res, 404, "no such estimate");
     const V = await view(est), vw = req.query.view === "internal" ? "internal" : "quote", fmt = String(req.query.format || "pdf");
     const base = "estimate-" + est.id + (vw === "internal" ? "-internal" : "-quote");
-    if (fmt === "pdf") return res.type("html").set("Content-Disposition", 'inline; filename="' + base + '.html"').send(REP.html(V, vw));
+    // "print" is an HTML page that opens the print dialog (Save as PDF), not a PDF file; "pdf" is its old name, kept for links already out there.
+    if (fmt === "print" || fmt === "pdf") return res.type("html").set("Content-Disposition", 'inline; filename="' + base + '.html"').send(REP.html(V, vw, { autoprint: true }));
     if (fmt === "csv") return res.type("text/csv; charset=utf-8").set("Content-Disposition", 'attachment; filename="' + base + '.csv"').send(REP.csv(V));
     if (fmt === "xlsx") return res.type(MIME_XLSX).set("Content-Disposition", 'attachment; filename="' + base + '.xlsx"').send(REP.xlsx(V));
-    bad(res, 400, "format must be pdf, csv or xlsx");
+    bad(res, 400, "format must be print, csv or xlsx");
   });
   ctx.app.get("/api/estimate/:id/thumb", async (req, res) => {
     const est = get(req.params.id); if (!est) return bad(res, 404, "no such estimate");

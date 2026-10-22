@@ -9,6 +9,7 @@
 const crypto = require("crypto"), fs = require("fs"), path = require("path");
 const QUOTE = require("./quote.js"), RB = require("./readyby.js"), PRICE = require("./price.js");
 const QUOTE_MAX_MB = Math.max(0.001, Number(process.env.U1HUB_QUOTE_MAX_MB) || 100);
+const QUOTE_STORE_MB = 2048;   // default total for stored public-quote files (config estimate.quote_store_mb)
 const DAY = 24 * 3600 * 1000;
 const isoDay = ms => new Date(ms).toISOString().slice(0, 10);
 
@@ -80,8 +81,25 @@ function mount(ctx, H) {
   const send = (res, est) => publicView(est).then(v => res.json(v)).catch(e => bad(res, 500, "quote failed: " + e.message));
 
   ctx.app.get("/api/quote-backend/ping", guard, (req, res) => { const S = settings(); res.json({ ok: true, enabled: !!S.enabled, max_mb: QUOTE_MAX_MB, analyses: { ...ANALYSES } }); });
+  // Stored public-quote files, in total, under estimate.quote_store_mb (default 2048). Counted from the
+  // records (each file's bytes at upload), not by walking the disk: no stat on every upload. Files that
+  // are gone (analysis failed, the visitor deleted them, pruned) do not count. Over the cap, uploads get
+  // the service's own "busy" answer and the Hub warns once until it is under again.
+  const storeCapBytes = () => { const mb = Number(conf().quote_store_mb); return (Number.isFinite(mb) && mb > 0 ? mb : QUOTE_STORE_MB) * 1048576; };
+  const storedBytes = () => {
+    let n = 0;
+    for (const e of Object.values(H.S.estimates)) if (e.public && !e.files_deleted) for (const f of e.files || []) if (!f.removed) n += Number(f.bytes) || 0;
+    return n;
+  };
+  let capWarned = false;
   ctx.app.post("/api/quote-backend/upload", guard, (req, res) => {
     if (!settings().enabled) { req.resume(); return paused(res); }
+    const used = storedBytes(), cap = storeCapBytes();
+    if (used >= cap) {
+      if (!capWarned) { capWarned = true; ctx.hublog("warn", "quote: public quote files use " + (used / 1048576).toFixed(1) + " MB, at estimate.quote_store_mb (" + (cap / 1048576) + " MB) - new public uploads are refused until quotes expire or are deleted"); }
+      req.resume(); return bad(res, 503, "We're busy right now - please try again in a while", { paused: true });
+    }
+    capWarned = false;
     const token = crypto.randomBytes(16).toString("hex");
     H.receive(req, res, { cap: QUOTE_MAX_MB * 1048576, capMb: QUOTE_MAX_MB, existing: null,
       make: id => ({ ...H.newEstimate(id), public: true, token, status: "quote", options: { qty: 1, quality: "standard", rush: false }, contact: null, owner_note: "", final_price: null }),
@@ -166,4 +184,4 @@ function mount(ctx, H) {
   act("close", async est => { est.status = "closed"; est.closed_at = Date.now(); });
   return { publicView, settings, TOKENS, byToken };
 }
-module.exports = { mount, QUOTE_MAX_MB };
+module.exports = { mount, QUOTE_MAX_MB, QUOTE_STORE_MB };

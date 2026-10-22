@@ -9,7 +9,7 @@
 const { spawn } = require("child_process");
 const fs = require("fs"), os = require("os"), path = require("path"), http = require("http");
 const REPO = path.join(__dirname, "..");
-const PORT = 45994, HUB = "http://127.0.0.1:" + PORT;
+const PORT = Number(process.env.U1HUB_QUOTE_TEST_PORT) || 45994, HUB = "http://127.0.0.1:" + PORT;
 const FALSIFY = process.env.U1HUB_QUOTE_FALSIFY === "1";
 let pass = 0, fail = 0;
 function ok(cond, name, detail) { if (cond) { pass++; console.log("  ok   " + name); } else { fail++; console.log("  FAIL " + name + (detail !== undefined ? "\n       " + JSON.stringify(detail).slice(0, 600) : "")); } }
@@ -296,8 +296,44 @@ async function gateInPasswordMode() {
   } finally { await stopHub(); }
 }
 
+// ==== crew/estimate review fixes (2026-10-21): public uploads cannot fill the disk ====
+async function crewDiskCap() {
+  console.log("\n-- [crew/estimate] a failed public analysis keeps no file; stored quote files have a total cap --");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u1hub-quote-cap-"));
+  // 0.0005 MB = 524 bytes: one 20 mm cube STL (684 bytes) puts the store over the cap
+  fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ gcodeFolder: path.join(tmp, "g"), port: PORT, printers: [],
+    estimate: { quote_key: KEY, quote_store_mb: 0.0005, quote: { enabled: true } } }));
+  const storeOf = () => { try { return JSON.parse(fs.readFileSync(path.join(tmp, "estimate-store.json"), "utf8")).estimates || {}; } catch { return {}; } };
+  const byTok = t => Object.values(storeOf()).find(e => e.token === t) || null;
+  const filesOf = id => { try { return fs.readdirSync(path.join(tmp, "estimates", id)); } catch { return []; } };
+  await startHub(tmp);
+  try {
+    // 600 bytes that are no STL: analysis fails. Its bytes alone would be over the cap if they were kept or counted.
+    const junk = Buffer.concat([Buffer.from("solid junk\n"), Buffer.alloc(589, 0x20)]);
+    let r = await bup("junk.stl", junk);
+    const TJ = r.body && r.body.token;
+    const vj = TJ ? await waitReady(TJ) : { body: {} };
+    let ej = null; for (let i = 0; i < 40 && !(ej && ej.files && ej.files[0] && ej.files[0].error); i++) { ej = byTok(TJ); await sleep(50); }
+    ok(vj.body && /couldn't read/i.test(vj.body.error || ""), "an unreadable public upload answers with the friendly error", vj.body);
+    ok(ej && ej.files[0].error && filesOf(ej.id).length === 0, "…its stored file is deleted, the error record is kept", ej && { id: ej.id, files: filesOf(ej.id), err: ej.files[0].error });
+    r = await bup("cube.stl", binStl(cubeTris(20)));
+    ok(r.status === 200 && /^[0-9a-f]{32}$/.test((r.body && r.body.token) || ""), "a deleted failure does not count toward the cap: the next upload is taken", r.body);
+    if (r.body && r.body.token) await waitReady(r.body.token);
+    const refused = await bup("cube2.stl", binStl(cubeTris(20)));
+    ok(refused.status === 503 && refused.body && refused.body.paused === true && /busy|paused/i.test(refused.body.error || "") && !/\bat\s|node_modules|Error:/.test(JSON.stringify(refused.body)),
+       "stored quote files over estimate.quote_store_mb -> 503 paused, a friendly message, no stack", refused);
+    await bup("cube3.stl", binStl(cubeTris(20)));
+    const hl = (((await bget("/api/diagnostics?logs=0", null)).body || {}).log || []).filter(x => /quote_store_mb/.test(x.msg));
+    ok(hl.length === 1 && hl[0].level === "warn", "the Hub warns once, not per refused upload", hl);
+    ok(fs.readdirSync(path.join(tmp, "estimates")).length === 2, "the refused uploads stored nothing", fs.readdirSync(path.join(tmp, "estimates")));
+  } finally { await stopHub(); }
+}
+
 async function main() {
   pureQuote(); pureReadyBy(); pruneRule();
+  try { await crewDiskCap(); }
+  catch (e) { fail++; console.log("  FAIL crew disk-cap section threw: " + e.message); }
+  finally { await stopHub(); }
   let ctxB = null;
   try { ctxB = await booted(); }
   catch (e) { fail++; console.log("  FAIL booted section threw: " + e.message); }

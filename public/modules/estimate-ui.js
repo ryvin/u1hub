@@ -6,7 +6,8 @@
 // into one estimate -> the server measures it, reads any slice info, looks for
 // earlier prints -> the page shows Model, Print, Printed before, Cost & price,
 // the inputs that re-price it (debounced; the newest answer wins), Save (to a
-// costing client / project) and the reports (quote / internal PDF, CSV, Excel).
+// costing client / project) and the reports (printable quote / breakdown pages
+// that open the print dialog for Save as PDF, CSV, Excel).
 // Every server string goes through esc().
 "use strict";
 (function () {
@@ -176,7 +177,7 @@
     const base = "/api/estimate/" + encodeURIComponent(v.id) + "/report?";
     return '<div class="estcard"><h3>Save &amp; reports</h3><div class="estrow"><select class="field" data-sv="client_id">' + cl + '</select><select class="field" data-sv="project_id">' + pr + '</select>'
       + '<input class="field" data-sv="note" placeholder="note" value="' + esc(v.note || "") + '"><button class="btn primary" data-est="save">' + (v.saved ? "Saved ✓ update" : "Save") + '</button></div>'
-      + '<div class="estrow"><button class="btn" data-est="pdf" data-view="quote">Quote PDF</button><button class="btn" data-est="pdf" data-view="internal">Internal PDF</button>'
+      + '<div class="estrow"><button class="btn" data-est="pdf" data-view="quote" title="Opens the print dialog - choose Save as PDF">Printable quote</button><button class="btn" data-est="pdf" data-view="internal" title="Opens the print dialog - choose Save as PDF">Printable breakdown</button>'
       + '<button class="btn" data-est="dl" data-href="' + esc(base + 'format=csv&view=internal') + '">CSV</button><button class="btn" data-est="dl" data-href="' + esc(base + 'format=xlsx&view=internal') + '">Excel</button>'
       + '<a href="#" data-est="new" style="font-size:12px; color:var(--ink-dim)">start a new estimate</a></div><div class="estok esto"></div></div>';
   }
@@ -248,10 +249,8 @@
       if (r.ok) { CUR = r.d; render(); const o = EL.querySelector(".esto"); if (o) o.textContent = "Saved."; paintSaved(); } else msg((r.d && r.d.error) || "could not save");
       return;
     }
-    if (act === "pdf") {
-      const w = window.open("/api/estimate/" + encodeURIComponent(CUR.id) + "/report?format=pdf&view=" + encodeURIComponent(t.dataset.view), "_blank");
-      if (w) w.addEventListener("load", () => { try { w.print(); } catch {} });
-    }
+    // An HTML page that opens its own print dialog (Save as PDF); it is not a PDF file.
+    if (act === "pdf") window.open("/api/estimate/" + encodeURIComponent(CUR.id) + "/report?format=print&view=" + encodeURIComponent(t.dataset.view), "_blank");
   }
 
   // ---- public quotes: requests and settings (docs/quote.md) ------------------------------
