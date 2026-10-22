@@ -112,7 +112,7 @@ function createMock(profile) {
       return send(200, { result: { state: "ready", software_version: state.softwareVersion || "v0.12.0-mock", hostname: profile + "-mock", cpu_info: "mock" } });
 
     if (u.pathname === "/server/files/list")
-      return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: Date.now() / 1000, permissions: "rw" })) });
+      return send(200, { result: state.files.map(f => ({ path: f.name, size: f.size, modified: f.modified != null ? f.modified : Date.now() / 1000, permissions: "rw" })) });   // fork (ryvin/u1hub): a test may pin modified (printer-sync)
 
     // v2.40.2: download a stored file (copy-to-Hub). Bytes are the file's own
     // `data` when the test gave one, else `size` deterministic bytes.

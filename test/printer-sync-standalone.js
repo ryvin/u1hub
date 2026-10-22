@@ -149,13 +149,34 @@ function writeConfig(dir, gcode, portU1, features) {
 
     // a copy whose length disagrees with the listing is discarded
     const short = path.join(gcode, "short.gcode");
-    mock.state.files.push({ name: "short.gcode", size: 999, data: Buffer.from("tiny") });
+    mock.state.files.push({ name: "short.gcode", size: 999, modified: 1760000000, data: Buffer.from("tiny") });
     await jpost("/api/printer-sync/run", {});
     const stat = (await jget("/api/printer-sync")).body;
     ok(!fs.existsSync(short) && !fs.existsSync(short + ".part") && stat.errors.some(e => e.name === "short.gcode"),
       "a copy whose byte count disagrees with the listing is discarded and logged", stat.errors);
     ok(stat.synced.some(x => x.name === "arrived_on_printer.gcode" && x.printer === "U1-mock"), "/api/printer-sync lists what it copied and from where");
     ok(stat.skipped["clash.gcode"] && /different file/.test(stat.skipped["clash.gcode"].reason), "/api/printer-sync explains the skip");
+
+    // a file whose size never matches its listing: tried twice, then left alone until the listing changes
+    {
+      const shortGets = () => mock.state.downloads.filter(d => d.name === "short.gcode").length;
+      const before2 = shortGets();
+      await jpost("/api/printer-sync/run", {});                       // attempt 2
+      ok(shortGets() === before2 + 1, "second pass: the mismatching file is tried a second time", shortGets() - before2);
+      const before3 = shortGets();
+      r = await jpost("/api/printer-sync/run", {});                   // pass 3
+      ok(shortGets() === before3, "third pass: nothing is requested for it", shortGets() - before3);
+      const s3 = (await jget("/api/printer-sync")).body;
+      ok(r.body.skipped.includes("short.gcode") && s3.skipped["short.gcode"] && /size never matches listing \(2 attempts\)/.test(s3.skipped["short.gcode"].reason),
+        "...and it is listed under skipped: 'size never matches listing (2 attempts)'", { pass: r.body.skipped, state: s3.skipped["short.gcode"] });
+      const f = mock.state.files.find(x => x.name === "short.gcode");
+      f.size = f.data.length;                                          // the printer's listing for it changes
+      const before4 = shortGets();
+      r = await jpost("/api/printer-sync/run", {});
+      ok(shortGets() === before4 + 1 && r.body.copied.includes("short.gcode") && fs.existsSync(short), "its listed size changed: eligible again (requested and copied)", r.body);
+      const s4 = (await jget("/api/printer-sync")).body;
+      ok(!s4.skipped["short.gcode"], "...and no longer listed as skipped", s4.skipped);
+    }
 
     // subfolders stay on the printer
     mock.state.files.push({ name: "sub/inner.gcode", size: 4, data: Buffer.from("G28\n") });
