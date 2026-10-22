@@ -234,7 +234,7 @@ function register(ctx) {
     // The chosen source when it is still available; otherwise the file's own slice when every file has one
     // (it beats a geometry guess), else geometry.
     let source = sources.includes(est.source) ? est.source : (sources.includes("sliced") ? "sliced" : (sources.find(x => x !== "printed") || "none"));
-    let grams = null, minutes = null, band_pct = null, failure_rate = null, label = "nothing measurable";
+    let grams = null, minutes = null, band_pct = null, success_rate = null, label = "nothing measurable";
     if (source === "geometry") { grams = geoGrams; minutes = CAL.minutesFrom(geoGrams, fit); band_pct = band; label = "geometry ±" + band + " %" + (fit.source === "fallback" ? " (time: fallback fit)" : ""); }
     let designer_minutes = null;
     if (source === "sliced") {
@@ -247,7 +247,7 @@ function register(ctx) {
       grams = c.grams != null ? c.grams : (files.length ? geoGrams : null);
       minutes = c.actual_minutes != null ? c.actual_minutes : (c.slicer_minutes != null ? c.slicer_minutes : CAL.minutesFrom(grams, fit));
       band_pct = c.actual_minutes != null ? 0 : band;
-      failure_rate = c.success_rate;
+      success_rate = c.success_rate;
       label = "exact (printed before: " + c.file + ")" + (c.size_check === "different" ? ", different size!" : c.size_check === "unchecked" ? ", size not checked" : "");
     }
     const printers = ctx.printers || [];
@@ -262,7 +262,7 @@ function register(ctx) {
       : (num(I.printer_id) != null && printers[I.printer_id] ? I.printer_id : -1);
     const pid = chosen >= 0 ? chosen : (fits[0] ? fits[0].i : 0);
     const ptype = printers[pid] ? (printers[pid].type || "u1") : "u1";
-    const price = PRICE.priceEstimate({ grams, minutes, qty: I.qty, printer_id: pid, type: ptype, material: I.material, labor_minutes: I.labor_minutes, rush: I.rush, success_rate: failure_rate, name: (est.files || []).map(f => f.name).join(", ") },
+    const price = PRICE.priceEstimate({ grams, minutes, qty: I.qty, printer_id: pid, type: ptype, material: I.material, labor_minutes: I.labor_minutes, rush: I.rush, success_rate, name: (est.files || []).map(f => f.name).join(", ") },
                                       use("costing.rates", () => ({}))() || {}, (ctx.cfg && ctx.cfg.margin) || {});
     return {
       inputs: { ...I, printer_id: chosen >= 0 ? chosen : null }, source, sources_available: sources, source_label: label,

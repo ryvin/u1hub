@@ -69,7 +69,7 @@ function mount(ctx, H) {
     const rates = H.use("costing.rates", () => ({}))() || {};
     const pid = v.printer_id, ptype = ((ctx.printers || [])[pid] || {}).type || "u1";
     const priceAt = (g, m) => PRICE.priceEstimate({ grams: g, minutes: m, qty: v.inputs.qty, printer_id: pid, type: ptype, material: v.inputs.material, rush: v.inputs.rush,
-      failure_rate: null, name: "quote" }, rates, (ctx.cfg && ctx.cfg.margin) || {}).recommended.price;
+      success_rate: null, name: "quote" }, rates, (ctx.cfg && ctx.cfg.margin) || {}).recommended.price;
     const fits = v.fits == null ? null : v.fits.length > 0;
     const range = fits === false || v.print.grams == null ? null
       : QUOTE.priceRange({ grams: v.print.grams, minutes: v.print.minutes, confidence, g: b.g, t: b.t, firm: S.firm_prices, round_to: S.round_to, min_fee: rates.min_fee != null ? Number(rates.min_fee) : null }, priceAt);
