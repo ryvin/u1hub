@@ -98,11 +98,34 @@ removes an unrequested quote at once, and only the file of a requested one.
 
 `MAX_MB` 100, `UPLOADS_PER_HOUR` 5 per IP, `REQUESTS_PER_DAY` 3 per IP,
 `GLOBAL_UPLOADS_PER_HOUR` 60, `READS_PER_HOUR` 300 per IP; `.stl`/`.3mf` only.
-The client IP is `CF-Connecting-IP` only with `TRUST_CF=1` (compose sets it,
-which is safe because the container publishes no host port: only the tunnel
-reaches it), the socket address
-otherwise. The Hub enforces its own 100 MB cap (`U1HUB_QUOTE_MAX_MB`) and reads
-every upload with the Estimate tab's hardened readers. CSP: `default-src
+The client IP is `CF-Connecting-IP` only with `TRUST_CF=1` **and** when the
+connection comes from a peer listed in `TRUSTED_PROXY`; otherwise it is the socket
+address. Publishing no host port keeps the LAN out, but the container shares
+`yt_steam_manager_default` with every other container of that compose project, and
+any of them could send its own `CF-Connecting-IP` and pick its own rate-limit bucket
+(review 2026-10-21). `TRUSTED_PROXY` takes IPs, CIDRs and hostnames, comma or space
+separated; a hostname (the tunnel container's name on the Docker network) is
+resolved before the service listens and every minute after, because a container's
+address changes when it is recreated. compose sets it to `snapmaker-cloudflared`
+unless `quote/.env` says otherwise. `TRUST_CF=1` with an empty `TRUSTED_PROXY`
+trusts nobody: the header is ignored, every visitor shares the tunnel's limit, and
+the service logs a warning at start. The startup line names whom it trusts
+(`CF-Connecting-IP from snapmaker-cloudflared`). The Hub enforces its own 100 MB cap
+(`U1HUB_QUOTE_MAX_MB`) and reads every upload with the Estimate tab's hardened
+readers.
+
+**Disk use.** Stored public-quote files are capped in total by
+`estimate.quote_store_mb` in the Hub's `config.json` (default 2048). It is counted
+from the quote records (each file's size at upload), not by walking the disk.
+Files that are gone do not count: an upload whose analysis failed (its file is
+deleted at once; the error record stays so the visitor's page still says "We
+couldn't read this file"), a visitor's **Delete my files**, and pruned quotes. At
+or over the cap the Hub answers new uploads 503 `paused` with "We're busy right
+now - please try again in a while" (the page shows it as-is), and logs one warn
+(`quote: public quote files use … MB, at estimate.quote_store_mb …`) until usage is
+under the cap again. The cap is checked before an upload starts, so it can be
+exceeded by the uploads already in flight (each at most `MAX_MB`; at most
+`GLOBAL_UPLOADS_PER_HOUR` an hour). CSP: `default-src
 'self'`, scripts and frames also from `challenges.cloudflare.com`, no inline
 script or style. A Hub that does not answer, or answers 5xx or 401, shows
 "Quotes are paused - try again soon"; nothing is queued.
@@ -110,7 +133,8 @@ script or style. A Hub that does not answer, or answers 5xx or 401, shows
 The service runs as `node` (`NODE_ENV=production`) on a read-only filesystem,
 listens on 4560 inside the container, publishes no host port, and joins the
 tunnel container's network `yt_steam_manager_default` (external; owned by the
-YT_Steam_Manager compose project). It reaches the Hub at
+YT_Steam_Manager compose project; shared with that project's other containers,
+hence `TRUSTED_PROXY`). It reaches the Hub at
 `host.docker.internal:4545`. Errors (a broken JSON body, one over 16 kB) answer
 a short JSON message, never a stack trace. The Hub analyses public uploads one
 at a time (`ping` reports `analyses: { running, waiting, max_running }`); the
@@ -139,11 +163,17 @@ Hub, owner (session): `GET|POST /api/estimate/quote/settings`, `POST
   the pure units, readyBy against hand-worked dates (UTC and Chicago), and a
   booted Hub: the key (missing, wrong, right; and in password mode a key opens
   nothing else), upload → token → a view with no file name, printer name or
-  cost, options, request + ntfy, delete, the owner routes, a new key.
+  cost, options, request + ntfy, delete, the owner routes, a new key; the
+  `quote_store_mb` cap (a failed analysis keeps no file and does not count, the
+  next upload over the cap gets 503 paused, one warn).
 - `quote/test/quote-standalone.js` (service; falsify `QUOTE_FALSIFY=1`) against
   a fake Hub and a fake siteverify: limits, Turnstile pass/fail, size cap, the
-  allow-list, tokens, "paused", a spoofed `CF-Connecting-IP` with `TRUST_CF` unset, error bodies,
+  allow-list, tokens, "paused", a spoofed `CF-Connecting-IP` with `TRUST_CF` unset,
+  with `TRUST_CF=1` from a peer not in `TRUSTED_PROXY`, and with `TRUSTED_PROXY`
+  empty; `TRUSTED_PROXY` matching (CIDR, IPv4-mapped, IPv6, a hostname); error bodies,
   the CSP and the page's no-inline/no-innerHTML rules.
+- Each suite's port can be moved with `U1HUB_QUOTE_TEST_PORT` / `QUOTE_TEST_PORT`
+  (the fake Hub takes the next port) so two runs on one machine do not collide.
 
 ## Verification record
 

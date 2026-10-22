@@ -4,7 +4,10 @@
 # tunnel and set their own CF-Connecting-IP (final review, Important 2). It
 # joins the tunnel container's network (snapmaker-cloudflared runs in the
 # YT_Steam_Manager compose project, network yt_steam_manager_default) and
-# reaches the Hub through the host's published :4545.
+# reaches the Hub through the host's published :4545. That network is shared
+# with the project's other containers, so CF-Connecting-IP is believed only
+# from TRUSTED_PROXY (the tunnel container, resolved by name; review 2026-10-21).
+# Override it in .env (TRUSTED_PROXY=) with an IP, CIDR or another name.
 name: u1-quote
 services:
   u1-quote:
@@ -16,6 +19,7 @@ services:
       PORT: "4560"
       HUB_URL: http://host.docker.internal:4545
       TRUST_CF: "1"
+      TRUSTED_PROXY: ${TRUSTED_PROXY:-snapmaker-cloudflared}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [tunnel]

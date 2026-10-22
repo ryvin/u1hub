@@ -6,14 +6,18 @@
 // field allow-list. Spec: docs/superpowers/specs/2026-10-07-public-quote-design.md; ops: docs/quote.md.
 const express = require("express"), path = require("path");
 const { load } = require("./lib/config.js"), { createLimiter } = require("./lib/limits.js"), { verify } = require("./lib/turnstile.js");
-const { createHub } = require("./lib/hub.js"), V = require("./lib/view.js");
+const { createHub } = require("./lib/hub.js"), V = require("./lib/view.js"), { createProxyCheck } = require("./lib/proxy.js");
 const C = load(process.env);
 const hub = createHub({ hubUrl: C.hubUrl, quoteKey: C.quoteKey, timeoutMs: C.hubTimeoutMs });
 const L = createLimiter(), HOUR = 3600000, DAY = 24 * HOUR;
 const app = express();
 app.disable("x-powered-by");
 const TOKEN = /^[0-9a-f]{32}$/;
-const ipOf = req => (C.trustCf && req.get("CF-Connecting-IP")) || req.socket.remoteAddress || "?";
+// CF-Connecting-IP is believed only with TRUST_CF=1 AND from a peer in TRUSTED_PROXY (the tunnel): any
+// other container on the shared Docker network could otherwise choose its own rate-limit bucket.
+const PROXY = createProxyCheck(C.trustCf ? C.trustedProxy : []);
+if (C.trustCf && !PROXY.any) console.warn("u1-quote: TRUST_CF=1 but TRUSTED_PROXY is empty - CF-Connecting-IP is ignored and every visitor is limited by the tunnel's own address. Set TRUSTED_PROXY to the cloudflared container (docs/quote.md).");
+const ipOf = req => (C.trustCf && PROXY.trusted(req.socket.remoteAddress) && req.get("CF-Connecting-IP")) || req.socket.remoteAddress || "?";
 const CSP = "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 app.use((req, res, next) => { res.set({ "Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store" }); next(); });
 const page = (req, res) => res.sendFile(path.join(__dirname, "public", "index.html"));
@@ -65,4 +69,6 @@ app.use((err, req, res, next) => {
   if (code === 500) console.error("u1-quote: " + (err && err.stack || err));
   res.status(code).json({ error: code === 413 ? "That is too large" : code === 500 ? "Something went wrong" : "Bad request" });
 });
-app.listen(C.port, () => console.log("u1-quote listening on " + C.port + " -> " + C.hubUrl));
+// Listen once the TRUSTED_PROXY hostnames have resolved, so the first visitor is limited by their own address.
+PROXY.ready.then(() => app.listen(C.port, () => console.log("u1-quote listening on " + C.port + " -> " + C.hubUrl
+  + (C.trustCf ? "; CF-Connecting-IP from " + (C.trustedProxy.join(", ") || "nobody") : ""))));

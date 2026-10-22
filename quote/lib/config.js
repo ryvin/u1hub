@@ -9,7 +9,10 @@ function load(env) {
     maxMb: n(env.MAX_MB, 100), uploadsPerHour: n(env.UPLOADS_PER_HOUR, 5), requestsPerDay: n(env.REQUESTS_PER_DAY, 3),
     globalUploadsPerHour: n(env.GLOBAL_UPLOADS_PER_HOUR, 60), readsPerHour: n(env.READS_PER_HOUR, 300), hubTimeoutMs: n(env.HUB_TIMEOUT_MS, 10000),
     // Only behind the tunnel is CF-Connecting-IP the visitor's address; anywhere else it is a header anyone can set.
-    trustCf: env.TRUST_CF === "1", publicUrl: String(env.PUBLIC_URL || "")
+    // ...and only from a peer in TRUSTED_PROXY (IPs, CIDRs or hostnames, comma/space separated: the
+    // cloudflared container), because other containers share the tunnel's Docker network (lib/proxy.js).
+    trustCf: env.TRUST_CF === "1", trustedProxy: String(env.TRUSTED_PROXY || "").split(/[\s,]+/).filter(Boolean),
+    publicUrl: String(env.PUBLIC_URL || "")
   };
   if (c.quoteKey.length < 32) throw new Error("QUOTE_KEY must be the Hub's estimate.quote_key (32+ characters)");
   if (!c.siteKey || !c.secret) throw new Error("TURNSTILE_SITEKEY and TURNSTILE_SECRET are required");
