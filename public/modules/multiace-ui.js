@@ -26,6 +26,9 @@
 (function () {
   if (window.HUB_FEATURES && window.HUB_FEATURES.multiace === false) return;
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  // A colour that goes into a style attribute: #rrggbb or #rrggbbaa, else nothing. esc() is HTML
+  // escaping only; it leaves ';' and 'url(' alone, and slot labels come straight from the printer.
+  const cssHex = s => { const m = /^#?([0-9a-f]{6}|[0-9a-f]{8})$/i.exec(typeof s === "string" ? s.trim() : ""); return m ? "#" + m[1].toLowerCase() : ""; };
   async function jget(p) { try { const r = await fetch(p); const d = await r.json().catch(() => null); return { ok: r.ok, status: r.status, d }; } catch (e) { return { ok: false, status: 0, d: { error: e.message } }; } }
   // Never leaves the card waiting forever: an answer that does not come within
   // the limit is an error the card shows (live 2026-10-07: a card sat on "Starting…").
@@ -161,7 +164,7 @@
         const slot = (lo.live_slots || []).find(x => x.ace === a && x.slot === s);
         const f = feeding[a + "," + s];
         if (!slot) rows += '<span class="macesw empty" title="ACE ' + a + ' slot ' + s + ' · empty or unlabelled"><span class="macest">A' + a + '</span></span>';
-        else rows += '<span class="macesw' + (f != null ? " feed" : "") + '" style="background:' + esc(slot.color) + '" title="ACE ' + a + ' slot ' + s + ' · ' + esc(slot.material) + ' ' + esc(slot.color) + (f != null ? ' · feeding T' + (f + 1) : "") + '"><span class="macest">A' + a + '</span></span>';
+        else rows += '<span class="macesw' + (f != null ? " feed" : "") + '" style="background:' + cssHex(slot.color) + '" title="ACE ' + a + ' slot ' + s + ' · ' + esc(slot.material) + ' ' + esc(slot.color) + (f != null ? ' · feeding T' + (f + 1) : "") + '"><span class="macest">A' + a + '</span></span>';
       }
       rows += "</div>";
     }
@@ -186,8 +189,8 @@
     const pick = mode === "slicer" && st.phase === "report";
     return '<div class="macetbl">' + rows.map(r => {
       const cls = r.tier === "exact_hex" ? "good" : (/^name_|fuzzy|planned|manual/.test(r.tier) ? "" : (r.tier === "fallback" || r.tier === "duplicate" ? "warn" : "bad"));
-      return '<div class="macetr"><span class="fsw" style="background:' + esc(r.hex || "#3a3f49") + '"></span><span class="macet" title="P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '">P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '</span><span class="macearrow">→</span>' +
-        (r.slot_hex ? '<span class="fsw" style="background:' + esc(r.slot_hex) + '"></span>' + (pick ? slotPicker(pid, st, r) : '<span>ACE ' + r.ace + ' · slot ' + r.slot + '</span>') : '<span class="fsw none"></span><span>no slot</span>') +
+      return '<div class="macetr"><span class="fsw" style="background:' + cssHex(r.hex || "#3a3f49") + '"></span><span class="macet" title="P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '">P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '</span><span class="macearrow">→</span>' +
+        (r.slot_hex ? '<span class="fsw" style="background:' + cssHex(r.slot_hex) + '"></span>' + (pick ? slotPicker(pid, st, r) : '<span>ACE ' + r.ace + ' · slot ' + r.slot + '</span>') : '<span class="fsw none"></span><span>no slot</span>') +
         '<span class="macetier ' + cls + '">' + esc(TIER[r.tier] || r.tier) + '</span>' + (r.dE != null ? '<span class="macede" title="CIEDE2000 between the file colour and the slot colour (advisory; the tier is the engine\'s verdict)">ΔE ' + r.dE.toFixed(1) + '</span>' : "") + '</div>';
     }).join("") + (pick && hasPicks(st) ? '<div class="macecap">slots picked by hand · <a href="#" data-mace="unpick" data-pid="' + pid + '" style="color:inherit">use the engine\'s match</a></div>' : "") + "</div>";
   }
@@ -195,7 +198,7 @@
     if (!moves || !moves.length) return "";
     const saved = slicerSwaps != null && planSwaps != null ? slicerSwaps - planSwaps : null;
     return '<div class="macemoves"><b>Move ' + moves.length + ' spool' + (moves.length === 1 ? "" : "s") + ' first</b>' + (saved != null && saved > 0 ? ' to save ' + saved + ' swap' + (saved === 1 ? "" : "s") + ' vs as sliced' : "") + ' - the Hub never moves anything; after moving, update the slot label in multiACE / FilamentHub and re-check.<br>' +
-      moves.map(m => '<span class="msw" style="background:' + esc(m.hex) + '"></span>' + esc(m.hex) + ' ' + esc(m.material) + (m.from ? ' (now ACE ' + m.from.ace + ' slot ' + m.from.slot + ')' : ' (not loaded)') + ' → <b>ACE ' + m.to.ace + ' slot ' + m.to.slot + '</b>' + (m.displaces ? ' <span style="color:var(--ink-faint)">(displaces ' + esc(m.displaces.color) + ')</span>' : "")).join("<br>") + "</div>";
+      moves.map(m => '<span class="msw" style="background:' + cssHex(m.hex) + '"></span>' + esc(m.hex) + ' ' + esc(m.material) + (m.from ? ' (now ACE ' + m.from.ace + ' slot ' + m.from.slot + ')' : ' (not loaded)') + ' → <b>ACE ' + m.to.ace + ' slot ' + m.to.slot + '</b>' + (m.displaces ? ' <span style="color:var(--ink-faint)">(displaces ' + esc(m.displaces.color) + ')</span>' : "")).join("<br>") + "</div>";
   }
   function estHtml(st, mode) {
     const e = (st.report.estimates || {})[mode];
@@ -367,7 +370,7 @@
       m.innerHTML = '<div class="modalbox"><div class="modalhdr"><span>Print via multiACE on ' + esc(fe.name || "") + '</span><button class="modalx" data-x="1" title="Close">×</button></div>' +
         '<div class="macesum"><span class="k">file</span><span>' + esc(window.SELECTED) + '</span><span class="k">plan</span><span>' + esc(PLAN[mode]) + ' · ' + esc(PLAN_HINT[mode]) + '</span>' +
         '<span class="k">swaps</span><span><b>' + e.swaps + '</b> ≈ +' + mins(e.est_added_sec) + ' (' + e.swap_seconds + ' s each)</span><span class="k">purge</span><span>≈ ' + e.purge_g + ' g top-up (' + e.purge_mm + ' mm) on top of the wipe tower</span>' +
-        '<span class="k">colours</span><span>' + rows.map(r => '<span class="msw" style="display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid rgba(255,255,255,.25);vertical-align:-1px;background:' + esc(r.hex) + '"></span>' + esc(r.hex) + ' → ACE ' + r.ace + ' slot ' + r.slot + ' <span style="color:var(--ink-faint)">' + esc(TIER[r.tier] || r.tier) + '</span>').join("<br>") + '</span></div>' +
+        '<span class="k">colours</span><span>' + rows.map(r => '<span class="msw" style="display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid rgba(255,255,255,.25);vertical-align:-1px;background:' + cssHex(r.hex) + '"></span>' + esc(r.hex) + ' → ACE ' + r.ace + ' slot ' + r.slot + ' <span style="color:var(--ink-faint)">' + esc(TIER[r.tier] || r.tier) + '</span>').join("<br>") + '</span></div>' +
         '<div class="macechk">Starts at once - the engine uploads with print=true; there is no upload-only path.<br>Air Print Detection: ' + (lo.airprint_detection ? '<span style="color:var(--bad)">ON - multiACE needs it off</span>' : '<span style="color:var(--ok)">off</span>') +
         '<br>Identity extruder map (T→T) is sent first' + (INFO && INFO.settings && INFO.settings.identity_map === false ? ' <span style="color:var(--bad)">(switched off in Settings)</span>' : "") + '.<br>Fitted the larger purge bin? Every swap flushes into it.</div>' +
         '<div class="macefoot"><button class="btn ghost" data-x="1">Cancel</button><button class="btn primary" data-go="1">Print</button></div></div>';
@@ -417,8 +420,8 @@
     const st = RSTATE.get(key(pid, window.SELECTED)) || { phase: "idle" };
     const warns = (v.rows || []).filter(r => r.warn).length;
     let h = '<div class="macemsg"><b>Already prepared by multiACE.</b> This copy has the swaps written in for the loadout it was made for. Reprint it as prepared: the Hub sends the straight tool → head map first (the touchscreen and the normal Print button would re-map the colours and print them on the wrong heads).</div>';
-    h += '<div class="macetbl">' + (v.rows || []).map(r => '<div class="macetr"><span class="fsw" style="background:' + esc(r.hex || "#3a3f49") + '"></span><span class="macet">P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '</span><span class="macearrow">→</span>'
-      + (r.slot_hex ? '<span class="fsw" style="background:' + esc(r.slot_hex) + '"></span>' : '<span class="fsw none"></span>') + '<span>head ' + esc(r.head + 1) + (r.ace != null ? ' · ACE ' + esc(r.ace) + ' slot ' + esc(r.slot) : '') + '</span>'
+    h += '<div class="macetbl">' + (v.rows || []).map(r => '<div class="macetr"><span class="fsw" style="background:' + cssHex(r.hex || "#3a3f49") + '"></span><span class="macet">P' + (r.t + 1) + ' ' + esc(r.hex) + ' ' + esc(r.material) + '</span><span class="macearrow">→</span>'
+      + (r.slot_hex ? '<span class="fsw" style="background:' + cssHex(r.slot_hex) + '"></span>' : '<span class="fsw none"></span>') + '<span>head ' + esc(r.head + 1) + (r.ace != null ? ' · ACE ' + esc(r.ace) + ' slot ' + esc(r.slot) : '') + '</span>'
       + (r.dE != null ? '<span class="macede">ΔE ' + Number(r.dE).toFixed(1) + '</span>' : '') + (r.warn ? '<span class="macetier warn" title="' + esc(r.warn) + '">' + esc(r.as_loaded ? "as loaded" : /material|holds/.test(r.warn) ? "other material" : /empty/.test(r.warn) ? "empty slot" : "check colour") + '</span>' : '<span class="macetier good">loaded</span>') + '</div>').join("") + '</div>';
     if (warns) h += '<div class="macecap" style="color:var(--warn,#f5b316)">' + (v.rows || []).filter(r => r.warn).map(r => 'P' + (r.t + 1) + ': ' + esc(r.warn)).join('<br>') + '<br>Check those slots, or re-slice and use Check with multiACE.</div>';
     if (st.phase === "sending") return h + '<div class="macemsg">' + esc(st.msg || "Sending…") + '</div>';
@@ -434,7 +437,7 @@
       let m = document.getElementById("macemodal");
       if (!m) { m = document.createElement("div"); m.id = "macemodal"; m.className = "modal macemodal"; document.body.appendChild(m); }
       m.innerHTML = '<div class="modalbox"><div class="modalhdr"><span>Reprint via multiACE on ' + esc(fe.name || "") + '</span><button class="modalx" data-x="1" title="Close">×</button></div>'
-        + '<div class="macesum"><span class="k">file</span><span>' + esc(file) + '</span><span class="k">colours</span><span>' + (v.rows || []).map(r => '<span class="msw" style="display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid rgba(255,255,255,.25);vertical-align:-1px;background:' + esc(r.hex) + '"></span> ' + esc(r.hex) + ' → head ' + esc(r.head + 1) + (r.ace != null ? ' (ACE ' + esc(r.ace) + ' slot ' + esc(r.slot) + ')' : '') + (r.warn ? ' <span style="color:var(--warn,#f5b316)">⚠ ' + esc(r.warn) + '</span>' : '')).join("<br>") + '</span></div>'
+        + '<div class="macesum"><span class="k">file</span><span>' + esc(file) + '</span><span class="k">colours</span><span>' + (v.rows || []).map(r => '<span class="msw" style="display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid rgba(255,255,255,.25);vertical-align:-1px;background:' + cssHex(r.hex) + '"></span> ' + esc(r.hex) + ' → head ' + esc(r.head + 1) + (r.ace != null ? ' (ACE ' + esc(r.ace) + ' slot ' + esc(r.slot) + ')' : '') + (r.warn ? ' <span style="color:var(--warn,#f5b316)">⚠ ' + esc(r.warn) + '</span>' : '')).join("<br>") + '</span></div>'
         + '<div class="macechk">Prints the file exactly as multiACE prepared it: the straight tool → head map is sent first, then it starts at once.' + (warns.length ? '<br><span style="color:var(--warn,#f5b316)">' + warns.length + ' warning(s) above.</span>' : '') + '</div>'
         + '<div class="macefoot"><button class="btn ghost" data-x="1">Cancel</button><button class="btn primary" data-go="1">Reprint</button></div></div>';
       const close = val => { m.classList.remove("show"); m.onclick = null; resolve(val); };

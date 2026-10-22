@@ -100,6 +100,19 @@ or `; LAYER_CHANGE` markers, a used material that no slot holds, TPU/TPE, nozzle
 diameters that differ between the file and the heads. The print step re-checks the
 state ones against fresh reads.
 
+**Right before any command goes to the printer** (since 2026-10-21) the Hub reads the
+printer again and re-runs the checks: a fresh snapshot (probe, `livedata`, `ace`, fleet)
+plus Moonraker's own `print_stats.state`, uncached, because the fleet snapshot can be
+seconds old and an upload can take minutes. Print via multiACE does this before the
+identity map, and asks `print_stats` once more before the engine's print POST.
+Reprint does it after the library copy's upload, before the identity map, and asks
+`print_stats` once more before `SDCARD_PRINT_FILE`. A printer that is printing,
+paused, or does not answer refuses with `printer became busy` (the print job's error,
+or a 409 from reprint); nothing further is sent and nothing is recorded as started.
+
+A `printer` field that is not a whole number (`""`, `false`, `true`, text, `1.5`) is
+400 `Unknown printer`; it used to read as printer 0.
+
 ## Reprinting a file multiACE already processed
 
 The engine rewrites a file once, for the loadout it saw: the body's `T<n>` become heads,
@@ -126,6 +139,11 @@ slot 1, white → head 4 / ACE 1 slot 3 (heads counted from 1 on the card), matc
 trace of its swap lines, and all five within ΔE 8 of davinci's loadout.
 
 ## Costing and the SME
+
+`multiace.json` is written tmp+rename (a direct write, logged once, where the
+filesystem refuses rename-over-existing, as on a share). A `multiace.json` that does not
+parse at boot is moved aside as `multiace.json.corrupt-<ts>` and logged, and the module
+starts empty; it is never silently overwritten.
 
 A print started through this route is recorded in `multiace.json` (plan, swaps,
 `est_added_sec`, `purge_mm`, `purge_g`, heads, engine job id, started/error) and
@@ -156,7 +174,7 @@ with their plan, swaps and purge estimate.
 - `GET /api/multiace/job?job=` → `{ phase, sent, total, done, error, result, engine:{stage, percent} }`
 - `GET /api/multiace/sent` → the last 100 records
 - `GET /api/multiace/reprint?printer=N&type=&file=` → `{ processed:false }` or `{ processed:true, heads, rows:[{ t, hex, material, head, ace, slot, as_loaded, how, slot_hex, slot_material, dE, warn }], link }`
-- `POST /api/multiace/reprint {printer, type, file}` → `{ started, uploaded, heads, warnings }`; 409 printer state; 400 a file that is not processed
+- `POST /api/multiace/reprint {printer, type, file}` → `{ started, uploaded, heads, warnings }`; 409 printer state (also `printer became busy` when it started printing during the upload); 400 a file that is not processed
 
 The report's `rows[mode]`, `estimates[mode]`, `moves[mode]` and `hub` are the Hub's
 additions; everything else is the engine's report as it came.

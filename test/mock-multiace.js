@@ -81,7 +81,9 @@ function createMultiaceMock(opts) {
     tokens: {},                           // token -> { filename, report }
     jobs: {},                             // job_id -> status
     moon: o.moon || null,                 // the mock-moonraker state, so a print lands as "printing" and command order is visible
-    onPrintStart: o.onPrintStart || null
+    onPrintStart: o.onPrintStart || null,
+    livedataCalls: 0,                     // every GET livedata, counted
+    onLivedata: null                      // (n, state) called on the n-th livedata GET, before the answer
   };
   let seq = 0;
   const token = () => (Date.now().toString(16) + (seq++).toString(16).padStart(6, "0") + "0".repeat(32)).slice(0, 32);
@@ -134,6 +136,8 @@ function createMultiaceMock(opts) {
       return send(200, { web: state.web, moonraker_url: "http://127.0.0.1:7125", config_path: "/home/lava/printer_data/config/extended/ace.cfg",
         frontend_dir: "/home/lava/multiace_web/frontend", printer: { device_name: "U1-mock", machine_type: "Snapmaker U1", firmware_version: "1.5.2" } });
     if (p === "/multiace/api/preflight/livedata" && req.method === "GET") {
+      state.livedataCalls++;
+      if (typeof state.onLivedata === "function") state.onLivedata(state.livedataCalls, state);
       if (state.manual) return send(409, { detail: "a head is in manual mode; slot matching is unavailable" });
       return send(200, { live_slots: state.live_slots.slice().sort((a, b) => a.ace - b.ace || a.slot - b.slot), head_ctx: state.head_ctx });
     }
