@@ -298,6 +298,10 @@ recommended = the highest of: minimum, grossUp(min_fee) when set, and the listed
               price of every method that is set (markup, target margin, machine-hour, per-gram)
 ```
 
+`sales_tax_pct` and `platform_fee_pct` are priced at most at their Settings caps
+(30 % and 50 %): a larger value hand-edited into config.json is clamped, so the
+divisor stays positive and no price comes out as $0 or blank.
+
 Per piece was chosen so that each piece sells for a whole-dollar amount (a
 10-piece plate breaking even at $25.05 has a minimum of $3 x 10 = $30, not
 $26). A cent of float noise never rounds up a dollar (the break-even is

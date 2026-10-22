@@ -394,8 +394,12 @@ function projectSummary(project, prints, rates) {
 //   net = gross / (1 + sales_tax_pct) - gross x platform_fee_pct - platform_fee_fixed
 // so gross = (net + fixed) / (1 / (1 + tax) - pct). One gross-up for both;
 // with no sales tax it is the old (price + fixed) / (1 - pct) exactly.
+// Settings refuses a fee over 50 % or tax over 30 % (RATE_KEYS); a value
+// hand-edited into config.json past that is priced at the cap, never as a
+// share that leaves nothing (a $0 or blank price).
+const capRate = (v, key) => Math.min(Math.max(num(v) || 0, RATE_KEYS[key][0]), RATE_KEYS[key][1]);
 function keepShare(rates) {
-  const tax = num(rates && rates.sales_tax_pct) || 0, pct = num(rates && rates.platform_fee_pct) || 0;
+  const tax = capRate(rates && rates.sales_tax_pct, "sales_tax_pct"), pct = capRate(rates && rates.platform_fee_pct, "platform_fee_pct");
   return 1 / (1 + tax / 100) - pct / 100;
 }
 function grossUp(price, rates) {
@@ -464,7 +468,7 @@ function pricing(s, rates, floor) {
     recommended: best ? { price: best.price, each: r2(best.price / pieces), method: best.key, label: best.label } : null,
     failure_pct_used: s.failure_pct_used != null ? s.failure_pct_used : null, failure_source: s.failure_source || null,
     // what a client needs to price a selection of these prints the same way (costing-ui.js selTotals)
-    rule: { failure_pct: s.failure_rate_pct != null ? s.failure_rate_pct : null, sales_tax_pct: num(R.sales_tax_pct), fee_pct: num(R.platform_fee_pct), fee_fixed: num(R.platform_fee_fixed) } };
+    rule: { failure_pct: s.failure_rate_pct != null ? s.failure_rate_pct : null, sales_tax_pct: num(R.sales_tax_pct) == null ? null : capRate(R.sales_tax_pct, "sales_tax_pct"), fee_pct: num(R.platform_fee_pct) == null ? null : capRate(R.platform_fee_pct, "platform_fee_pct"), fee_fixed: num(R.platform_fee_fixed) } };
 }
 
 // ---- pure: CSV ---------------------------------------------------------------------

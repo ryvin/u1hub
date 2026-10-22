@@ -76,7 +76,8 @@ print is used (`success_rate` from match.js: done / runs), else it is costing's
 `pricing().recommended`: the highest of the owner's minimum (break-even with failure,
 sales tax and card fee, whole dollars per piece; [costing.md](costing.md#the-minimum-price-the-owners-rule))
 and every method that is set (markup, target margin, machine-hour, and the per-gram
-floor only when a sell floor was set on purpose), × the rush multiplier. The tab shows
+floor only when a sell floor was set on purpose), × the rush multiplier - and never below
+the minimum, so a rush under 1 discounts the extras, not the floor. The tab shows
 "Break-even $50.08 · minimum $51" and the failure rate used with its source. Quantity breaks are
 costing's (1 / 10 / 50, cost + markup). A rate that is not set is named as a blank.
 

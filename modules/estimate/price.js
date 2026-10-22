@@ -30,7 +30,8 @@ function priceEstimate(e, rates, marginRates) {
   const rush = Number(e.rush) > 0 ? Number(e.rush) : 1;
   // 0 g (an unmeasured or empty model) is not a price, whatever the rates say.
   const priced = Number(e.grams) > 0;
-  const price = best && priced ? r2(best.price * rush) : null;
+  // A rush below 1 discounts the methods, never the owner's minimum.
+  const price = best && priced ? r2(Math.max(best.price * rush, p.minimum != null ? p.minimum : 0)) : null;
   return { cost: s, pricing: p, recommended: { price, each: price != null ? r2(price / qty) : null, method: best && priced ? best.method : null, label: best && priced ? best.label : null, rush },
            blanks: (s.blanks || []).concat(p ? [] : ["no cost to price (set rates in Settings)"]).concat(priced ? [] : ["no grams: nothing to price"]) };
 }

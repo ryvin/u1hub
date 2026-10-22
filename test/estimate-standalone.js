@@ -224,6 +224,14 @@ async function main() {
     const own24 = PRICE.priceEstimate({ grams: 1200, minutes: 4200, qty: 1, printer_id: 0, type: "u1", labor_minutes: 0, name: "big.stl" }, { ...RL, failure_pct: 24 }, {});
     const ownS = PRICE.priceEstimate({ grams: 20, minutes: 600, qty: 1, printer_id: 0, type: "u1", labor_minutes: 0, name: "small.stl" }, RL, {});
     ok(own24.recommended.price === 63 && ownS.cost.direct === 3.37 && ownS.recommended.price === 4, "failure 24 % -> $63; 20 g / 10 h -> direct 3.37, $4", { f24: own24.recommended, small: ownS.recommended });
+    // Final review (fixes pass): a rush below 1 is a discount on the extras,
+    // never a price under the owner's minimum.
+    const cheap = PRICE.priceEstimate({ grams: 1200, minutes: 4200, qty: 1, printer_id: 0, type: "u1", material: "PLA", labor_minutes: 0, rush: 0.5, name: "big.stl" }, RL, {});
+    ok(cheap.recommended.price === 51 && cheap.recommended.price >= cheap.pricing.minimum, "rush 0.5 never drops the price below the minimum ($51)", cheap.recommended);
+    // A fee % hand-edited past the Settings cap (50) is clamped to it, not a $0 / blank price.
+    const fee100 = PRICE.priceEstimate({ grams: 1200, minutes: 4200, qty: 1, printer_id: 0, type: "u1", material: "PLA", labor_minutes: 0, rush: 1, name: "big.stl" }, { ...RL, platform_fee_pct: 100 }, {});
+    const fee50 = PRICE.priceEstimate({ grams: 1200, minutes: 4200, qty: 1, printer_id: 0, type: "u1", material: "PLA", labor_minutes: 0, rush: 1, name: "big.stl" }, { ...RL, platform_fee_pct: 50 }, {});
+    ok(fee100.recommended.price > 0 && fee100.recommended.price === fee50.recommended.price, "platform_fee_pct 100 in the file is priced as the 50 % cap, never $0", { f100: fee100.recommended, f50: fee50.recommended });
     const noFloor = PRICE.priceEstimate({ ...base, labor_minutes: 0 }, { ...R, markup_pct: null }, {});
     ok(noFloor.pricing.methods.find(m => m.key === "per_gram").price === null && noFloor.recommended.method === "minimum", "no sell floor set by the owner: margin.js's built-in $0.12/g is NOT a price method", noFloor.pricing.methods.find(m => m.key === "per_gram"));
     const bare = PRICE.priceEstimate({ ...base, labor_minutes: 0 }, {}, {});
